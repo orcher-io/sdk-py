@@ -1,0 +1,274 @@
+name: Release
+
+# Every push to main is read as Conventional Commits. release-please keeps a
+# pull request open with the next version and its changelog; merging it tags
+# the release, and the jobs below build the wheels and the sdist, publish them
+# to PyPI as `orcher-sdk` and attach them to the GitHub release.
+#
+# The version is in pyproject.toml, the native crate's Cargo.toml and
+# `__version__` in src/orcher/__init__.py; release-please bumps all three
+# together (see release-please-config.json). Before 1.0, features and fixes
+# bump the patch and a breaking change bumps the minor.
+#
+# The first public version, 0.4.0, is published by running this workflow by
+# hand with `publish`, which also tags v0.4.0 and creates its release. The same
+# run retries a publish that failed: files already on PyPI are skipped. Until
+# that tag exists release-please counts from the start of the repository, so
+# publish 0.4.0 before merging any release pull request.
+#
+# Publishing authenticates with PyPI trusted publishing (OIDC) from the `pypi`
+# environment, so no token is stored. The trusted publisher is registered on
+# pypi.org for this repository, this workflow file and that environment.
+#
+# Wheels: one abi3 wheel per platform serves every Python from 3.11 on.
+#   - macOS arm64 and x86_64, both built on Apple silicon (x86_64 by
+#     cross-compiling).
+#   - Linux x86_64 and aarch64, each for glibc (manylinux 2.17) and musl
+#     (musllinux 1.2). Each is built on a runner of its own architecture, in
+#     the container maturin-action picks for it (PyPA's manylinux2014 image for
+#     glibc, rust-musl-cross for musl), so no build runs under emulation and
+#     no C dependency is compiled for a foreign CPU. Each wheel is then
+#     installed and imported in a python:3.11 and a python:3.14 container of
+#     the matching libc.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish the version in pyproject.toml to PyPI and tag it (first release, or to retry a failed publish)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A release is never cancelled halfway.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      released: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # The commit and version to release: the tag release-please just cut, or the
+  # version in pyproject.toml for a manual publish. The tag must match the
+  # version, or the files would be published under a different number.
+  target:
+    needs: release-please
+    if: >-
+      always() &&
+      (needs.release-please.outputs.released == 'true' ||
+       (github.event_name == 'workflow_dispatch' && inputs.publish))
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.pick.outputs.ref }}
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag || github.sha }}
+      - id: pick
+        env:
+          TAG: ${{ needs.release-please.outputs.tag }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ -n "$TAG" ] && [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not match pyproject.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "ref=${TAG:-$GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: wheel (linux ${{ matrix.target }} ${{ matrix.libc }})
+    needs: target
+    if: always() && needs.target.result == 'success'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+            libc: glibc
+            compatibility: manylinux2014
+            image: slim
+          - target: aarch64
+            runner: ubuntu-24.04-arm
+            libc: glibc
+            compatibility: manylinux2014
+            image: slim
+          - target: x86_64
+            runner: ubuntu-latest
+            libc: musl
+            compatibility: musllinux_1_2
+            image: alpine
+          - target: aarch64
+            runner: ubuntu-24.04-arm
+            libc: musl
+            compatibility: musllinux_1_2
+            image: alpine
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.ref }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.compatibility }}
+          args: --release --out dist
+      # Proves the wheel installs and its native module loads on the libc it
+      # claims, on the oldest and newest supported Python, not only that it
+      # linked. The runner shares the wheel's architecture, so no emulation.
+      - name: Install and import
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          for py in 3.11 3.14; do
+            docker run --rm -v "$PWD/dist:/dist:ro" "python:$py-$IMAGE" sh -ec '
+              pip install --quiet --disable-pip-version-check --root-user-action=ignore /dist/*.whl
+              cd / && python -c "import orcher, orcher._native, platform; print(platform.python_version(), platform.machine(), orcher.__version__)"'
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-${{ matrix.target }}-${{ matrix.libc }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  macos:
+    name: wheel (macos ${{ matrix.target }})
+    needs: target
+    if: always() && needs.target.result == 'success'
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [aarch64, x86_64]
+    # Apple silicon. The x86_64 wheel is cross-compiled, so it is checked for
+    # its architecture rather than imported.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.14
+            3.11
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+      - name: Install and import
+        if: matrix.target == 'aarch64'
+        run: |
+          for py in python3.11 python3.14; do
+            "$py" -m venv "$RUNNER_TEMP/smoke-$py"
+            "$RUNNER_TEMP/smoke-$py/bin/pip" install --quiet dist/*.whl
+            (cd "$RUNNER_TEMP" && "$RUNNER_TEMP/smoke-$py/bin/python" -c \
+              'import orcher, orcher._native, platform; print(platform.python_version(), platform.machine(), orcher.__version__)')
+          done
+      - name: Check the architecture
+        if: matrix.target == 'x86_64'
+        run: |
+          python3 -m zipfile -e dist/*.whl "$RUNNER_TEMP/wheel"
+          test "$(lipo -archs "$RUNNER_TEMP"/wheel/orcher/_native*.so)" = x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    needs: target
+    if: always() && needs.target.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.ref }}
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # Only this job can mint the PyPI token, and it runs nothing but the upload.
+  publish:
+    needs: [target, linux, macos, sdist]
+    if: >-
+      always() && needs.linux.result == 'success' &&
+      needs.macos.result == 'success' && needs.sdist.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/orcher-sdk/${{ needs.target.outputs.version }}/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Check every file is there
+        run: |
+          ls -l dist
+          test "$(find dist -name '*.whl' | wc -l)" -eq 6
+          test "$(find dist -name '*.tar.gz' | wc -l)" -eq 1
+      # Files already on PyPI are skipped, so a publish that failed halfway can
+      # be run again.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  # Attaches the files to the GitHub release. A manual publish creates the
+  # release and its tag first, so release-please starts the next changelog
+  # from it.
+  github-release:
+    needs: [target, publish]
+    if: always() && needs.publish.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: v${{ needs.target.outputs.version }}
+      REF: ${{ needs.target.outputs.ref }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the release (manual publish)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 ||
+            gh release create "$TAG" --target "$REF" --title "$TAG" --notes "First public release on PyPI: \`pip install orcher-sdk\`."
+      - name: Attach the files
+        run: gh release upload "$TAG" dist/* --clobber

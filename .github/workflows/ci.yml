@@ -1,0 +1,123 @@
+name: CI
+
+# Runs on GitHub-hosted runners only. Pull requests from forks run here too,
+# so this workflow must never target a runner of our own or read secrets.
+#
+# The native module is Rust built against crates from crates.io
+# (orcher-sdk-core, orcher-proto), so no job needs a token, git credentials or
+# a protobuf compiler. A build that fails fails the job: the test suite skips what needs the
+# native module when it is missing, so a job that carried on without it would
+# report a pass having tested little.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Release pull requests are opened with the default token, which starts no
+  # workflows, so their CI is started by hand on the release branch.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per pull request: a new push cancels the run for the one before it.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts only pay off when the same files are rebuilt over and
+  # over on one machine; in CI they just make the target directory bigger.
+  CARGO_INCREMENTAL: 0
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  # Ruff reads source only, so this needs no build. The version is pinned: a
+  # new ruff release can flag code nobody touched, and that should arrive as a
+  # deliberate bump, not as a red pull request.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff==0.16.9
+      - run: ruff check .
+
+  # The oldest and the newest supported Python, on Linux x86_64 and macOS arm64.
+  test:
+    name: test (${{ matrix.os }}, python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-${{ matrix.python }}
+
+      # A fresh virtual environment, so `maturin develop` has one to install
+      # into and `cargo test` a Python to link against.
+      - name: Create a virtual environment
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          echo "VIRTUAL_ENV=$RUNNER_TEMP/venv" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+      - run: pip install "maturin>=1.4,<2.0"
+      - name: Build the native module
+        # Builds the extension into the virtual environment and installs the
+        # package with its test dependencies.
+        run: maturin develop --extras dev
+      - name: Check the native module loads
+        # The suite skips native-dependent tests when the module is missing;
+        # fail here instead, so a broken build cannot pass as skipped tests.
+        run: python -c "import orcher._native"
+      - name: Test
+        run: python -m pytest -rs
+      - name: Test the native crate
+        # The crate's own unit tests, linked against the virtual environment's
+        # Python: the extension-module feature, which leaves libpython
+        # unlinked, is only turned on by maturin.
+        run: PYO3_PYTHON="$VIRTUAL_ENV/bin/python" cargo test
+
+  # Builds the sdist, builds a wheel from that sdist the way pip would for a
+  # platform with no prebuilt wheel, checks both render on PyPI, and installs
+  # the wheel into a clean environment on the oldest and the newest Python.
+  # The wheel is abi3, so the one build serves both.
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.14
+            3.11
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # readme_renderer's Markdown extra, or twine passes a README it cannot
+      # render without checking it.
+      - run: python3.11 -m pip install "maturin>=1.4,<2.0" twine "readme_renderer[md]"
+      - name: Build the sdist
+        run: python3.11 -m maturin sdist --out dist
+      - name: Build a wheel from the sdist
+        run: python3.11 -m pip wheel --no-deps --wheel-dir dist dist/orcher_sdk-*.tar.gz
+      - name: Check the metadata PyPI will render
+        run: python3.11 -m twine check --strict dist/*
+      - name: Install and import
+        run: |
+          for py in python3.11 python3.14; do
+            "$py" -m venv "$RUNNER_TEMP/smoke-$py"
+            "$RUNNER_TEMP/smoke-$py/bin/pip" install --quiet dist/orcher_sdk-*.whl
+            (cd "$RUNNER_TEMP" && "$RUNNER_TEMP/smoke-$py/bin/python" -c \
+              'import orcher, orcher._native, sys; print(sys.version.split()[0], orcher.__version__, orcher.__native_version__)')
+          done

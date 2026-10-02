@@ -1,0 +1,17 @@
+/target
+**/target
+Cargo.lock
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+*.so
+*.dylib
+*.node
+
+# Local cross-repo override (see .cargo/config.example.toml)
+.cargo/config.toml
