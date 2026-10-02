@@ -82,6 +82,10 @@ class WorkerBuilder:
         self._version_id: str | None = _undeclared_if_blank(os.environ.get("ORCHER_VERSION_ID"))
         self._binary_checksum: str | None = None
         self._organization_id: str | None = None
+        # Keys are issued out of band, so the environment is the usual way one
+        # reaches a process. Read the same variable as from_env and the client;
+        # an explicit .api_key() takes precedence.
+        self._api_key: str | None = _undeclared_if_blank(os.environ.get("ORCHER_API_KEY"))
 
         # Auto-discovery settings
         self._auto_discover_paths: list[str] | None = None
@@ -329,6 +333,26 @@ class WorkerBuilder:
         self._organization_id = org_id
         return self
 
+    def api_key(self, key: str | None) -> WorkerBuilder:
+        """
+        Set the API key the worker authenticates with.
+
+        Sent as `authorization: Bearer <key>` on every request the worker
+        makes: polling, reporting results, heartbeats, registration and actor
+        calls. Defaults to the `ORCHER_API_KEY` environment variable.
+
+        Args:
+            key: API key. None or blank sends none.
+
+        Returns:
+            Builder instance for chaining
+
+        Example:
+            >>> builder.api_key(os.environ["ORCHER_API_KEY"])
+        """
+        self._api_key = _undeclared_if_blank(key)
+        return self
+
     def task_executor(self, executor: Executor) -> WorkerBuilder:
         """
         Set the executor for sync tasks.
@@ -505,6 +529,9 @@ class WorkerBuilder:
 
         if self._organization_id:
             config_kwargs["organization_id"] = self._organization_id
+
+        if self._api_key:
+            config_kwargs["api_key"] = self._api_key
 
         config = WorkerConfig(**config_kwargs)
 

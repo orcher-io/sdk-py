@@ -56,6 +56,9 @@ class WorkerConfig:
         actor_poller_count: Number of concurrent actor pollers (default: 4)
         max_concurrent_actor_operations: Maximum concurrent actor operations (default: 100)
         organization_id: Optional organization ID, sent as the `X-Organization-Id` header
+        api_key: Optional API key, sent as `authorization: Bearer <key>` on every
+            request the worker makes, for servers that require one. from_env
+            reads it from {prefix}API_KEY. Never shown by repr.
 
     Example:
         >>> config = WorkerConfig(
@@ -99,6 +102,10 @@ class WorkerConfig:
     # the `X-Organization-Id` header, enabling organization-level quotas and
     # billing attribution.
     organization_id: str | None = None
+
+    # Authentication (optional). Kept out of repr so that logging a config
+    # never logs the key.
+    api_key: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
@@ -155,6 +162,7 @@ class WorkerConfig:
         - {prefix}WORKFLOW_POLLER_COUNT, {prefix}TASK_POLLER_COUNT
         - {prefix}SHUTDOWN_GRACE_TIME_MS, {prefix}FORCE_SHUTDOWN_TIMEOUT_MS
         - {prefix}VERSION_ID, {prefix}BINARY_CHECKSUM, {prefix}ORGANIZATION_ID
+        - {prefix}API_KEY
 
         Only SERVER_URL and TASK_QUEUE are required.
 
@@ -204,4 +212,7 @@ class WorkerConfig:
             version_id=_undeclared_if_blank(os.environ.get(f"{prefix}VERSION_ID")),
             binary_checksum=os.environ.get(f"{prefix}BINARY_CHECKSUM"),
             organization_id=os.environ.get(f"{prefix}ORGANIZATION_ID"),
+            # Blank is "no key": an exported-but-empty variable must not send
+            # an empty bearer token.
+            api_key=_undeclared_if_blank(os.environ.get(f"{prefix}API_KEY")),
         )

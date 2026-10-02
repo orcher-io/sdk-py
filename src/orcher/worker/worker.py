@@ -600,6 +600,7 @@ class Worker:
                 actor_poller_count=self._config.actor_poller_count if self._actor_handlers else 0,
                 max_concurrent_actors=self._config.max_concurrent_actor_operations,
                 organization_id=self._config.organization_id,
+                api_key=self._config.api_key,
                 version_id=self._config.version_id,
             )
 

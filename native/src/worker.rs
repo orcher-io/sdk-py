@@ -79,7 +79,7 @@ pub(crate) fn parse_execution_result(result_json: &str) -> PyResult<ExecutionRes
 
 /// Configuration for `BridgeWorker`.
 #[pyclass(name = "WorkerConfig")]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PyWorkerConfig {
     /// Server URL (e.g., "http://localhost:50051")
     #[pyo3(get, set)]
@@ -114,6 +114,11 @@ pub struct PyWorkerConfig {
     /// Organization ID for multi-tenant servers (optional)
     #[pyo3(get, set)]
     pub organization_id: Option<String>,
+    /// API key sent as `authorization: Bearer <key>` on every request the
+    /// worker makes, for servers that require one. Never printed: `repr` and
+    /// `Debug` redact it.
+    #[pyo3(get, set)]
+    pub api_key: Option<String>,
     /// Path to CA certificate PEM file for TLS (optional)
     #[pyo3(get, set)]
     pub tls_ca_cert_path: Option<String>,
@@ -150,7 +155,8 @@ impl PyWorkerConfig {
         tls_ca_cert_path = None,
         tls_client_cert_path = None,
         tls_client_key_path = None,
-        version_id = None
+        version_id = None,
+        api_key = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -169,8 +175,9 @@ impl PyWorkerConfig {
         tls_client_cert_path: Option<String>,
         tls_client_key_path: Option<String>,
         version_id: Option<String>,
-    ) -> Self {
-        Self {
+        api_key: Option<String>,
+    ) -> PyResult<Self> {
+        Ok(Self {
             server_url,
             namespace,
             task_queue,
@@ -193,18 +200,64 @@ impl PyWorkerConfig {
             // environment variable would bind executions to a release named "",
             // which looks like a real release and hides that versioning is off.
             version_id: version_id.filter(|v| !v.trim().is_empty()),
-        }
+            api_key: Self::checked_api_key(api_key)?,
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "WorkerConfig(server_url='{}', namespace='{}', task_queue='{}')",
-            self.server_url, self.namespace, self.task_queue
+            "WorkerConfig(server_url='{}', namespace='{}', task_queue='{}', api_key={})",
+            self.server_url,
+            self.namespace,
+            self.task_queue,
+            redacted(&self.api_key)
         )
     }
 }
 
+/// How a secret appears in `repr` and `Debug`: whether it is set, never what
+/// it is.
+fn redacted(secret: &Option<String>) -> &'static str {
+    match secret {
+        Some(_) => "'<redacted>'",
+        None => "None",
+    }
+}
+
+impl std::fmt::Debug for PyWorkerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("server_url", &self.server_url)
+            .field("namespace", &self.namespace)
+            .field("task_queue", &self.task_queue)
+            .field("identity", &self.identity)
+            .field("organization_id", &self.organization_id)
+            .field("api_key", &format_args!("{}", redacted(&self.api_key)))
+            .field("version_id", &self.version_id)
+            .finish_non_exhaustive()
+    }
+}
+
 impl PyWorkerConfig {
+    /// An empty key means "none". Any other key must be sendable as a header,
+    /// or sdk-core would silently drop it and the worker would connect with
+    /// no credentials at all.
+    fn checked_api_key(api_key: Option<String>) -> PyResult<Option<String>> {
+        let Some(key) = api_key.filter(|k| !k.trim().is_empty()) else {
+            return Ok(None);
+        };
+        // Parsed exactly as sdk-core parses it when it builds the header.
+        if format!("Bearer {key}")
+            .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            .is_err()
+        {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "api_key contains characters that cannot be sent in the authorization header",
+            ));
+        }
+        Ok(Some(key))
+    }
+
     /// Build a TlsConfig from the path fields, reading PEM files from disk.
     pub fn build_tls_config(
         &self,
@@ -286,7 +339,7 @@ impl PyWorkerConfig {
         config.strict_determinism = false;
         config.poller_count = self.workflow_poller_count;
         config.organization_id = self.organization_id.clone();
-        config.api_key = None;
+        config.api_key = self.api_key.clone();
         config.tls_config = tls_config.clone();
         config.version_id = self.version_id.clone();
         config
@@ -306,7 +359,7 @@ impl PyWorkerConfig {
         config.poll_timeout = Duration::from_secs(30);
         config.poller_count = self.actor_poller_count;
         config.organization_id = self.organization_id.clone();
-        config.api_key = None;
+        config.api_key = self.api_key.clone();
         config.enable_heartbeat = true;
         config.heartbeat_interval = Duration::from_secs(10);
         config.registration_id = None;
@@ -330,7 +383,7 @@ impl PyWorkerConfig {
         config.heartbeat_interval = Duration::from_secs(30);
         config.poller_count = self.task_poller_count;
         config.organization_id = self.organization_id.clone();
-        config.api_key = None;
+        config.api_key = self.api_key.clone();
         config.tls_config = tls_config;
         config.version_id = self.version_id.clone();
         // Every task is heartbeated while it runs, whatever its code does, so
@@ -510,7 +563,7 @@ pub struct PyBridgeWorker {
     /// Number of actor poll slots
     actor_slot_count: AtomicUsize,
     /// Shared gRPC connection for actor RPCs (state, registration, invoke).
-    state_channel_manager: Arc<Mutex<Option<ChannelManager>>>,
+    state_channel_manager: actor_state::StateChannels,
     /// Server URL.
     #[allow(dead_code)]
     server_url: String,
@@ -553,6 +606,11 @@ impl PyBridgeWorker {
         );
 
         // Read the TLS files before entering the async context.
+        let credentials = actor_state::Credentials {
+            api_key: config.api_key.clone(),
+            organization_id: config.organization_id.clone(),
+        };
+
         let tls_config = config
             .build_tls_config()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
@@ -1016,7 +1074,7 @@ impl PyBridgeWorker {
             workflow_slot_count,
             task_slot_count,
             actor_slot_count,
-            state_channel_manager: Arc::new(Mutex::new(Some(state_cm))),
+            state_channel_manager: actor_state::StateChannels::new(state_cm, credentials),
             server_url,
             service_id,
             session_queue_tx: Arc::new(std::sync::Mutex::new(Some(session_queue_tx))),
@@ -1093,7 +1151,7 @@ impl PyBridgeWorker {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             use orcher_sdk_core::proto::orcher::v1::{
-                actor_service_client::ActorServiceClient, ActorHandler, OperationMode,
+                ActorHandler, OperationMode,
                 RegisterHandlersRequest,
             };
 
@@ -1132,20 +1190,9 @@ impl PyBridgeWorker {
             let metadata: std::collections::HashMap<String, String> =
                 serde_json::from_str(&metadata_json).unwrap_or_default();
 
-            // Scope the lock: clone the channel out and release the lock
-            // before the RPC await, or every other bridge RPC would serialize
-            // behind this one.
-            let channel = {
-                let mut cm_guard = channel_manager.lock().await;
-                let cm = cm_guard.as_mut().ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err("Channel manager not available")
-                })?;
-                cm.get().await.map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("gRPC connect error: {}", e))
-                })?
-            };
-
-            let mut client = ActorServiceClient::new(channel);
+            // The client is taken off the shared channel without holding its
+            // lock across the RPC, so other bridge RPCs never queue behind it.
+            let mut client = actor_state::client(&channel_manager).await?;
             let request = tonic::Request::new(RegisterHandlersRequest {
                 service_id,
                 handlers,
@@ -1190,25 +1237,15 @@ impl PyBridgeWorker {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             use orcher_sdk_core::proto::orcher::v1::{
-                actor_service_client::ActorServiceClient, ExecutionStatus,
+                ExecutionStatus,
                 InvokeOperationRequest,
             };
 
-            // Scope the lock: this await can last the whole operation
-            // (seconds), and the executing operation's own state RPCs need the
-            // same channel manager. Holding the guard here would deadlock them
-            // and serialize concurrent invocations client-side.
-            let channel = {
-                let mut cm_guard = channel_manager.lock().await;
-                let cm = cm_guard.as_mut().ok_or_else(|| {
-                    pyo3::exceptions::PyRuntimeError::new_err("Channel manager not available")
-                })?;
-                cm.get().await.map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!("gRPC connect error: {}", e))
-                })?
-            };
-
-            let mut client = ActorServiceClient::new(channel);
+            // This await can last the whole operation (seconds), and the
+            // executing operation's own state RPCs need the same channel. The
+            // client is taken off it without holding its lock across the RPC,
+            // so they are not deadlocked behind it.
+            let mut client = actor_state::client(&channel_manager).await?;
             let request = tonic::Request::new(InvokeOperationRequest {
                 actor_name,
                 key,
@@ -1971,7 +2008,9 @@ mod tests {
             None,
             None,
             None,
-        );
+            None,
+        )
+        .unwrap();
         assert_eq!(config.server_url, "http://localhost:50051");
         assert_eq!(config.task_queue, "test-queue");
     }
@@ -1994,7 +2033,9 @@ mod tests {
             None,
             None,
             None,
-        );
+            None,
+        )
+        .unwrap();
 
         let driver_config = config.to_workflow_driver_config(None);
         assert_eq!(driver_config.server_url, "http://localhost:50051");
@@ -2022,12 +2063,86 @@ mod tests {
             None,
             None,
             None,
-        );
+            None,
+        )
+        .unwrap();
 
         let driver_config = config.to_task_driver_config(None);
         assert_eq!(driver_config.server_url, "http://localhost:50051");
         assert_eq!(driver_config.task_queue, "test-queue");
         assert_eq!(driver_config.max_concurrent_executions, 200);
         assert_eq!(driver_config.poller_count, 4);
+    }
+
+    fn config_with_credentials(api_key: Option<&str>) -> PyResult<PyWorkerConfig> {
+        PyWorkerConfig::new(
+            "http://localhost:50051".to_string(),
+            "test-queue".to_string(),
+            "default".to_string(),
+            100,
+            100,
+            Some("test-identity".to_string()),
+            2,
+            4,
+            4,
+            100,
+            Some("org_123".to_string()),
+            None,
+            None,
+            None,
+            None,
+            api_key.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn the_api_key_reaches_every_driver() {
+        let config = config_with_credentials(Some("orch_secret")).unwrap();
+        let key = Some("orch_secret".to_string());
+        let org = Some("org_123".to_string());
+
+        // sdk-core hands each driver's key and organization on to its pollers,
+        // its completion and heartbeat reports, and its worker registration.
+        let workflow = config.to_workflow_driver_config(None);
+        assert_eq!(workflow.api_key, key, "workflow driver");
+        assert_eq!(workflow.organization_id, org, "workflow driver");
+        let task = config.to_task_driver_config(None);
+        assert_eq!(task.api_key, key, "task driver");
+        assert_eq!(task.organization_id, org, "task driver");
+        let actor = config.to_actor_driver_config(None);
+        assert_eq!(actor.api_key, key, "actor driver");
+        assert_eq!(actor.organization_id, org, "actor driver");
+    }
+
+    #[test]
+    fn a_worker_without_a_key_sends_none() {
+        for api_key in [None, Some(""), Some("  ")] {
+            let config = config_with_credentials(api_key).unwrap();
+            assert_eq!(config.api_key, None);
+            assert_eq!(config.to_workflow_driver_config(None).api_key, None);
+            assert_eq!(config.to_task_driver_config(None).api_key, None);
+            assert_eq!(config.to_actor_driver_config(None).api_key, None);
+        }
+    }
+
+    #[test]
+    fn a_key_that_cannot_be_a_header_is_refused_rather_than_dropped() {
+        assert!(config_with_credentials(Some("orch_\nsecret")).is_err());
+        assert!(config_with_credentials(Some("orch_\u{7f}")).is_err());
+    }
+
+    #[test]
+    fn repr_and_debug_never_show_the_api_key() {
+        let config = config_with_credentials(Some("orch_secret")).unwrap();
+        let repr = config.__repr__();
+        let debug = format!("{config:?}");
+        for shown in [&repr, &debug] {
+            assert!(!shown.contains("orch_secret"), "key leaked: {shown}");
+            assert!(shown.contains("redacted"), "key not marked as set: {shown}");
+        }
+        assert!(debug.contains("org_123"));
+
+        let without = config_with_credentials(None).unwrap();
+        assert!(!without.__repr__().contains("redacted"));
     }
 }

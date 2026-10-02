@@ -13,18 +13,69 @@ use orcher_sdk_core::proto::orcher::v1::{
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::PyResult;
 use tokio::sync::Mutex;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
-/// The channel manager the actor state calls share.
-pub(crate) type StateChannels = Arc<Mutex<Option<ChannelManager>>>;
+/// The credential headers on the worker's own actor RPCs.
+///
+/// sdk-core's drivers send `authorization: Bearer <key>` and
+/// `x-organization-id` on everything they send. Actor registration, state and
+/// invocation go out on this crate's own channel, so they need the same two
+/// headers attached here, or a server that requires authentication rejects
+/// them while the pollers beside them are accepted. Not `Debug`: it holds the
+/// key.
+#[derive(Clone, Default)]
+pub(crate) struct Credentials {
+    pub(crate) api_key: Option<String>,
+    pub(crate) organization_id: Option<String>,
+}
+
+impl tonic::service::Interceptor for Credentials {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        if let Some(ref org_id) = self.organization_id {
+            if let Ok(value) = org_id.parse() {
+                request.metadata_mut().insert("x-organization-id", value);
+            }
+        }
+        if let Some(ref key) = self.api_key {
+            if let Ok(value) = format!("Bearer {key}").parse() {
+                request.metadata_mut().insert("authorization", value);
+            }
+        }
+        Ok(request)
+    }
+}
+
+/// The connection the worker's actor RPCs share, and the credentials they
+/// carry.
+#[derive(Clone)]
+pub(crate) struct StateChannels {
+    manager: Arc<Mutex<Option<ChannelManager>>>,
+    credentials: Credentials,
+}
+
+impl StateChannels {
+    pub(crate) fn new(manager: ChannelManager, credentials: Credentials) -> Self {
+        Self {
+            manager: Arc::new(Mutex::new(Some(manager))),
+            credentials,
+        }
+    }
+}
+
+/// An actor service client that sends the worker's credentials.
+pub(crate) type ActorClient = ActorServiceClient<InterceptedService<Channel, Credentials>>;
 
 /// A client on the shared channel.
 ///
 /// The manager's lock is held only to take the channel out, never across a
 /// call: an RPC can last as long as the server takes, and every other actor
 /// operation's state calls would queue behind it.
-async fn client(channels: &StateChannels) -> PyResult<ActorServiceClient<Channel>> {
-    let mut guard = channels.lock().await;
+pub(crate) async fn client(channels: &StateChannels) -> PyResult<ActorClient> {
+    let mut guard = channels.manager.lock().await;
     let manager = guard
         .as_mut()
         .ok_or_else(|| PyRuntimeError::new_err("Channel manager not available"))?;
@@ -32,7 +83,10 @@ async fn client(channels: &StateChannels) -> PyResult<ActorServiceClient<Channel
         .get()
         .await
         .map_err(|e| PyRuntimeError::new_err(format!("gRPC connect error: {}", e)))?;
-    Ok(ActorServiceClient::new(channel))
+    Ok(ActorServiceClient::with_interceptor(
+        channel,
+        channels.credentials.clone(),
+    ))
 }
 
 /// Reads one state key; `None` when the key does not exist.
@@ -223,8 +277,10 @@ mod tests {
                 ),
         );
 
-        let channels: StateChannels =
-            Arc::new(Mutex::new(Some(ChannelManager::new(format!("http://{address}")))));
+        let channels = StateChannels::new(
+            ChannelManager::new(format!("http://{address}")),
+            Credentials::default(),
+        );
 
         // One operation's read is waiting on the server...
         let reading = tokio::spawn({
@@ -263,5 +319,77 @@ mod tests {
 
         release.notify_one();
         assert_eq!(reading.await.unwrap().unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn actor_rpcs_carry_the_worker_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (arrived_tx, _arrived) = mpsc::unbounded_channel();
+        let service = SlowGetState {
+            get_state_arrived: arrived_tx,
+            release: Arc::new(Notify::new()),
+        };
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = {
+            let seen = seen.clone();
+            move |request: Request<()>| {
+                let header = |name| {
+                    request
+                        .metadata()
+                        .get(name)
+                        .map(|v| v.to_str().unwrap().to_string())
+                };
+                seen.lock()
+                    .unwrap()
+                    .push((header("authorization"), header("x-organization-id")));
+                Ok(request)
+            }
+        };
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .layer(tonic::service::interceptor(record))
+                .add_service(ActorServiceServer::new(service))
+                .serve_with_incoming(
+                    tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+                        .unwrap(),
+                ),
+        );
+
+        let channels = StateChannels::new(
+            ChannelManager::new(format!("http://{address}")),
+            Credentials {
+                api_key: Some("orch_secret".into()),
+                organization_id: Some("org_123".into()),
+            },
+        );
+        list_state_keys(&channels, "a".into(), "k".into(), "e".into(), String::new())
+            .await
+            .unwrap();
+        set_state(&channels, "a".into(), "k".into(), "s".into(), vec![1], "e".into())
+            .await
+            .unwrap();
+        delete_state(&channels, "a".into(), "k".into(), "s".into(), "e".into())
+            .await
+            .unwrap();
+        // Registration and invocation take their client from the same place.
+        client(&channels)
+            .await
+            .unwrap()
+            .register_handlers(RegisterHandlersRequest::default())
+            .await
+            .unwrap_err();
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4);
+        for headers in seen.iter() {
+            assert_eq!(
+                headers,
+                &(
+                    Some("Bearer orch_secret".to_string()),
+                    Some("org_123".to_string())
+                )
+            );
+        }
     }
 }
