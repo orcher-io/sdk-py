@@ -245,8 +245,12 @@ class WorkflowHandle:
 # Service API
 # =============================================================================
 
-class ServiceConfig:
-    """Configuration for Service runtime."""
+class WorkerConfig:
+    """Configuration for ``BridgeWorker``.
+
+    ``api_key`` is sent as ``authorization: Bearer <key>`` on every request the
+    worker makes; ``repr`` never shows it.
+    """
 
     def __init__(
         self,
@@ -258,6 +262,14 @@ class ServiceConfig:
         identity: str | None = None,
         workflow_poller_count: int = 2,
         task_poller_count: int = 4,
+        actor_poller_count: int = 4,
+        max_concurrent_actors: int = 100,
+        organization_id: str | None = None,
+        tls_ca_cert_path: str | None = None,
+        tls_client_cert_path: str | None = None,
+        tls_client_key_path: str | None = None,
+        version_id: str | None = None,
+        api_key: str | None = None,
     ) -> None: ...
 
     server_url: str
@@ -268,6 +280,14 @@ class ServiceConfig:
     identity: str | None
     workflow_poller_count: int
     task_poller_count: int
+    actor_poller_count: int
+    max_concurrent_actors: int
+    organization_id: str | None
+    api_key: str | None
+    tls_ca_cert_path: str | None
+    tls_client_cert_path: str | None
+    tls_client_key_path: str | None
+    version_id: str | None
 
     def __repr__(self) -> str: ...
 
@@ -279,7 +299,7 @@ class BridgeWorker:
     work from it, runs the user's handlers, and hands the results back.
     """
 
-    def __init__(self, config: ServiceConfig) -> None: ...
+    def __init__(self, config: WorkerConfig) -> None: ...
     async def register_actor_handlers(
         self,
         handlers_json: str,
@@ -422,7 +442,7 @@ class Service:
     ``orcher.Worker`` does not use it; it drives ``BridgeWorker`` instead.
     """
 
-    def __init__(self, config: ServiceConfig) -> None: ...
+    def __init__(self, config: WorkerConfig) -> None: ...
     def register_workflow(
         self,
         workflow_type: str,

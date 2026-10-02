@@ -52,6 +52,9 @@ ORCHER_TIMEOUT_WATCHER_GRACE_SECS=1
 
 At the defaults the first scenario fails and the second takes a few minutes.
 
+Against an engine that requires an API key, set `ORCHER_API_KEY`: the workers
+and the client both send it.
+
 Then, with the native module built (`maturin develop` or `pip install -e .`):
 
 ```bash

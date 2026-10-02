@@ -558,7 +558,16 @@ async def main() -> None:
     worker_task = asyncio.create_task(worker.run())
     await asyncio.sleep(2)  # let the worker register and start polling
 
-    client = Client(ClientConfig(server_url=args.server_url, namespace=args.namespace))
+    # The workers read ORCHER_API_KEY through the builder; the client must use
+    # the same key, so the suite runs unchanged against an engine that requires
+    # authentication.
+    client = Client(
+        ClientConfig(
+            server_url=args.server_url,
+            namespace=args.namespace,
+            api_key=os.environ.get("ORCHER_API_KEY") or None,
+        )
+    )
     await client.connect()
 
     passed = failed = skipped = 0

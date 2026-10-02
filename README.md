@@ -29,6 +29,7 @@ Write async functions; ORCHER journals each step and resumes interrupted runs wh
 - <img height="14" src="https://octicons-col.vercel.app/git-branch/38BDF0"> **Child workflows**: compose and run workflows in parallel
 - <img height="14" src="https://octicons-col.vercel.app/database/38BDF0"> **Actors**: stateful objects with a single writer per key
 - <img height="14" src="https://octicons-col.vercel.app/beaker/38BDF0"> **Testing**: run workflows in memory with mocks and a fake clock
+- <img height="14" src="https://octicons-col.vercel.app/shield-lock/38BDF0"> **Multi-tenant**: API keys, organizations and namespaces built in
 - <img height="14" src="https://octicons-col.vercel.app/cpu/38BDF0"> **Native core**: the engine protocol and state machine run in Rust
 
 <br />
@@ -62,6 +63,7 @@ their module is imported, and the worker runs everything registered:
 
 ```python
 import asyncio
+import os
 
 from orcher import TaskContext, Worker, WorkflowContext, task, workflow
 
@@ -82,6 +84,7 @@ async def main() -> None:
         .server_url("http://localhost:50051")
         .namespace("default")
         .task_queue("orders")
+        .api_key(os.environ.get("ORCHER_API_KEY"))  # for an engine that requires one
         .build()
     )
     await worker.run()
@@ -98,9 +101,15 @@ Start it from any process and wait for the result. A dict input reaches the
 workflow as keyword arguments:
 
 ```python
+import os
+
 from orcher import Client, ClientConfig
 
-async with Client(ClientConfig(server_url="http://localhost:50051")) as client:
+config = ClientConfig(
+    server_url="http://localhost:50051",
+    api_key=os.environ.get("ORCHER_API_KEY"),  # for an engine that requires one
+)
+async with Client(config) as client:
     handle = await client.start_workflow(
         "confirm-order",
         task_queue="orders",
