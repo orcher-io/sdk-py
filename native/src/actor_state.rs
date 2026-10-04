@@ -83,10 +83,13 @@ pub(crate) async fn client(channels: &StateChannels) -> PyResult<ActorClient> {
         .get()
         .await
         .map_err(|e| PyRuntimeError::new_err(format!("gRPC connect error: {}", e)))?;
-    Ok(ActorServiceClient::with_interceptor(
-        channel,
-        channels.credentials.clone(),
-    ))
+    // Actor state up to the worker's message limit, not tonic's 4 MiB.
+    let max = manager.max_message_bytes();
+    Ok(
+        ActorServiceClient::with_interceptor(channel, channels.credentials.clone())
+            .max_decoding_message_size(max)
+            .max_encoding_message_size(max),
+    )
 }
 
 /// Reads one state key; `None` when the key does not exist.
