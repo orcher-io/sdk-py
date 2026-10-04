@@ -94,6 +94,20 @@ def _optional_millis(ms: int | float | None) -> timedelta | None:
     """
     return None if ms is None else timedelta(milliseconds=ms)
 
+
+def _task_attempt(request: dict[str, Any]) -> int:
+    """Which attempt of its task a request runs, counted from 1.
+
+    An engine that does not number the attempt sends 0, as engines up to
+    0.5.4 did for every attempt, retries included; that reads as 1, never as
+    0, so a first attempt is never mistaken for anything else.
+    """
+    try:
+        attempt = int(request.get("attempt") or 1)
+    except (TypeError, ValueError):
+        return 1
+    return max(attempt, 1)
+
 def _workflow_error_type(error: BaseException) -> str:
     """The execution error type the core is told for a failed workflow.
 
@@ -1415,7 +1429,7 @@ class Worker:
             run_id=request.get("execution_id", ""),
             task_queue=request.get("task_queue", ""),
             namespace=request.get("namespace", "default"),
-            attempt=request.get("attempt", 1),
+            attempt=_task_attempt(request),
             scheduled_at=datetime.now(),
             started_at=datetime.now(),
             heartbeat_timeout=_optional_millis(request.get("heartbeat_timeout_ms")),
@@ -1472,7 +1486,7 @@ class Worker:
 
         # The engine retries a failed task as a new attempt; this worker sees
         # only the attempt number, not the error that caused the retry.
-        attempt = request.get("attempt", 1) or 1
+        attempt = _task_attempt(request)
         if attempt > 1:
             await self._task_interceptor_chain.notify_retry(
                 ictx, exec_info, attempt, _max_attempts(metadata.retry_policy)
