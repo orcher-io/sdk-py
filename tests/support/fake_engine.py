@@ -32,6 +32,10 @@ def _system_time(ms: int) -> dict[str, int]:
     return {"secs_since_epoch": ms // 1000, "nanos_since_epoch": (ms % 1000) * 1_000_000}
 
 
+class NonDeterministicError(AssertionError):
+    """What sdk-core refuses an activation for: see ``FakeEngine.activate``."""
+
+
 @dataclass
 class Activation:
     """What one activation issued."""
@@ -235,9 +239,15 @@ class FakeEngine:
         }
 
     async def activate(self) -> Activation:
-        """Run one activation and apply what it issued."""
+        """Run one activation and apply what it issued.
+
+        Raises ``NonDeterministicError`` where sdk-core would refuse the
+        activation: a step the journal recorded that the code did not reach,
+        while it issues new work or ends the workflow.
+        """
         result = await self.worker._execute_workflow(self.request())
         self._check_with_core(result)
+        self._check_left_behind(result)
         activation = Activation(result=result, commands=list(result["commands"]))
         if not result["successful"]:
             self.failure = result["error"]
@@ -253,6 +263,36 @@ class FakeEngine:
             return
         # Raises ValueError for anything sdk-core would refuse.
         _native._parse_execution_result(json.dumps(result))
+
+    def _check_left_behind(self, result: dict[str, Any]) -> None:
+        reached = result.get("reached_steps")
+        if not isinstance(reached, list):
+            raise AssertionError("the activation does not report the steps it reached")
+        step_kinds = ("ScheduleTask", "StartTimer", "StartChildWorkflow")
+        id_field = {
+            "ScheduleTask": "task_id",
+            "StartTimer": "timer_id",
+            "StartChildWorkflow": "workflow_id",
+        }
+        issued = [
+            body[id_field[kind]]
+            for command in result["commands"]
+            for kind, body in command.items()
+            if kind in step_kinds
+        ]
+        new_work = next((step for step in issued if step not in self.issued), None)
+        ends = any(
+            kind in ("CompleteWorkflow", "FailWorkflow", "RestartFresh")
+            for command in result["commands"]
+            for kind in command
+        )
+        reached_or_issued = set(reached) | set(issued)
+        left = [step for step in self.issued if step not in reached_or_issued]
+        if left and (new_work or ends or not result["successful"]):
+            did = f"issued {new_work}" if new_work else "ended the workflow"
+            raise NonDeterministicError(
+                f"recorded {', '.join(left)} not reached, and the code {did}"
+            )
 
     def _issue(self, kind: str, step_id: str, work_type: str, activation: Activation) -> None:
         activation.steps.append((kind, step_id))

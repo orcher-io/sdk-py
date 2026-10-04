@@ -1146,6 +1146,9 @@ class Worker:
                 "update_results": update_results,
                 "error": None,
                 "restart_fresh": None,
+                # The steps the code reached, which sdk-core checks against
+                # the journal to tell code that no longer replays the run.
+                "reached_steps": ctx._take_reached_steps(),
             }
 
         except WorkflowSuspendedError as e:
@@ -1157,6 +1160,7 @@ class Worker:
             # not run again on the next one.
             await ctx._closures_settled()
             commands = ctx._take_commands()
+            reached_steps = ctx._take_reached_steps()
 
             # Queries and updates are answered even while suspended.
             query_responses = self._process_query_jobs(jobs, ctx)
@@ -1170,6 +1174,7 @@ class Worker:
                 "update_results": update_results,
                 "error": None,
                 "restart_fresh": None,
+                "reached_steps": reached_steps,
             }
 
         except Exception as e:
@@ -1177,6 +1182,7 @@ class Worker:
             # The activation fails and its commands are dropped; closures it
             # left running still finish, rather than being abandoned mid-way.
             await ctx._closures_settled()
+            reached_steps = ctx._take_reached_steps()
 
             duration_ms = (datetime.now() - start_time).total_seconds() * 1000
             exec_info.error = e
@@ -1202,6 +1208,7 @@ class Worker:
                     "retryable": False,
                 },
                 "restart_fresh": None,
+                "reached_steps": reached_steps,
             }
 
     def _process_query_jobs(
