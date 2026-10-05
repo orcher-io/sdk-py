@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.2](https://github.com/orcher-io/sdk-py/compare/v0.4.1...v0.4.2) (2026-10-05)
+
+
+### Bug Fixes
+
+* report the steps each activation reached, and build on orcher-sdk-core 0.9.0 so code that no longer replays a run is caught ([#9](https://github.com/orcher-io/sdk-py/issues/9)) ([505fc51](https://github.com/orcher-io/sdk-py/commit/505fc51a95ae4a52ca1ac282c264cef8212e19ca))
+
+
+### Documentation
+
+* read the version badge from the registry with a short cache ([#7](https://github.com/orcher-io/sdk-py/issues/7)) ([9b05380](https://github.com/orcher-io/sdk-py/commit/9b05380f74ff372666fb9e0b6a38f8074e16f0cd))
+
 ## [0.4.1](https://github.com/orcher-io/sdk-py/compare/v0.4.0...v0.4.1) (2026-10-04)
 
 
