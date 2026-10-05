@@ -21,7 +21,7 @@ pyo3 = { version = "0.23", features = ["abi3-py311"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 
 # ORCHER SDK Core - the Rust implementation
-orcher-sdk-core = "0.8.1"
+orcher-sdk-core = "0.9.0"
 
 # ORCHER Proto - gRPC definitions
 orcher-proto = "0.1"
