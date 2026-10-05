@@ -185,6 +185,13 @@ class WorkflowContext:
         # Commands produced by this activation, handed to the native bridge.
         self._commands: list[dict[str, Any]] = []
 
+        # The id of every step (task, timer, child workflow) the code reached
+        # this activation, in order, whether the journal already held its
+        # outcome or its command is issued now. sdk-core checks them against
+        # the steps the journal recorded to tell code that no longer replays
+        # the run.
+        self._reached_steps: list[str] = []
+
         # The one step counter. Task, timer, child, closure and session ids
         # are derived from it, and each step takes exactly one number whether
         # it is issued or read back from the journal, so an id depends only on
@@ -269,6 +276,21 @@ class WorkflowContext:
         self._step_sequence += 1
         return self._step_sequence
 
+    def _reach(self, step_id: str) -> None:
+        """The code reached the step with this id; see ``_take_reached_steps``."""
+        self._reached_steps.append(step_id)
+
+    def _take_reached_steps(self) -> list[str]:
+        """Take the ids of the steps the code reached this activation (internal).
+
+        sdk-core compares them with the steps the journal recorded: a recorded
+        step left unreached by an activation that issues new work or ends the
+        workflow is reported as non-determinism, and the activation is tried
+        again instead of applied.
+        """
+        reached, self._reached_steps = self._reached_steps, []
+        return reached
+
     def _observe(self, key: str) -> None:
         """The workflow received what was journaled under ``key``: its clock
         moves to when that was journaled."""
@@ -352,6 +374,7 @@ class WorkflowContext:
         # already completed. The task name prefix makes the journal readable.
         sequence = self._next_sequence()
         task_id = f"{task_name}_{sequence}"
+        self._reach(task_id)
 
         # A journaled result means the task already ran: return it instead of
         # scheduling the task again.
@@ -609,6 +632,7 @@ class WorkflowContext:
         sequence = self._next_sequence()
         session_id = f"session_{sequence}"
         task_id = f"{SESSION_CREATE_TASK}_{sequence}"
+        self._reach(task_id)
         cache_key = f"task:{task_id}"
 
         # On replay, the creation task's journaled result is a serialized SessionInfo.
@@ -681,6 +705,7 @@ class WorkflowContext:
         # One number from the step counter on every path.
         sequence = self._next_sequence()
         timer_id = f"timer_{sequence}"
+        self._reach(timer_id)
 
         # A fired timer is in the journal: the sleep is over.
         cache_key = f"timer:{timer_id}"
@@ -741,6 +766,7 @@ class WorkflowContext:
         sequence = self._next_sequence()
         if workflow_id is None:
             workflow_id = f"child_{sequence}"
+        self._reach(workflow_id)
 
         # On replay the worker has injected the child's outcome under
         # child:{id}: return its result, or raise its failure.
@@ -849,6 +875,10 @@ class WorkflowContext:
         # timer is named after the event and how many timed waits for it came
         # before, taken on every path, so a replay names it as the live run did.
         timer_id = self._event_timeout_timer_id(event_name) if timeout else None
+        # Reached on every path, whichever of the event and the deadline wins:
+        # the journal holds this timer whenever an earlier activation parked.
+        if timer_id is not None:
+            self._reach(timer_id)
         fired = self._cached_results.get(f"timer:{timer_id}") if timer_id else None
         timer_fired = timer_id is not None and f"timer:{timer_id}" in self._cached_results
         # A fired marker without a journal position is treated as later than
@@ -1049,6 +1079,7 @@ class WorkflowContext:
         """
         # One number from the step counter on every path.
         sequence = self._next_sequence()
+        self._reach(timer_id)
 
         cache_key = f"timer:{timer_id}"
         if cache_key in self._cached_results:
@@ -1112,6 +1143,7 @@ class WorkflowContext:
         sequence = self._next_sequence()
         if workflow_id is None:
             workflow_id = f"child_{sequence}"
+        self._reach(workflow_id)
 
         # On replay the child may already have ended — return a handle
         # without re-emitting the command.
