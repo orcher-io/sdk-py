@@ -11,7 +11,12 @@ from concurrent.futures import Executor
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from orcher.interceptors.base import Interceptor, TaskInterceptor, WorkflowInterceptor
+from orcher.interceptors.base import (
+    Interceptor,
+    InterceptorFactory,
+    TaskInterceptor,
+    WorkflowInterceptor,
+)
 from orcher.worker.config import WorkerConfig, _undeclared_if_blank
 
 if TYPE_CHECKING:
@@ -382,18 +387,28 @@ class WorkerBuilder:
         self._task_executor = executor
         return self
 
-    def interceptor(self, interceptor: Interceptor) -> WorkerBuilder:
+    def interceptor(self, interceptor: Interceptor | InterceptorFactory) -> WorkerBuilder:
         """Add an interceptor for cross-cutting concerns.
 
-        The interceptor is automatically routed to the workflow or task
-        chain based on its type. If it implements both WorkflowInterceptor
-        and TaskInterceptor, it is added to both chains.
+        An interceptor is routed to the workflow or task chain based on its
+        type. If it implements both WorkflowInterceptor and TaskInterceptor,
+        it is added to both chains.
+
+        A factory such as the built-in ``LoggingInterceptor``,
+        ``MetricsInterceptor`` or ``TracingInterceptor`` is not an interceptor
+        itself; passing one adds ``factory.workflow()`` to the workflow chain
+        and ``factory.task()`` to the task chain.
 
         Args:
-            interceptor: A WorkflowInterceptor, TaskInterceptor, or both.
+            interceptor: A WorkflowInterceptor, a TaskInterceptor, one that is
+                both, or an InterceptorFactory.
 
         Returns:
             Builder instance for chaining
+
+        Raises:
+            TypeError: If ``interceptor`` is none of these, rather than
+                ignoring it.
 
         Example:
             >>> from orcher.interceptors.builtin import LoggingInterceptor
@@ -405,11 +420,34 @@ class WorkerBuilder:
             ...     .build()
             ... )
         """
-        if isinstance(interceptor, WorkflowInterceptor):
-            self._workflow_interceptors.append(interceptor)
-        if isinstance(interceptor, TaskInterceptor):
-            self._task_interceptors.append(interceptor)
-        return self
+        if isinstance(interceptor, WorkflowInterceptor | TaskInterceptor):
+            if isinstance(interceptor, WorkflowInterceptor):
+                self._workflow_interceptors.append(interceptor)
+            if isinstance(interceptor, TaskInterceptor):
+                self._task_interceptors.append(interceptor)
+            return self
+
+        if isinstance(interceptor, InterceptorFactory):
+            workflow_interceptor = interceptor.workflow()
+            task_interceptor = interceptor.task()
+            if not isinstance(workflow_interceptor, WorkflowInterceptor) or not isinstance(
+                task_interceptor, TaskInterceptor
+            ):
+                raise TypeError(
+                    f"{type(interceptor).__name__}.workflow() and .task() must return a "
+                    "WorkflowInterceptor and a TaskInterceptor; got "
+                    f"{type(workflow_interceptor).__name__} and "
+                    f"{type(task_interceptor).__name__}"
+                )
+            self._workflow_interceptors.append(workflow_interceptor)
+            self._task_interceptors.append(task_interceptor)
+            return self
+
+        raise TypeError(
+            "interceptor() expects a WorkflowInterceptor, a TaskInterceptor, or a "
+            "factory with workflow() and task() methods (such as LoggingInterceptor); "
+            f"got {type(interceptor).__name__}"
+        )
 
     def workflow_interceptor(self, interceptor: WorkflowInterceptor) -> WorkerBuilder:
         """Add a workflow-specific interceptor.

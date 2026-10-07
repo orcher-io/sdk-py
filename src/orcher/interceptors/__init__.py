@@ -39,6 +39,7 @@ from orcher.interceptors.base import (
     ExecutionInfo,
     Interceptor,
     InterceptorContext,
+    InterceptorFactory,
     NextFn,
     TaskInterceptor,
     WorkflowInterceptor,
@@ -55,6 +56,7 @@ __all__ = [
     "InterceptorContext",
     "ExecutionInfo",
     "NextFn",
+    "InterceptorFactory",
     # Workflow interceptors
     "WorkflowInterceptor",
     "WorkflowInterceptorChain",

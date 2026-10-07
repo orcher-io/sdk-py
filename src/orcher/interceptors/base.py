@@ -3,7 +3,7 @@
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Protocol, runtime_checkable
 
 __all__ = [
     "InterceptorContext",
@@ -12,6 +12,7 @@ __all__ = [
     "Interceptor",
     "WorkflowInterceptor",
     "TaskInterceptor",
+    "InterceptorFactory",
 ]
 
 # Calls the next interceptor in the chain, or the workflow or task itself.
@@ -265,3 +266,23 @@ class TaskInterceptor(Interceptor):
             max_attempts: Maximum number of attempts configured.
         """
         pass
+
+
+@runtime_checkable
+class InterceptorFactory(Protocol):
+    """Anything that makes a matched workflow and task interceptor pair.
+
+    The built-in ``LoggingInterceptor``, ``MetricsInterceptor`` and
+    ``TracingInterceptor`` are factories of this kind: they are not
+    interceptors themselves, but ``workflow()`` and ``task()`` return
+    interceptors that share the factory's configuration. ``WorkerBuilder``
+    accepts one in ``interceptor()`` and adds both.
+    """
+
+    def workflow(self) -> WorkflowInterceptor:
+        """Create the workflow interceptor."""
+        ...
+
+    def task(self) -> TaskInterceptor:
+        """Create the task interceptor."""
+        ...
