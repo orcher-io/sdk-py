@@ -616,6 +616,9 @@ class Worker:
                 organization_id=self._config.organization_id,
                 api_key=self._config.api_key,
                 version_id=self._config.version_id,
+                tls_ca_cert_path=self._config.tls_ca_cert_path,
+                tls_client_cert_path=self._config.tls_client_cert_path,
+                tls_client_key_path=self._config.tls_client_key_path,
             )
 
             self._bridge_worker = native.BridgeWorker(native_config)
