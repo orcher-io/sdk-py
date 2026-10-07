@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.3](https://github.com/orcher-io/sdk-py/compare/v0.4.2...v0.4.3) (2026-10-07)
+
+
+### Bug Fixes
+
+* accept interceptor factories in WorkerBuilder.interceptor() ([#10](https://github.com/orcher-io/sdk-py/issues/10)) ([3e49a88](https://github.com/orcher-io/sdk-py/commit/3e49a88d57da847b9581863b0cab4c81bac29f01))
+
 ## [0.4.2](https://github.com/orcher-io/sdk-py/compare/v0.4.1...v0.4.2) (2026-10-05)
 
 
