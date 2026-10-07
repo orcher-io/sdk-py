@@ -58,12 +58,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: ${{ matrix.python }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: python-${{ matrix.python }}
+          # The exact version, not the matrix's minor one: PyO3's build script
+          # caches the interpreter's path, which changes with each patch
+          # release the runner image picks up, and a stale one fails to link
+          # the native crate's tests (-lpython3.x not found).
+          key: python-${{ steps.python.outputs.python-version }}
 
       # A fresh virtual environment, so `maturin develop` has one to install
       # into and `cargo test` a Python to link against.
