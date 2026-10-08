@@ -190,47 +190,17 @@ impl PyClientConfig {
 }
 
 impl PyClientConfig {
-    /// Build a TlsConfig from the path fields, reading PEM files from disk.
+    /// The TLS settings for this config's server URL and `tls_*` paths; see
+    /// [`crate::tls::tls_from_paths`].
     fn build_tls_config(
         &self,
     ) -> std::result::Result<Option<orcher_sdk_core::poller::TlsConfig>, String> {
-        // TLS is requested if ANY tls_* path is set. A missing CA means "verify
-        // against the system trust store", not "no TLS", so a client
-        // certificate without a CA never connects in plaintext.
-        if self.tls_ca_cert_path.is_none()
-            && self.tls_client_cert_path.is_none()
-            && self.tls_client_key_path.is_none()
-        {
-            return Ok(None);
-        }
-
-        let ca_cert = self
-            .tls_ca_cert_path
-            .as_ref()
-            .map(|p| std::fs::read(p).map_err(|e| format!("Failed to read CA cert '{}': {}", p, e)))
-            .transpose()?;
-
-        let client_cert = self
-            .tls_client_cert_path
-            .as_ref()
-            .map(|p| {
-                std::fs::read(p).map_err(|e| format!("Failed to read client cert '{}': {}", p, e))
-            })
-            .transpose()?;
-
-        let client_key = self
-            .tls_client_key_path
-            .as_ref()
-            .map(|p| {
-                std::fs::read(p).map_err(|e| format!("Failed to read client key '{}': {}", p, e))
-            })
-            .transpose()?;
-
-        let mut tls = orcher_sdk_core::poller::TlsConfig::new();
-        tls.ca_cert = ca_cert;
-        tls.client_cert = client_cert;
-        tls.client_key = client_key;
-        Ok(Some(tls))
+        crate::tls::tls_from_paths(
+            &self.server_url,
+            self.tls_ca_cert_path.as_deref(),
+            self.tls_client_cert_path.as_deref(),
+            self.tls_client_key_path.as_deref(),
+        )
     }
 }
 
@@ -306,7 +276,7 @@ impl PyClient {
                 let channel = endpoint.connect().await.map_err(|e| {
                     pyo3::exceptions::PyRuntimeError::new_err(format!(
                         "TLS connection failed: {}",
-                        e
+                        crate::tls::with_causes(&e)
                     ))
                 })?;
 

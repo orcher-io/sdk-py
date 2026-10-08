@@ -27,6 +27,7 @@ mod convert;
 mod error;
 mod journal_times;
 mod runtime;
+mod tls;
 mod worker;
 mod types;
 

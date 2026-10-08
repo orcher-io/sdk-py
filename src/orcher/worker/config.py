@@ -59,6 +59,17 @@ class WorkerConfig:
         api_key: Optional API key, sent as `authorization: Bearer <key>` on every
             request the worker makes, for servers that require one. from_env
             reads it from {prefix}API_KEY. Never shown by repr.
+        tls_ca_cert_path: Optional path to a CA certificate PEM file, for a
+            private or self-signed authority. Without one the server is
+            verified against the system trust store.
+        tls_client_cert_path: Optional path to a client certificate PEM file,
+            for mTLS. Requires tls_client_key_path.
+        tls_client_key_path: Optional path to the client key PEM file, for
+            mTLS. Requires tls_client_cert_path.
+
+    TLS follows the URL scheme: an ``https://`` server_url connects over TLS
+    verified against the system trust store, ``http://`` in plaintext. The
+    tls_* paths apply to every connection the worker opens.
 
     Example:
         >>> config = WorkerConfig(
@@ -107,6 +118,12 @@ class WorkerConfig:
     # never logs the key.
     api_key: str | None = field(default=None, repr=False)
 
+    # TLS (optional). An https:// server_url uses TLS without any of these;
+    # they add a private CA or a client certificate (mTLS).
+    tls_ca_cert_path: str | None = None
+    tls_client_cert_path: str | None = None
+    tls_client_key_path: str | None = None
+
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
         self._validate()
@@ -146,6 +163,9 @@ class WorkerConfig:
         if self.force_shutdown_timeout_ms < 0:
             raise ValueError("force_shutdown_timeout_ms must be >= 0")
 
+        if (self.tls_client_cert_path is None) != (self.tls_client_key_path is None):
+            raise ValueError("tls_client_cert_path and tls_client_key_path must be set together")
+
     @classmethod
     def from_env(cls, prefix: str = "ORCHER_") -> "WorkerConfig":
         """
@@ -163,6 +183,7 @@ class WorkerConfig:
         - {prefix}SHUTDOWN_GRACE_TIME_MS, {prefix}FORCE_SHUTDOWN_TIMEOUT_MS
         - {prefix}VERSION_ID, {prefix}BINARY_CHECKSUM, {prefix}ORGANIZATION_ID
         - {prefix}API_KEY
+        - {prefix}TLS_CA_CERT_PATH, {prefix}TLS_CLIENT_CERT_PATH, {prefix}TLS_CLIENT_KEY_PATH
 
         Only SERVER_URL and TASK_QUEUE are required.
 
@@ -215,4 +236,11 @@ class WorkerConfig:
             # Blank is "no key": an exported-but-empty variable must not send
             # an empty bearer token.
             api_key=_undeclared_if_blank(os.environ.get(f"{prefix}API_KEY")),
+            tls_ca_cert_path=_undeclared_if_blank(os.environ.get(f"{prefix}TLS_CA_CERT_PATH")),
+            tls_client_cert_path=_undeclared_if_blank(
+                os.environ.get(f"{prefix}TLS_CLIENT_CERT_PATH")
+            ),
+            tls_client_key_path=_undeclared_if_blank(
+                os.environ.get(f"{prefix}TLS_CLIENT_KEY_PATH")
+            ),
         )

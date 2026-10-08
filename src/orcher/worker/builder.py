@@ -91,6 +91,9 @@ class WorkerBuilder:
         # reaches a process. Read the same variable as from_env and the client;
         # an explicit .api_key() takes precedence.
         self._api_key: str | None = _undeclared_if_blank(os.environ.get("ORCHER_API_KEY"))
+        self._tls_ca_cert_path: str | None = None
+        self._tls_client_cert_path: str | None = None
+        self._tls_client_key_path: str | None = None
 
         # Auto-discovery settings
         self._auto_discover_paths: list[str] | None = None
@@ -358,6 +361,52 @@ class WorkerBuilder:
         self._api_key = _undeclared_if_blank(key)
         return self
 
+    def tls(
+        self,
+        ca_cert_path: str | os.PathLike[str] | None = None,
+        client_cert_path: str | os.PathLike[str] | None = None,
+        client_key_path: str | os.PathLike[str] | None = None,
+    ) -> WorkerBuilder:
+        """
+        Set the TLS certificates for every connection the worker opens.
+
+        An ``https://`` server URL needs none of this: it connects over TLS
+        verified against the system trust store by default. Supply a CA for a
+        private or self-signed authority, and a client certificate and key for
+        mTLS. The paths match the client's ``tls_*`` options.
+
+        Args:
+            ca_cert_path: CA certificate PEM file. None verifies the server
+                against the system trust store.
+            client_cert_path: Client certificate PEM file, for mTLS. Requires
+                client_key_path.
+            client_key_path: Client private key PEM file, for mTLS. Requires
+                client_cert_path.
+
+        Returns:
+            Builder instance for chaining
+
+        Raises:
+            ValueError: If only one of client_cert_path and client_key_path is given.
+
+        Example:
+            >>> builder.server_url("https://orcher.internal:443").tls(
+            ...     ca_cert_path="ca.pem",
+            ...     client_cert_path="client.pem",
+            ...     client_key_path="client-key.pem",
+            ... )
+        """
+        if (client_cert_path is None) != (client_key_path is None):
+            raise ValueError("client_cert_path and client_key_path must be set together")
+        self._tls_ca_cert_path = os.fspath(ca_cert_path) if ca_cert_path is not None else None
+        self._tls_client_cert_path = (
+            os.fspath(client_cert_path) if client_cert_path is not None else None
+        )
+        self._tls_client_key_path = (
+            os.fspath(client_key_path) if client_key_path is not None else None
+        )
+        return self
+
     def task_executor(self, executor: Executor) -> WorkerBuilder:
         """
         Set the executor for sync tasks.
@@ -570,6 +619,10 @@ class WorkerBuilder:
 
         if self._api_key:
             config_kwargs["api_key"] = self._api_key
+
+        config_kwargs["tls_ca_cert_path"] = self._tls_ca_cert_path
+        config_kwargs["tls_client_cert_path"] = self._tls_client_cert_path
+        config_kwargs["tls_client_key_path"] = self._tls_client_key_path
 
         config = WorkerConfig(**config_kwargs)
 
