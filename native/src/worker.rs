@@ -1151,6 +1151,7 @@ impl PyBridgeWorker {
                             .to_string(),
                         mode,
                         metadata: std::collections::HashMap::new(),
+                        ..Default::default()
                     }
                 })
                 .collect();
@@ -1165,6 +1166,7 @@ impl PyBridgeWorker {
                 service_id,
                 handlers,
                 metadata,
+                ..Default::default()
             });
 
             let response = client.register_handlers(request).await.map_err(|e| {
@@ -1222,6 +1224,7 @@ impl PyBridgeWorker {
                 timeout_ms: timeout_ms.unwrap_or(30_000),
                 idempotency_key: String::new(),
                 metadata: std::collections::HashMap::new(),
+                ..Default::default()
             });
 
             let response = client.invoke_operation(request).await.map_err(|e| {

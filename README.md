@@ -178,6 +178,12 @@ handle = await client.get_workflow("approval-42")
 await handle.send_event("approved", True)
 ```
 
+Cancel it the same way, optionally limiting how long its cleanup may take before the engine terminates it. Engines from before cancellation cleanup ignore the limit and cancel at once:
+
+```python
+await handle.cancel(cleanup_timeout=timedelta(seconds=30))
+```
+
 </details>
 
 <details>

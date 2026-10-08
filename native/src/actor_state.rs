@@ -107,6 +107,7 @@ pub(crate) async fn get_state(
             key,
             state_key,
             execution_id,
+            ..Default::default()
         })
         .await
         .map_err(|e| PyRuntimeError::new_err(format!("GetState RPC error: {}", e)))?
@@ -132,6 +133,7 @@ pub(crate) async fn set_state(
             value,
             execution_id,
             expected_version: String::new(),
+            ..Default::default()
         })
         .await
         .map_err(|e| PyRuntimeError::new_err(format!("SetState RPC error: {}", e)))?;
@@ -153,6 +155,7 @@ pub(crate) async fn delete_state(
             key,
             state_key,
             execution_id,
+            ..Default::default()
         })
         .await
         .map_err(|e| PyRuntimeError::new_err(format!("DeleteState RPC error: {}", e)))?;
@@ -174,6 +177,7 @@ pub(crate) async fn list_state_keys(
             key,
             execution_id,
             prefix,
+            ..Default::default()
         })
         .await
         .map_err(|e| PyRuntimeError::new_err(format!("ListStateKeys RPC error: {}", e)))?;

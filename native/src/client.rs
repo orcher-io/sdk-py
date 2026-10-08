@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-use orcher_sdk_core::client::{StartWorkflowOpts, WorkflowClient, WorkflowHandle};
+use orcher_sdk_core::client::{CancelWorkflowOpts, StartWorkflowOpts, WorkflowClient, WorkflowHandle};
 use orcher_sdk_core::types::{
     ListWorkflowsOptions, ListWorkflowsSortOrder, SearchWorkflowsOptions, WorkflowExecution,
     WorkflowStatus,
@@ -24,6 +24,15 @@ fn ms_to_proto_duration(ms: u64) -> orcher_sdk_core::proto::prost_types::Duratio
     orcher_sdk_core::proto::prost_types::Duration {
         seconds: (ms / 1000) as i64,
         nanos: ((ms % 1000) * 1_000_000) as i32,
+    }
+}
+
+/// The sdk-core options for a cancellation whose cleanup may take `cleanup_timeout`.
+fn cancel_opts(cleanup_timeout: Option<Duration>) -> CancelWorkflowOpts {
+    let opts = CancelWorkflowOpts::default();
+    match cleanup_timeout {
+        Some(timeout) => opts.with_cleanup_timeout(timeout),
+        None => opts,
     }
 }
 
@@ -70,6 +79,7 @@ fn extract_retry_policy(
             .and_then(|v| v.extract().ok())
             .unwrap_or(0),
         non_retryable_error_types: non_retryable,
+        ..Default::default()
     }))
 }
 
@@ -765,13 +775,23 @@ impl PyWorkflowHandle {
         })
     }
 
-    /// Cancel the workflow
-    fn cancel<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    /// Cancel the workflow.
+    ///
+    /// `cleanup_timeout_ms` is how long the workflow may spend cleaning up
+    /// before the engine terminates it; `None` sets no limit. Engines from
+    /// before cancellation cleanup ignore it and cancel at once.
+    #[pyo3(signature = (cleanup_timeout_ms = None))]
+    fn cancel<'py>(
+        &self,
+        py: Python<'py>,
+        cleanup_timeout_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
+        let opts = cancel_opts(cleanup_timeout_ms.map(Duration::from_millis));
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let handle = inner.lock().await;
-            handle.cancel().await.into_py_result()?;
+            handle.cancel_with(opts).await.into_py_result()?;
             Ok(())
         })
     }
@@ -845,5 +865,18 @@ mod tests {
         assert_eq!(config.namespace, "default");
         assert_eq!(config.timeout_ms, 10000);
         assert_eq!(config.connect_timeout_ms, 2500);
+    }
+
+    #[test]
+    fn a_cancellation_sets_no_cleanup_limit_by_default() {
+        assert_eq!(cancel_opts(None).cleanup_timeout, None);
+    }
+
+    #[test]
+    fn a_cancellation_passes_its_cleanup_limit_to_sdk_core() {
+        assert_eq!(
+            cancel_opts(Some(Duration::from_millis(90_500))).cleanup_timeout,
+            Some(Duration::from_millis(90_500))
+        );
     }
 }

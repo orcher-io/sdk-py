@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from orcher.errors._translate import translates_native_errors
@@ -200,18 +201,34 @@ class WorkflowHandle(Generic[T]):
         return await native.update(update_name, update_args)
 
     @translates_native_errors
-    async def cancel(self) -> None:
+    async def cancel(self, cleanup_timeout: timedelta | None = None) -> None:
         """Request workflow cancellation.
 
         This sends a cancellation request to the workflow. The workflow
         can handle this gracefully or ignore it.
 
+        Example::
+
+            await handle.cancel(cleanup_timeout=timedelta(seconds=30))
+
+        Args:
+            cleanup_timeout: How long the workflow may spend cleaning up after
+                it observes the cancellation, after which the engine terminates
+                it. ``None`` sets no limit. Engines from before cancellation
+                cleanup ignore it and cancel at once.
+
         Raises:
+            ValueError: If ``cleanup_timeout`` is negative.
             WorkflowError: If the workflow is not found.
             ClientError: If there's a communication error.
         """
+        cleanup_timeout_ms = None
+        if cleanup_timeout is not None:
+            if cleanup_timeout < timedelta(0):
+                raise ValueError(f"cleanup_timeout must not be negative, got {cleanup_timeout}")
+            cleanup_timeout_ms = int(cleanup_timeout.total_seconds() * 1000)
         native = self._ensure_native()
-        await native.cancel()
+        await native.cancel(cleanup_timeout_ms)
 
     @translates_native_errors
     async def terminate(self, reason: str = "") -> None:
