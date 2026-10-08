@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.4](https://github.com/orcher-io/sdk-py/compare/v0.4.3...v0.4.4) (2026-10-08)
+
+
+### Features
+
+* TLS and mTLS for workers, automatic TLS for https:// URLs ([#25](https://github.com/orcher-io/sdk-py/issues/25)) ([9833b4b](https://github.com/orcher-io/sdk-py/commit/9833b4bcb28fbeba488133d64d4cedc6bb5c7bc8))
+
 ## [0.4.3](https://github.com/orcher-io/sdk-py/compare/v0.4.2...v0.4.3) (2026-10-07)
 
 
