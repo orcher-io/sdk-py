@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.6](https://github.com/orcher-io/sdk-py/compare/v0.4.5...v0.4.6) (2026-10-09)
+
+
+### Features
+
+* let a workflow clean up when it is cancelled ([#29](https://github.com/orcher-io/sdk-py/issues/29)) ([397945f](https://github.com/orcher-io/sdk-py/commit/397945f269ef5a12a45495580a8f281d271b9dd9))
+
 ## [0.4.5](https://github.com/orcher-io/sdk-py/compare/v0.4.4...v0.4.5) (2026-10-09)
 
 
