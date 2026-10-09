@@ -297,6 +297,92 @@ async def wait_for_event_timeout(ctx: WorkflowContext, key: str) -> dict:
     return {"received": received, "timed_out": received is None}
 
 
+# --- Cancellation: a cancelled workflow is told, once, and may clean up -------
+
+
+@task(name="cancel_cleanup", retry=1)
+async def cancel_cleanup(ctx: TaskContext) -> str:
+    """Cleanup long enough to be heartbeated. Reports whether it was told to
+    stop: work started after a cancellation request is cleanup, and the engine
+    must let it finish."""
+    import asyncio
+    import time
+
+    started = time.monotonic()
+    while time.monotonic() - started < 2.5:
+        if ctx.cancellation_token.is_cancelled:
+            return "interrupted"
+        await asyncio.sleep(0.1)
+    return "cleaned"
+
+
+@task(name="cancel_reserve", retry=1)
+async def cancel_reserve(ctx: TaskContext) -> str:
+    """A step a saga can undo."""
+    return "reserved"
+
+
+@task(name="cancel_release", retry=1)
+async def cancel_release(ctx: TaskContext) -> str:
+    """Undoes ``cancel_reserve``."""
+    return "released"
+
+
+def _is_cancellation(e: Exception) -> bool:
+    from orcher.errors import ErrorCode
+
+    return isinstance(e, WorkflowError) and e.code == ErrorCode.WORKFLOW_CANCELLED
+
+
+@workflow(name="cancel_sleep")
+async def cancel_sleep(ctx: WorkflowContext, key: str) -> str:
+    """Park on a long sleep and let the cancellation it is told of end it."""
+    PARKED_WORKFLOWS.add(key)
+    await ctx.sleep(timedelta(minutes=10))
+    return "slept"
+
+
+@workflow(name="cancel_cleanup")
+async def cancel_cleanup_workflow(ctx: WorkflowContext, key: str) -> dict:
+    """Park on a long sleep; when told it is cancelled, run cleanup and return,
+    which ends it completed."""
+    PARKED_WORKFLOWS.add(key)
+    try:
+        await ctx.sleep(timedelta(minutes=10))
+    except WorkflowError as e:
+        if not _is_cancellation(e):
+            raise
+        cleanup = await ctx.execute_task(cancel_cleanup)
+        return {"told": ctx.is_cancel_requested(), "cleanup": cleanup}
+    raise WorkflowError.execution_failed(
+        ctx.info.workflow_id, "the sleep finished; the cancellation never arrived"
+    )
+
+
+@workflow(name="cancel_saga")
+async def cancel_saga(ctx: WorkflowContext, key: str) -> dict:
+    """Reserve, then park; when told it is cancelled, compensate the reservation
+    and report how many compensations ran."""
+    from orcher import Saga
+
+    saga = Saga()
+    await saga.add_step(
+        action=lambda: ctx.execute_task(cancel_reserve),
+        compensation=lambda: ctx.execute_task(cancel_release),
+    )
+    PARKED_WORKFLOWS.add(key)
+    try:
+        await ctx.sleep(timedelta(minutes=10))
+    except WorkflowError as e:
+        if not _is_cancellation(e):
+            raise
+        compensated = await saga.compensate()
+        return {"compensated": compensated}
+    raise WorkflowError.execution_failed(
+        ctx.info.workflow_id, "the sleep finished; the cancellation never arrived"
+    )
+
+
 # --- Actor catalog -----------------------------------------------------------
 #
 # `contract_probe` checks the shared/exclusive scheduling contract end to end:
