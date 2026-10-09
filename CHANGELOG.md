@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.5](https://github.com/orcher-io/sdk-py/compare/v0.4.4...v0.4.5) (2026-10-09)
+
+
+### Features
+
+* build on orcher-sdk-core 0.10, with a cleanup limit on cancellation ([dbf481a](https://github.com/orcher-io/sdk-py/commit/dbf481ac59d73184aea6375aa728e9529af6b511))
+
 ## [0.4.4](https://github.com/orcher-io/sdk-py/compare/v0.4.3...v0.4.4) (2026-10-08)
 
 
