@@ -208,6 +208,14 @@ class WorkflowContext:
         # When each buffered event was journaled, per name, oldest first.
         self._event_times: dict[str, list[int]] = {}
 
+        # A request to cancel the workflow, if the journal holds one, and when it
+        # was journaled. The code is told once, at the first wait whose result
+        # the journal did not record before the request: the same wait on every
+        # replay, since the code's order and the journal's times are both fixed.
+        self._cancel_requested = False
+        self._cancel_requested_at: int | None = None
+        self._cancel_delivered = False
+
         # Deadline timers of timed event waits, counted per event name.
         self._event_timeout_waits: dict[str, int] = {}
 
@@ -379,6 +387,7 @@ class WorkflowContext:
         # A journaled result means the task already ran: return it instead of
         # scheduling the task again.
         cache_key = f"task:{task_id}"
+        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(task_id))
         if cache_key in self._cached_results:
             self._observe(task_id)
             cached = self._cached_results[cache_key]
@@ -634,6 +643,7 @@ class WorkflowContext:
         task_id = f"{SESSION_CREATE_TASK}_{sequence}"
         self._reach(task_id)
         cache_key = f"task:{task_id}"
+        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(task_id))
 
         # On replay, the creation task's journaled result is a serialized SessionInfo.
         if cache_key in self._cached_results:
@@ -709,6 +719,7 @@ class WorkflowContext:
 
         # A fired timer is in the journal: the sleep is over.
         cache_key = f"timer:{timer_id}"
+        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(cache_key))
         if cache_key in self._cached_results:
             self._observe(cache_key)
             return
@@ -808,6 +819,7 @@ class WorkflowContext:
         """A child's result from the journal: returned, raised if the child
         failed or ended without one, or the workflow suspends until it ends."""
         cache_key = f"child:{workflow_id}"
+        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(cache_key))
         if cache_key not in self._cached_results:
             from orcher.errors import WorkflowSuspendedError
 
@@ -897,6 +909,20 @@ class WorkflowContext:
         buffer_key = f"event_buffer:{event_name}"
         positions = self._cached_results.get(f"event_positions:{event_name}") or []
         buffer = self._cached_results.get(buffer_key)
+        # This wait's result is the event or the deadline, whichever the journal
+        # recorded first; if neither came before a cancellation request, the
+        # request is delivered here.
+        received_at: list[int | None] = []
+        if buffer:
+            event_times = self._event_times.get(event_name)
+            received_at.append(event_times[0] if event_times else None)
+        if timer_fired:
+            received_at.append(self._resolved_at.get(f"timer:{timer_id}"))
+        known = [at for at in received_at if at is not None]
+        self._cancellation(
+            bool(received_at),
+            min(known) if known and len(known) == len(received_at) else None,
+        )
         if buffer:
             event_at = positions[0] if positions else -math.inf
             if not timer_fired or event_at < fired_at:
@@ -1082,6 +1108,7 @@ class WorkflowContext:
         self._reach(timer_id)
 
         cache_key = f"timer:{timer_id}"
+        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(cache_key))
         if cache_key in self._cached_results:
             self._observe(cache_key)
             return
@@ -1294,6 +1321,40 @@ class WorkflowContext:
         commands, self._commands = self._commands, []
         results = [c for c in commands if "RecordStepResult" in c]
         return results + [c for c in commands if "RecordStepResult" not in c]
+
+    def is_cancel_requested(self) -> bool:
+        """Whether the workflow has been told it is being cancelled.
+
+        True from the wait at which the code learned of the request onwards:
+        that wait raised ``WorkflowError`` with code ``WORKFLOW_CANCELLED``, and
+        everything after it is the workflow's cleanup, which runs normally. A
+        long loop that does not wait can check this to stop early. Read from the
+        journal, so it answers the same at the same point on every replay.
+        """
+        return self._cancel_delivered
+
+    def _note_cancel_requested(self, at_ms: int | None) -> None:
+        """The journal holds a request to cancel the workflow, journaled at
+        ``at_ms`` (ms since the epoch) when known."""
+        self._cancel_requested = True
+        self._cancel_requested_at = at_ms
+
+    def _cancellation(self, present: bool, at_ms: int | None) -> None:
+        """Raise the cancellation here if this wait is where the code learns of
+        the request: one has come, the code has not been told, and this wait's
+        result (``present``, journaled at ``at_ms`` if known) was not journaled
+        before it. A result journaled no later than the request is received; one
+        with no known time is too, since it exists."""
+        if not self._cancel_requested or self._cancel_delivered:
+            return
+        if present:
+            requested_at = self._cancel_requested_at
+            if at_ms is None or requested_at is None or at_ms <= requested_at:
+                return
+        self._cancel_delivered = True
+        from orcher.errors import WorkflowError
+
+        raise WorkflowError.cancelled(self.info.workflow_id)
 
     def _record_journal_times(self, times: dict[str, Any]) -> None:
         """Record when the engine journaled what this activation can hand the

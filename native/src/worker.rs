@@ -307,6 +307,10 @@ impl PyWorkerConfig {
         config.strict_determinism = false;
         config.poller_count = self.workflow_poller_count;
         config.organization_id = self.organization_id.clone();
+        // The Python layer hands a cancellation request to workflow code
+        // (WorkflowContext.is_cancel_requested), so the engine may wait for the
+        // workflow to clean up and end itself.
+        config.protocol_version = orcher_sdk_core::worker_protocol::CANCEL_REQUEST;
         config.api_key = self.api_key.clone();
         config.tls_config = tls_config.clone();
         config.version_id = self.version_id.clone();

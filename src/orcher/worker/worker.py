@@ -1067,6 +1067,12 @@ class Worker:
         )
         ctx = WorkflowContext(info=info, replaying=request.get("is_replaying", False))
         ctx._record_journal_times(journal_times)
+        # A request to cancel the workflow: it is told at its first wait whose
+        # result the journal did not record before it, by the journal's times.
+        # The engine adds step results after the journal's own entries, so where
+        # a job sits says nothing about when it happened.
+        if any(isinstance(job, dict) and "CancelWorkflow" in job for job in jobs):
+            ctx._note_cancel_requested(journal_times.get("cancel_requested_at"))
 
         ictx = InterceptorContext(
             workflow_id=workflow_id,
@@ -1181,6 +1187,30 @@ class Worker:
             }
 
         except Exception as e:
+            told_and_not_caught = (
+                ctx.is_cancel_requested()
+                and getattr(e, "code", None) == ErrorCode.WORKFLOW_CANCELLED
+            )
+            if told_and_not_caught:
+                # The cancellation the workflow was told of, not caught: it ends
+                # as cancelled, with whatever cleanup it issued before giving up.
+                logger.info(f"Workflow {workflow_id} ended as cancelled")
+                await ctx._closures_settled()
+                exec_info.duration_ms = (datetime.now() - start_time).total_seconds() * 1000
+                await self._workflow_interceptor_chain.notify_exit(ictx, exec_info)
+                return {
+                    "run_id": run_id,
+                    "successful": True,
+                    "commands": [
+                        *ctx._take_commands(),
+                        {"CancelWorkflowExecution": {"details": None}},
+                    ],
+                    "query_responses": self._process_query_jobs(jobs, ctx),
+                    "update_results": await self._process_update_jobs(jobs, ctx),
+                    "error": None,
+                    "restart_fresh": None,
+                    "reached_steps": ctx._take_reached_steps(),
+                }
             logger.exception(f"Workflow execution failed: {e}")
             # The activation fails and its commands are dropped; closures it
             # left running still finish, rather than being abandoned mid-way.

@@ -22,6 +22,9 @@ pub struct JournalTimes {
     pub resolved_at: HashMap<String, i64>,
     /// When each event was journaled, per name, in journal order.
     pub events: HashMap<String, Vec<i64>>,
+    /// When a request to cancel the workflow was journaled. The workflow learns of
+    /// it at its first wait whose result was journaled after this.
+    pub cancel_requested_at: Option<i64>,
 }
 
 impl JournalTimes {
@@ -38,6 +41,9 @@ impl JournalTimes {
             };
             if entry.entry_type == EntryType::WorkflowExecutionStarted as i32 {
                 times.started_at_ms.get_or_insert(at_ms);
+            }
+            if entry.entry_type == EntryType::WorkflowExecutionCancelRequested as i32 {
+                times.cancel_requested_at.get_or_insert(at_ms);
             }
             let key = match &entry.attributes {
                 Some(Attributes::StepCompleted(a)) => a.step_name.clone(),
@@ -79,7 +85,7 @@ mod tests {
     use orcher_sdk_core::proto::orcher::v1::{
         ChildWorkflowExecutionCanceledEventAttributes, EventReceivedEventAttributes,
         StepCompletedEventAttributes, TimerFiredEventAttributes,
-        WorkflowExecutionStartedEventAttributes,
+        WorkflowExecutionCancelRequestedEventAttributes, WorkflowExecutionStartedEventAttributes,
     };
     use orcher_sdk_core::proto::prost_types::Timestamp;
 
@@ -93,6 +99,24 @@ mod tests {
             attributes: Some(attributes),
             ..Default::default()
         }
+    }
+
+    /// The workflow is told of a cancellation at its first wait whose result was
+    /// journaled after the request, so the request's time is read too.
+    #[test]
+    fn reads_when_cancellation_was_requested() {
+        let journal = [entry(
+            EntryType::WorkflowExecutionCancelRequested,
+            Some(2_000),
+            Attributes::WorkflowExecutionCancelRequested(
+                WorkflowExecutionCancelRequestedEventAttributes::default(),
+            ),
+        )];
+        assert_eq!(
+            JournalTimes::read(&journal).cancel_requested_at,
+            Some(2_000)
+        );
+        assert_eq!(JournalTimes::read(&[]).cancel_requested_at, None);
     }
 
     #[test]
@@ -181,6 +205,7 @@ mod tests {
             started_at_ms: Some(5),
             resolved_at: HashMap::from([("timer:t".to_string(), 7)]),
             events: HashMap::new(),
+            cancel_requested_at: Some(9),
         };
         assert_eq!(
             serde_json::to_value(&times).unwrap(),
@@ -188,6 +213,7 @@ mod tests {
                 "started_at_ms": 5,
                 "resolved_at": { "timer:t": 7 },
                 "events": {},
+                "cancel_requested_at": 9,
             })
         );
     }
