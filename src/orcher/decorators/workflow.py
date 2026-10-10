@@ -5,7 +5,7 @@ from __future__ import annotations
 import functools
 import inspect
 from collections.abc import Callable
-from typing import Any, TypeVar, cast
+from typing import Any, Protocol, TypeVar, cast, overload
 
 from orcher.decorators.registry import GlobalRegistry, HandlerType, WorkflowMetadata
 
@@ -15,13 +15,23 @@ F = TypeVar("F", bound=Callable[..., Any])
 T = TypeVar("T")
 
 
+class _WorkflowDecorator(Protocol):
+    """What ``workflow(...)`` returns: it gives back the class or function it decorates."""
+
+    @overload
+    def __call__(self, fn: type[T], /) -> type[T]: ...
+
+    @overload
+    def __call__(self, fn: F, /) -> F: ...
+
+
 def workflow(
     *,
     name: str,
     version: str = "1.0",
     description: str = "",
     cron_schedule: str | None = None,
-) -> Callable[[F | type[T]], F | type[T]]:
+) -> _WorkflowDecorator:
     """Define a workflow function or class.
 
     Apply it to either:
@@ -70,7 +80,7 @@ def workflow(
         ...         return {"status": "completed", "result": result}
     """
 
-    def decorator(fn: F | type[T]) -> F | type[T]:
+    def decorator(fn: Callable[..., Any]) -> Callable[..., Any]:
         if not callable(fn):
             raise ValueError(
                 f"@workflow decorator must be applied to a function or class, got {type(fn)}"
@@ -79,7 +89,7 @@ def workflow(
         is_class = inspect.isclass(fn)
 
         if is_class:
-            cls = cast(type[T], fn)
+            cls = cast(type[Any], fn)
 
             if not hasattr(cls, "run"):
                 raise ValueError(
@@ -87,7 +97,7 @@ def workflow(
                     f"Define: async def run(self, ctx: WorkflowContext, ...) -> ..."
                 )
 
-            run_method = cls.run  # type: ignore[attr-defined]
+            run_method = cls.run
             if not callable(run_method):
                 raise ValueError(f"Workflow class '{cls.__name__}' run attribute must be a method.")
 
@@ -115,10 +125,10 @@ def workflow(
             registry.register_workflow(metadata)
 
             # Attach metadata to the class for introspection
-            cls.__orcher_workflow__ = metadata  # type: ignore
-            cls.__orcher_workflow_name__ = name  # type: ignore
-            cls.__orcher_workflow_version__ = version  # type: ignore
-            cls.__orcher_cron_schedule__ = cron_schedule  # type: ignore
+            cls.__orcher_workflow__ = metadata
+            cls.__orcher_workflow_name__ = name
+            cls.__orcher_workflow_version__ = version
+            cls.__orcher_cron_schedule__ = cron_schedule
 
             return cls
 
@@ -160,6 +170,6 @@ def workflow(
             wrapper.__orcher_workflow_version__ = version  # type: ignore
             wrapper.__orcher_cron_schedule__ = cron_schedule  # type: ignore
 
-            return wrapper  # type: ignore
+            return wrapper
 
-    return decorator
+    return cast(_WorkflowDecorator, decorator)
