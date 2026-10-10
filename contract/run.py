@@ -316,6 +316,57 @@ async def run_event_scenario(
     return True, ""
 
 
+async def run_cancel_scenario(
+    client: Client, args: argparse.Namespace, sc: dict
+) -> tuple[bool, str]:
+    """Start the workflow, cancel it once it has parked, and assert how it ended.
+
+    ``expect.status`` is ``cancelled`` for a workflow that lets the cancellation
+    it is told of end it, and ``completed``, with ``expect.result``, for one
+    that cleans up and returns.
+    """
+    from orcher.types import WorkflowStatus
+
+    expect = sc["expect"]
+    key = f"conf-{uuid.uuid4()}"
+    scenario_input = sc.get("input", {})
+    payload = {**(scenario_input if isinstance(scenario_input, dict) else {}), "key": key}
+    handle = await client.start_workflow(
+        sc["workflow"], task_queue=args.task_queue, args=(payload,)
+    )
+
+    if not await _wait_until_parked(key, args.result_timeout_secs):
+        with contextlib.suppress(Exception):  # best effort
+            await handle.cancel()
+        return False, "the workflow never parked"
+    # As for an event: let the engine record the parking activation, so the
+    # cancellation wakes a parked workflow rather than racing its first run.
+    await asyncio.sleep(0.5)
+    await handle.cancel()
+
+    status = expect.get("status")
+    if status == "cancelled":
+        deadline = time.monotonic() + args.result_timeout_secs
+        while True:
+            current = await handle.status()
+            if current == WorkflowStatus.CANCELLED:
+                return True, ""
+            if current != WorkflowStatus.RUNNING or time.monotonic() >= deadline:
+                return False, f"expected the workflow cancelled, it is {current}"
+            await asyncio.sleep(0.2)
+    if status == "completed":
+        try:
+            result = await handle.result(timeout=args.result_timeout_secs)
+        except Exception as e:
+            return False, f"expected completion after cleanup but got: {e}"
+        if not json_matches(expect.get("result", {}), result):
+            return False, (
+                f"result mismatch\n    expected: {expect.get('result')}\n    actual:   {result}"
+            )
+        return True, ""
+    return False, f"unknown expected status '{status}' for a cancel scenario"
+
+
 async def run_workflow_id_reuse_scenario(
     client: Client, args: argparse.Namespace, sc: dict
 ) -> tuple[bool, str]:
@@ -584,6 +635,9 @@ async def main() -> None:
             label = sc["workflow"]
         elif kind == "event":
             ok, msg = await run_event_scenario(client, args, sc)
+            label = sc["workflow"]
+        elif kind == "cancel":
+            ok, msg = await run_cancel_scenario(client, args, sc)
             label = sc["workflow"]
         elif kind == "engine_restart":
             ok, msg = await run_engine_restart_scenario(client, args, sc)
