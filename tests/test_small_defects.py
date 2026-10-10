@@ -142,3 +142,23 @@ def test_a_description_reads_its_times_like_a_listing() -> None:
     assert description.start_time == listing.start_time
     assert description.start_time is not None
     assert description.close_time is None
+
+
+def test_a_missing_native_module_names_the_sdk_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    # `pip install orcher` installs the CLI, not this SDK.
+    import orcher
+    from orcher.core import native
+
+    missing = ImportError("No module named 'orcher._native'")
+    monkeypatch.setattr(orcher, "__native_version__", None)
+    monkeypatch.setattr(orcher, "_import_error", missing, raising=False)
+    monkeypatch.setattr(native, "_native_module", None)
+    monkeypatch.setattr(native, "_native_error", missing)
+
+    with pytest.raises(ImportError) as from_package:
+        orcher._check_native()
+    with pytest.raises(native.NativeError) as from_core:
+        native.get_native_module()
+
+    for message in (str(from_package.value), str(from_core.value)):
+        assert "pip install orcher-sdk\n" in message
