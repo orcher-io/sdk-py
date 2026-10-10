@@ -205,7 +205,7 @@ def _check_native() -> None:
     if __native_version__ is None:
         raise ImportError(
             "ORCHER native module not found. "
-            "Please install the package with: pip install orcher\n"
+            "Please install the package with: pip install orcher-sdk\n"
             "Or build from source with: maturin develop\n"
             f"Original error: {_import_error}"
         )
