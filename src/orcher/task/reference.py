@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+if TYPE_CHECKING:
+    from orcher.decorators.registry import TaskMetadata
+
 __all__ = ["TaskReference"]
 
 TInput = TypeVar("TInput")
@@ -27,6 +30,9 @@ class TaskReference(Generic[TInput, TOutput]):
         task_name: The registered name of the task.
         handler_class: The class containing the task method.
         method_name: The name of the task method.
+        __orcher_task__: The task's registered metadata, as a function decorated
+            with ``@task`` carries it, so a workflow reads the declared return type
+            from either one the same way.
 
     Example:
         >>> from orcher import task, TaskContext
@@ -49,6 +55,7 @@ class TaskReference(Generic[TInput, TOutput]):
         task_name: str,
         handler_class: type[Any],
         method_name: str,
+        metadata: TaskMetadata | None = None,
     ) -> None:
         """Initialize a TaskReference.
 
@@ -56,10 +63,12 @@ class TaskReference(Generic[TInput, TOutput]):
             task_name: The registered name of the task.
             handler_class: The class containing the task method.
             method_name: The name of the task method.
+            metadata: The task's registered metadata.
         """
         self._task_name = task_name
         self._handler_class = handler_class
         self._method_name = method_name
+        self.__orcher_task__ = metadata
 
     @property
     def task_name(self) -> str:

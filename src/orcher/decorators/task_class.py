@@ -96,14 +96,16 @@ def tasks(cls: type[T]) -> type[T]:
             heartbeat_timeout=original_metadata.heartbeat_timeout if original_metadata else None,
             handler_class=cls,
             method_name=attr_name,
+            return_type=original_metadata.return_type if original_metadata else None,
         )
 
         registry.register_task(metadata)
 
-        task_ref = TaskReference(
+        task_ref: TaskReference[Any, Any] = TaskReference(
             task_name=task_name,
             handler_class=cls,
             method_name=attr_name,
+            metadata=metadata,
         )
         setattr(cls, attr_name, task_ref)
 
