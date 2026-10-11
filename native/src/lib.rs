@@ -31,6 +31,7 @@ mod codec;
 mod convert;
 mod error;
 mod journal_times;
+mod journal_updates;
 mod runtime;
 mod tls;
 mod worker;

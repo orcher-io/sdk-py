@@ -12,7 +12,7 @@ import hashlib
 import inspect
 import json
 import math
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import timedelta
 from typing import (
     TYPE_CHECKING,
@@ -216,6 +216,14 @@ class WorkflowContext:
         self._cancel_requested_at: int | None = None
         self._cancel_delivered = False
 
+        # Updates the engine already answered, oldest first, each with when it
+        # was journaled. An update's handler changed the workflow's state, which
+        # a replay rebuilds from the start, so each is run again at the same
+        # point of the code: the first wait whose result the journal recorded
+        # after it. The worker supplies how to run one.
+        self._journaled_updates: list[dict[str, Any]] = []
+        self._update_replayer: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+
         # Deadline timers of timed event waits, counted per event name.
         self._event_timeout_waits: dict[str, int] = {}
 
@@ -387,7 +395,7 @@ class WorkflowContext:
         # A journaled result means the task already ran: return it instead of
         # scheduling the task again.
         cache_key = f"task:{task_id}"
-        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(task_id))
+        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(task_id))
         if cache_key in self._cached_results:
             self._observe(task_id)
             cached = self._cached_results[cache_key]
@@ -643,7 +651,7 @@ class WorkflowContext:
         task_id = f"{SESSION_CREATE_TASK}_{sequence}"
         self._reach(task_id)
         cache_key = f"task:{task_id}"
-        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(task_id))
+        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(task_id))
 
         # On replay, the creation task's journaled result is a serialized SessionInfo.
         if cache_key in self._cached_results:
@@ -719,7 +727,7 @@ class WorkflowContext:
 
         # A fired timer is in the journal: the sleep is over.
         cache_key = f"timer:{timer_id}"
-        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(cache_key))
+        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(cache_key))
         if cache_key in self._cached_results:
             self._observe(cache_key)
             return
@@ -782,7 +790,7 @@ class WorkflowContext:
         # On replay the worker has injected the child's outcome under
         # child:{id}: return its result, or raise its failure.
         if f"child:{workflow_id}" in self._cached_results:
-            return self._resolve_child(workflow_id)
+            return await self._resolve_child(workflow_id)
 
         # The child's input is a JSON Payload, as for ScheduleTask. A single
         # positional arg is sent as the value itself (the child worker passes a
@@ -815,11 +823,11 @@ class WorkflowContext:
 
         raise WorkflowSuspendedError(f"Starting child workflow: {workflow_type}")
 
-    def _resolve_child(self, workflow_id: str) -> Any:
+    async def _resolve_child(self, workflow_id: str) -> Any:
         """A child's result from the journal: returned, raised if the child
         failed or ended without one, or the workflow suspends until it ends."""
         cache_key = f"child:{workflow_id}"
-        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(cache_key))
+        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(cache_key))
         if cache_key not in self._cached_results:
             from orcher.errors import WorkflowSuspendedError
 
@@ -919,7 +927,7 @@ class WorkflowContext:
         if timer_fired:
             received_at.append(self._resolved_at.get(f"timer:{timer_id}"))
         known = [at for at in received_at if at is not None]
-        self._cancellation(
+        await self._at_wait(
             bool(received_at),
             min(known) if known and len(known) == len(received_at) else None,
         )
@@ -1014,6 +1022,8 @@ class WorkflowContext:
 
         Update handlers can be invoked by external clients to send
         synchronous mutations to running workflows and receive results.
+        The handler runs again on every replay, where the update first came,
+        so the state it sets lasts; it should only read and change state.
 
         Args:
             name: Name of the update.
@@ -1108,7 +1118,7 @@ class WorkflowContext:
         self._reach(timer_id)
 
         cache_key = f"timer:{timer_id}"
-        self._cancellation(cache_key in self._cached_results, self._resolved_at.get(cache_key))
+        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(cache_key))
         if cache_key in self._cached_results:
             self._observe(cache_key)
             return
@@ -1338,6 +1348,43 @@ class WorkflowContext:
         ``at_ms`` (ms since the epoch) when known."""
         self._cancel_requested = True
         self._cancel_requested_at = at_ms
+
+    async def _at_wait(self, present: bool, at_ms: int | None) -> None:
+        """What the code learns at a wait before its result: the updates that
+        came before that result run, then a cancellation request may be
+        delivered. ``present`` says whether the journal holds the wait's result
+        and ``at_ms`` when it was journaled, if known."""
+        await self._replay_updates(before_ms=at_ms if present else None, every=not present)
+        self._cancellation(present, at_ms)
+
+    def _record_journaled_updates(
+        self,
+        updates: list[dict[str, Any]],
+        replayer: Callable[[dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        """Hold the updates the engine already answered, oldest first, to run
+        again with ``replayer`` as the code reaches them (internal; the worker
+        calls it before the workflow runs)."""
+        self._journaled_updates = [u for u in updates if isinstance(u, dict)]
+        self._update_replayer = replayer
+
+    async def _replay_updates(self, *, before_ms: int | None = None, every: bool = False) -> None:
+        """Run again the journaled updates not yet run: every one, or those
+        journaled before ``before_ms``.
+
+        At a wait whose result the journal holds, the updates journaled before
+        that result came while the code waited there, so they run before it
+        receives the result. At a wait with no result yet, where the code
+        stops, every remaining update came while it waited there. An update
+        with no known time runs only then.
+        """
+        while self._journaled_updates:
+            at = self._journaled_updates[0].get("at_ms")
+            if not every and (before_ms is None or not isinstance(at, int) or at >= before_ms):
+                return
+            update = self._journaled_updates.pop(0)
+            if self._update_replayer is not None:
+                await self._update_replayer(update)
 
     def _cancellation(self, present: bool, at_ms: int | None) -> None:
         """Raise the cancellation here if this wait is where the code learns of

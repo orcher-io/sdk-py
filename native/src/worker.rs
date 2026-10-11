@@ -50,6 +50,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::actor_state;
 use crate::journal_times::JournalTimes;
+use crate::journal_updates::JournaledUpdate;
 use orcher_sdk_core::bridge::{task_to_execution_request, ExecutionResult};
 use orcher_sdk_core::poller::channel::ChannelManager;
 use orcher_sdk_core::poller::{
@@ -830,6 +831,12 @@ impl PyBridgeWorker {
                             request.insert(
                                 "journal_times".to_string(),
                                 serde_json::json!(JournalTimes::read(&workflow_work.task.journal)),
+                            );
+                            // The updates already answered, which the workflow
+                            // runs again on replay to rebuild the state they set.
+                            request.insert(
+                                "journaled_updates".to_string(),
+                                serde_json::json!(JournaledUpdate::read(&workflow_work.task.journal)),
                             );
                         }
 

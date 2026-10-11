@@ -54,7 +54,7 @@ class ChildWorkflowHandle(Generic[T]):
         """
         if self._context is None:
             raise NotImplementedError("Child workflow result requires execution context")
-        return self._context._resolve_child(self._workflow_id)  # type: ignore[no-any-return]
+        return await self._context._resolve_child(self._workflow_id)  # type: ignore[no-any-return]
 
     async def send_event(self, event_name: str, data: Any = None) -> None:
         """Send an event to the child workflow.
