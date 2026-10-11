@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from concurrent.futures import Executor
 from datetime import timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from orcher.interceptors.base import (
@@ -534,7 +535,15 @@ class WorkerBuilder:
 
         Scans Python files in the given paths and imports them so their
         decorators register. Without this call, import the decorated classes
-        yourself before build(). Files that fail to import are skipped.
+        yourself before build().
+
+        Each file is imported once, under its real module name: a scanned
+        directory is an import root, and a directory holding ``__init__.py``
+        is a package within its parent. A module already imported, such as
+        the running script or one imported by hand, is not imported again.
+        ``build()`` raises ``ImportError`` naming every file that failed to
+        import, including one whose decorators clash with a registration
+        made elsewhere.
 
         Args:
             paths: List of directories to scan (default: ["./src"])
@@ -637,55 +646,18 @@ class WorkerBuilder:
         )
 
     def _run_auto_discovery(self) -> None:
-        """
-        Run auto-discovery to import decorated modules.
+        """Import the modules auto-discovery finds, so their decorators register.
 
-        This imports Python files matching the configured patterns,
-        which triggers decorator registration with the GlobalRegistry.
+        Raises:
+            ImportError: If any of them fails to import.
         """
-        import fnmatch
-        import importlib.util
-        import sys
-        from pathlib import Path
-
         if not self._auto_discover_paths:
             return
-
-        imported_count = 0
-        failed_count = 0
-
-        for base_path in self._auto_discover_paths:
-            base = Path(base_path).resolve()
-            if not base.exists():
-                continue
-
-            for pattern in self._auto_discover_patterns or ["**/*.py"]:
-                for py_file in base.glob(pattern):
-                    if self._auto_discover_exclude:
-                        relative = str(py_file.relative_to(base))
-                        if any(
-                            fnmatch.fnmatch(relative, exc) for exc in self._auto_discover_exclude
-                        ):
-                            continue
-
-                    if py_file.name == "__init__.py":
-                        continue
-
-                    try:
-                        # Unique per file so same-named files in different
-                        # directories do not collide in sys.modules.
-                        module_name = f"_auto_discover_{py_file.stem}_{id(py_file)}"
-
-                        spec = importlib.util.spec_from_file_location(module_name, py_file)
-                        if spec and spec.loader:
-                            module = importlib.util.module_from_spec(spec)
-                            sys.modules[module_name] = module
-                            spec.loader.exec_module(module)
-                            imported_count += 1
-                    except Exception:
-                        failed_count += 1
-                        # Skip files that cannot be imported here, such as
-                        # scripts with syntax errors or unavailable imports.
+        _discover_modules(
+            self._auto_discover_paths,
+            self._auto_discover_patterns or ["**/*.py"],
+            self._auto_discover_exclude or [],
+        )
 
     @classmethod
     def create(cls) -> WorkerBuilder:
@@ -699,3 +671,100 @@ class WorkerBuilder:
             >>> worker = WorkerBuilder.create().server_url("...").task_queue("q").build()
         """
         return cls()
+
+
+def _discover_modules(paths: list[str], patterns: list[str], exclude: list[str]) -> list[str]:
+    """Import every module under ``paths`` matching ``patterns`` and not ``exclude``.
+
+    Each is imported once, by its real module name, so a module the program
+    also imports by name is the same module and its decorators run once. A
+    module already loaded, the running script among them, is left alone.
+
+    Returns:
+        The names of the modules imported.
+
+    Raises:
+        ImportError: Naming each file that failed to import and why. The first
+            failure is chained as the cause.
+    """
+    import fnmatch
+    import importlib
+    import sys
+
+    loaded = {
+        Path(file).resolve()
+        for module in list(sys.modules.values())
+        if isinstance(file := getattr(module, "__file__", None), str)
+    }
+    seen: set[Path] = set()
+    imported: list[str] = []
+    failures: list[tuple[Path, str, BaseException]] = []
+
+    for base_path in paths:
+        base = Path(base_path).resolve()
+        if not base.is_dir():
+            continue
+        root = _import_root(base)
+        for pattern in patterns:
+            for py_file in sorted(base.glob(pattern)):
+                if py_file.suffix != ".py" or py_file in seen:
+                    continue
+                relative = str(py_file.relative_to(base))
+                if any(fnmatch.fnmatch(relative, exc) for exc in exclude):
+                    continue
+                seen.add(py_file)
+                if py_file in loaded:
+                    continue
+                name = _module_name(root, py_file)
+                try:
+                    if name is None:
+                        raise ImportError(f"{py_file.relative_to(root)} is not a valid module name")
+                    _put_on_path(root)
+                    module = importlib.import_module(name)
+                    file = getattr(module, "__file__", None)
+                    if file is None or Path(file).resolve() != py_file:
+                        raise ImportError(f"module {name!r} is already {file or module!r}")
+                except Exception as error:  # noqa: BLE001 - every failure is reported
+                    failures.append((py_file, name or "?", error))
+                else:
+                    imported.append(name)
+
+    if failures:
+        lines = [f"auto_discover could not import {len(failures)} file(s):"]
+        lines += [
+            f"  {path} (as {name}): {type(error).__name__}: {error}"
+            for path, name, error in failures
+        ]
+        raise ImportError("\n".join(lines)) from failures[0][2]
+    return imported
+
+
+def _import_root(base: Path) -> Path:
+    """The directory modules under ``base`` are imported relative to: ``base``
+    itself, or, if it is a package, the directory above its outermost package."""
+    root = base
+    while (root / "__init__.py").is_file():
+        root = root.parent
+    return root
+
+
+def _module_name(root: Path, py_file: Path) -> str | None:
+    """The dotted name ``py_file`` imports as from ``root``, or None if its path
+    is not one."""
+    parts = list(py_file.relative_to(root).with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    if not parts or not all(part.isidentifier() for part in parts):
+        return None
+    return ".".join(parts)
+
+
+def _put_on_path(root: Path) -> None:
+    """Make ``root`` an import root, after those already on ``sys.path``."""
+    import importlib
+    import sys
+
+    if any(Path(entry or ".").resolve() == root for entry in sys.path):
+        return
+    sys.path.append(str(root))
+    importlib.invalidate_caches()
