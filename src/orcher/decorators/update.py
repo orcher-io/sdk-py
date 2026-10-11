@@ -34,6 +34,11 @@ def update(
     running workflow. They can read and mutate workflow state via WorkflowContext,
     and return a result back to the caller.
 
+    The state an update sets lasts: on every replay the handler runs again, with
+    the same arguments, at the point of the workflow where the update first
+    came. So a handler should only read and change workflow state, and not
+    start tasks, timers or other steps.
+
     The decorated function should:
     - Accept WorkflowContext as the first argument
     - Be async (recommended) or sync

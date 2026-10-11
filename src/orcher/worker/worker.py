@@ -1075,6 +1075,18 @@ class Worker:
         if any(isinstance(job, dict) and "CancelWorkflow" in job for job in jobs):
             ctx._note_cancel_requested(journal_times.get("cancel_requested_at"))
 
+        # The updates already answered run again as the code reaches the point
+        # where each came, so the state they set is there on every replay.
+        async def replay_update(update: dict[str, Any]) -> None:
+            name = update.get("update_name", "")
+            try:
+                await self._run_update_handler(ctx, name, update.get("args") or [])
+            except Exception as e:
+                # Its result was answered and journaled when it first ran.
+                logger.debug(f"Replayed update '{name}' raised again: {e}")
+
+        ctx._record_journaled_updates(request.get("journaled_updates") or [], replay_update)
+
         ictx = InterceptorContext(
             workflow_id=workflow_id,
             run_id=run_id,
@@ -1122,6 +1134,7 @@ class Worker:
             await self._workflow_interceptor_chain.notify_success(ictx, exec_info)
             await self._workflow_interceptor_chain.notify_exit(ictx, exec_info)
 
+            await ctx._replay_updates(every=True)
             query_responses = self._process_query_jobs(jobs, ctx)
             update_results = await self._process_update_jobs(jobs, ctx)
 
@@ -1166,6 +1179,7 @@ class Worker:
             reached_steps = ctx._take_reached_steps()
 
             # Queries and updates are answered even while suspended.
+            await ctx._replay_updates(every=True)
             query_responses = self._process_query_jobs(jobs, ctx)
             update_results = await self._process_update_jobs(jobs, ctx)
 
@@ -1192,6 +1206,7 @@ class Worker:
                 await ctx._closures_settled()
                 exec_info.duration_ms = (datetime.now() - start_time).total_seconds() * 1000
                 await self._workflow_interceptor_chain.notify_exit(ictx, exec_info)
+                await ctx._replay_updates(every=True)
                 return {
                     "run_id": run_id,
                     "successful": True,
@@ -1219,6 +1234,7 @@ class Worker:
             await self._workflow_interceptor_chain.notify_exit(ictx, exec_info)
 
             # Queries and updates are answered even when the workflow fails.
+            await ctx._replay_updates(every=True)
             query_responses = self._process_query_jobs(jobs, ctx)
             update_results = await self._process_update_jobs(jobs, ctx)
 
@@ -1339,16 +1355,7 @@ class Worker:
             update_id = update_job.get("update_id", "")
             update_name = update_job.get("update_name", "")
 
-            # The worker's registry takes precedence over the context.
-            update_metadata = self._update_handlers.get(update_name)
-            handler = None
-
-            if update_metadata is not None:
-                handler = update_metadata.handler
-            elif hasattr(ctx, "_update_handlers"):
-                handler = ctx._update_handlers.get(update_name)
-
-            if handler is None:
+            if self._update_handler(ctx, update_name) is None:
                 update_results.append({
                     "update_id": update_id,
                     "result": {
@@ -1361,17 +1368,8 @@ class Worker:
 
             try:
                 payload = update_job.get("payload", {})
-                args_data = None
-                if isinstance(payload, dict) and "data" in payload:
-                    raw_bytes = bytes(payload["data"])
-                    if raw_bytes:
-                        args_data = json.loads(raw_bytes)
-
-                u_args, u_kwargs = unpack_arguments(args_data)
-                if asyncio.iscoroutinefunction(handler):
-                    result = await handler(ctx, *u_args, **u_kwargs)
-                else:
-                    result = handler(ctx, *u_args, **u_kwargs)
+                raw = payload.get("data", []) if isinstance(payload, dict) else []
+                result = await self._run_update_handler(ctx, update_name, raw)
 
                 result_bytes = json.dumps(result).encode("utf-8") if result is not None else b"null"
                 update_results.append({
@@ -1398,6 +1396,30 @@ class Worker:
                 })
 
         return update_results
+
+    def _update_handler(self, ctx: Any, update_name: str) -> Any:
+        """The handler of update ``update_name``, or None. The worker's registry
+        (the update decorator) takes precedence over the context's own."""
+        update_metadata = self._update_handlers.get(update_name)
+        if update_metadata is not None:
+            return update_metadata.handler
+        if hasattr(ctx, "_update_handlers"):
+            return ctx._update_handlers.get(update_name)
+        return None
+
+    async def _run_update_handler(self, ctx: Any, update_name: str, raw_args: Any) -> Any:
+        """Run update ``update_name``'s handler on ``raw_args``, its JSON
+        arguments as bytes (empty for none), and return its result. An update
+        without a handler does nothing and returns None."""
+        handler = self._update_handler(ctx, update_name)
+        if handler is None:
+            return None
+        raw_bytes = bytes(raw_args)
+        args_data = json.loads(raw_bytes) if raw_bytes else None
+        args, kwargs = unpack_arguments(args_data)
+        if asyncio.iscoroutinefunction(handler):
+            return await handler(ctx, *args, **kwargs)
+        return handler(ctx, *args, **kwargs)
 
     async def _execute_task(self, request: dict[str, Any]) -> Any:
         """
