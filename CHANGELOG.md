@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.7](https://github.com/orcher-io/sdk-py/compare/v0.4.6...v0.4.7) (2026-10-10)
+
+
+### Bug Fixes
+
+* keep the type of a class or function decorated with [@workflow](https://github.com/workflow) ([#33](https://github.com/orcher-io/sdk-py/issues/33)) ([5b24875](https://github.com/orcher-io/sdk-py/commit/5b24875dcebfa144e6fc14d477bcf526a952c5b6))
+* name orcher-sdk in the missing native module error ([#32](https://github.com/orcher-io/sdk-py/issues/32)) ([cf73809](https://github.com/orcher-io/sdk-py/commit/cf738092b106a3bb9e19fef6a315d1f0605c656f))
+* restore dataclass results of [@tasks](https://github.com/tasks) methods ([#34](https://github.com/orcher-io/sdk-py/issues/34)) ([14bae5b](https://github.com/orcher-io/sdk-py/commit/14bae5b0b46932458e2c169e2a3f42fec62332e0))
+
 ## [0.4.6](https://github.com/orcher-io/sdk-py/compare/v0.4.5...v0.4.6) (2026-10-09)
 
 
