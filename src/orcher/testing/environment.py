@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, TypeVar
 
+from orcher._internal.arguments import unpack_arguments
 from orcher.testing.mocks import MockTaskBuilder, MockTaskRegistry
 from orcher.testing.time_controller import TimeController
 from orcher.testing.types import (
@@ -760,8 +761,4 @@ def _task_name(task_ref: Any) -> str:
 
 def _workflow_arguments(input_data: Any) -> tuple[tuple[Any, ...], dict[str, Any]]:
     """Spread a workflow input into call arguments, as the worker does."""
-    if isinstance(input_data, dict):
-        return (), input_data
-    if input_data is None:
-        return (), {}
-    return (input_data,), {}
+    return unpack_arguments(input_data)

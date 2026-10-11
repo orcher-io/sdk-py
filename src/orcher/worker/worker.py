@@ -38,6 +38,7 @@ from datetime import UTC, datetime, timedelta
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
+from orcher._internal.arguments import unpack_arguments
 from orcher.actor.types import ActorMetadata
 from orcher.core.native import get_native_module, is_native_available
 from orcher.decorators.registry import (
@@ -1104,17 +1105,9 @@ class Worker:
                 ctx._set_cached_results(cached_results)
 
             async def run_workflow(data: Any) -> Any:
-                # Normalize the workflow input into call arguments: a dict is
-                # spread as kwargs, any other non-None value is passed as one
-                # positional argument, and None passes nothing. This matches
-                # the query and update handlers.
-                if isinstance(data, dict):
-                    wf_args: tuple[Any, ...] = ()
-                    wf_kwargs: dict[str, Any] = data
-                elif data is None:
-                    wf_args, wf_kwargs = (), {}
-                else:
-                    wf_args, wf_kwargs = (data,), {}
+                # The input becomes call arguments as unpack_arguments
+                # describes, as for the query and update handlers.
+                wf_args, wf_kwargs = unpack_arguments(data)
 
                 if metadata.is_function:
                     workflow_fn = metadata.handler
@@ -1149,7 +1142,8 @@ class Worker:
             # of its completion: an event it sent, a child it started without
             # waiting. Closures it left running are waited for first.
             await ctx._closures_settled()
-            result_bytes = json.dumps(result).encode("utf-8") if result else b"null"
+            # Only None is null: 0, False, "" and empty containers are results.
+            result_bytes = json.dumps(result).encode("utf-8") if result is not None else b"null"
             return {
                 "run_id": run_id,
                 "successful": True,
@@ -1311,14 +1305,8 @@ class Worker:
                         raw_bytes = bytes(first_arg["data"])
                         args_data = json.loads(raw_bytes)
 
-                # A dict argument is spread as kwargs; any other value is positional.
-                if args_data is not None:
-                    if isinstance(args_data, dict):
-                        result = handler(ctx, **args_data)
-                    else:
-                        result = handler(ctx, args_data)
-                else:
-                    result = handler(ctx)
+                q_args, q_kwargs = unpack_arguments(args_data)
+                result = handler(ctx, *q_args, **q_kwargs)
 
                 result_bytes = json.dumps(result).encode("utf-8") if result is not None else b"null"
                 query_responses.append({
@@ -1428,15 +1416,7 @@ class Worker:
             return None
         raw_bytes = bytes(raw_args)
         args_data = json.loads(raw_bytes) if raw_bytes else None
-
-        # A dict argument is spread as kwargs; any other value is positional.
-        if args_data is None:
-            args: tuple[Any, ...] = ()
-            kwargs: dict[str, Any] = {}
-        elif isinstance(args_data, dict):
-            args, kwargs = (), args_data
-        else:
-            args, kwargs = (args_data,), {}
+        args, kwargs = unpack_arguments(args_data)
         if asyncio.iscoroutinefunction(handler):
             return await handler(ctx, *args, **kwargs)
         return handler(ctx, *args, **kwargs)
@@ -1740,7 +1720,7 @@ class Worker:
             # Protobuf bytes decoded as a list of ints.
             operation_input = json.loads(bytes(payload_bytes)) if payload_bytes else {}
         else:
-            operation_input = payload_bytes if payload_bytes else {}
+            operation_input = payload_bytes if payload_bytes is not None else {}
 
         actor_key = ActorKey(actor_name=actor_name, key=key)
 
