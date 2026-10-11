@@ -22,6 +22,7 @@ from typing import (
     get_origin,
 )
 
+from orcher._internal.arguments import pack_arguments
 from orcher.types import RetryPolicy, WorkflowExecution
 from orcher.workflow.child import ChildWorkflowHandle
 from orcher.workflow.info import WorkflowInfo
@@ -762,7 +763,9 @@ class WorkflowContext:
                 not guarantee uniqueness within the parent. The engine echoes
                 this id back on completion for correlation. Supply one only to
                 address the child later (events, cancel) by a known id.
-            args: Arguments to pass to the child workflow.
+            args: Arguments to pass to the child workflow, one to one onto
+                its parameters after the context. A single dict argument is
+                spread as keyword arguments.
             task_queue: Optional task queue (defaults to parent's queue).
 
         Returns:
@@ -784,10 +787,10 @@ class WorkflowContext:
         if f"child:{workflow_id}" in self._cached_results:
             return self._resolve_child(workflow_id)
 
-        # The child's input is a JSON Payload, as for ScheduleTask. A single
-        # positional arg is sent as the value itself (the child worker passes a
-        # non-dict value as a positional parameter); several are sent as a list.
-        child_input: Any = args[0] if len(args) == 1 else list(args)
+        # The child's input is a JSON Payload, as for ScheduleTask, packed as a
+        # client start packs its arguments: the child's worker passes them one
+        # to one as positional arguments (see pack_arguments).
+        child_input: Any = pack_arguments(args)
         input_bytes = json.dumps(child_input).encode("utf-8")
         input_payload = {
             "data": list(input_bytes),
@@ -1154,7 +1157,7 @@ class WorkflowContext:
             workflow_id: Optional ID for the child. When omitted, a deterministic
                 ``child_{sequence}`` id is derived from the step sequence, as in
                 ``execute_child_workflow`` and the Rust and TypeScript SDKs.
-            args: Arguments to pass.
+            args: Arguments to pass, as for ``execute_child_workflow``.
             task_queue: Optional task queue (defaults to parent's queue).
 
         Returns:
@@ -1182,9 +1185,8 @@ class WorkflowContext:
                 context=self,
             )
 
-        # Same input encoding and command shape as execute_child_workflow: a
-        # single arg is sent as the value, several as a list.
-        child_input: Any = args[0] if len(args) == 1 else list(args)
+        # Same input encoding and command shape as execute_child_workflow.
+        child_input: Any = pack_arguments(args)
         input_bytes = json.dumps(child_input).encode("utf-8")
         input_payload = {
             "data": list(input_bytes),

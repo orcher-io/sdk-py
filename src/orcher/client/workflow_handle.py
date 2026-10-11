@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from orcher._internal.arguments import pack_arguments
 from orcher.errors._translate import translates_native_errors
 from orcher.types import WorkflowExecution, WorkflowExecutionDescription, WorkflowStatus
 
@@ -174,7 +175,7 @@ class WorkflowHandle(Generic[T]):
             ClientError: If there's a communication error.
         """
         native = self._ensure_native()
-        query_args = args[0] if len(args) == 1 else (args if args else None)
+        query_args = pack_arguments(args)
         return await native.query(query_name, query_args)
 
     @translates_native_errors
@@ -197,7 +198,7 @@ class WorkflowHandle(Generic[T]):
             ClientError: If there's a communication error.
         """
         native = self._ensure_native()
-        update_args = args[0] if len(args) == 1 else (args if args else None)
+        update_args = pack_arguments(args)
         return await native.update(update_name, update_args)
 
     @translates_native_errors

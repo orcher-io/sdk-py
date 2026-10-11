@@ -6,6 +6,7 @@ import uuid
 from datetime import timedelta
 from typing import Any
 
+from orcher._internal.arguments import pack_arguments
 from orcher.client.config import ClientConfig
 from orcher.client.workflow_handle import WorkflowHandle
 from orcher.errors import ClientError
@@ -175,7 +176,9 @@ class Client:
             workflow_type: Type/name of the workflow to execute.
             workflow_id: Unique identifier for this workflow execution.
             task_queue: Task queue where the workflow will be executed.
-            args: Arguments to pass to the workflow.
+            args: Arguments to pass to the workflow, one to one onto its
+                parameters after the context. A single dict argument is
+                spread as keyword arguments.
             retry_policy: Optional retry policy for the workflow.
             execution_timeout: Maximum time for the entire workflow execution.
             run_timeout: Maximum time for a single run of the workflow.
@@ -211,8 +214,9 @@ class Client:
         workflow_id = workflow_id or str(uuid.uuid4())
         task_queue = task_queue or "default"
 
-        # A single argument is sent as-is; several are sent as a tuple.
-        input_data = args[0] if len(args) == 1 else (args if args else None)
+        # One argument is sent as itself, several so that the worker passes
+        # them one to one as positional arguments (see pack_arguments).
+        input_data = pack_arguments(args)
 
         kwargs: dict[str, Any] = {}
         if execution_timeout is not None:
