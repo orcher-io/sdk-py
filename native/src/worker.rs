@@ -838,6 +838,12 @@ impl PyBridgeWorker {
                                 "journaled_updates".to_string(),
                                 serde_json::json!(JournaledUpdate::read(&workflow_work.task.journal)),
                             );
+                            // The children the run started, so a child started
+                            // without an id keeps the id the journal holds for it.
+                            request.insert(
+                                "journaled_children".to_string(),
+                                serde_json::json!(crate::journal_children::read(&workflow_work.task.journal)),
+                            );
                         }
 
                         let response = serde_json::json!({

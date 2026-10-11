@@ -225,6 +225,11 @@ class WorkflowContext:
         self._journaled_updates: list[dict[str, Any]] = []
         self._update_replayer: Callable[[dict[str, Any]], Awaitable[None]] | None = None
 
+        # The ids of the children the journal records this run starting. A
+        # child started without an id keeps the id the journal holds for it
+        # when that is an earlier SDK's default; see _default_child_id.
+        self._journaled_children: set[str] = set()
+
         # Deadline timers of timed event waits, counted per event name.
         self._event_timeout_waits: dict[str, int] = {}
 
@@ -292,6 +297,30 @@ class WorkflowContext:
         """Take the next number from the step counter."""
         self._step_sequence += 1
         return self._step_sequence
+
+    def _default_child_id(self, sequence: int) -> str:
+        """The id of a child started without one, at step ``sequence``.
+
+        It is derived from the parent's workflow id and the step sequence, so
+        it is the same on every replay and differs between parents: children
+        of two parents, each started at the same point in its parent's code,
+        do not share an id.
+
+        Earlier SDKs used ``child_{sequence}``, which every parent shared.
+        A run that started a child under that id keeps it: if the journal
+        records ``child_{sequence}``, the child at this sequence is that one,
+        so a run that began under the old default replays to the same child
+        rather than starting another.
+        """
+        legacy = f"child_{sequence}"
+        if legacy in self._journaled_children or f"child:{legacy}" in self._cached_results:
+            return legacy
+        return f"{self._info.workflow_id}-child-{sequence}"
+
+    def _record_journaled_children(self, workflow_ids: list[str]) -> None:
+        """Hold the ids of the children the journal records (internal; the
+        worker calls it before the workflow runs)."""
+        self._journaled_children = {i for i in workflow_ids if isinstance(i, str) and i}
 
     def _reach(self, step_id: str) -> None:
         """The code reached the step with this id; see ``_take_reached_steps``."""
@@ -765,12 +794,13 @@ class WorkflowContext:
 
         Args:
             workflow_type: Type/name of the child workflow.
-            workflow_id: Optional ID for the child workflow. When omitted, a
-                deterministic ``child_{sequence}`` id is derived from the step
-                sequence, as in the Rust and TypeScript SDKs, so callers need
-                not guarantee uniqueness within the parent. The engine echoes
-                this id back on completion for correlation. Supply one only to
-                address the child later (events, cancel) by a known id.
+            workflow_id: Optional ID for the child workflow. When omitted,
+                one is derived from the parent's workflow id and where the
+                child is started in the parent's code
+                (``{parent id}-child-{sequence}``): the same on every replay,
+                and different for every parent. The engine echoes this id back
+                on completion for correlation. Supply one to address the child
+                later (events, cancel) by a name of your choosing.
             args: Arguments to pass to the child workflow, one to one onto
                 its parameters after the context. A single dict argument is
                 spread as keyword arguments.
@@ -783,11 +813,11 @@ class WorkflowContext:
             child (events, cancel), use ``start_child_workflow`` instead.
         """
         # One number from the step counter on every path. A child given no id
-        # is named after it, so the id is the same on every replay; the engine
-        # echoes it back with the child's outcome.
+        # is named after its parent and that number, so the id is the same on
+        # every replay; the engine echoes it back with the child's outcome.
         sequence = self._next_sequence()
         if workflow_id is None:
-            workflow_id = f"child_{sequence}"
+            workflow_id = self._default_child_id(sequence)
         self._reach(workflow_id)
 
         # On replay the worker has injected the child's outcome under
@@ -1164,9 +1194,10 @@ class WorkflowContext:
 
         Args:
             workflow_type: Type/name of the child workflow.
-            workflow_id: Optional ID for the child. When omitted, a deterministic
-                ``child_{sequence}`` id is derived from the step sequence, as in
-                ``execute_child_workflow`` and the Rust and TypeScript SDKs.
+            workflow_id: Optional ID for the child. When omitted, one is
+                derived from the parent's workflow id and the step sequence
+                (``{parent id}-child-{sequence}``), as in
+                ``execute_child_workflow``.
             args: Arguments to pass, as for ``execute_child_workflow``.
             task_queue: Optional task queue (defaults to parent's queue).
 
@@ -1179,10 +1210,10 @@ class WorkflowContext:
             >>> charged, reserved = await a.result(), await b.result()
         """
         # One number from the step counter on every path; a child given no id
-        # is named after it (see execute_child_workflow).
+        # is named after its parent and that number (see _default_child_id).
         sequence = self._next_sequence()
         if workflow_id is None:
-            workflow_id = f"child_{sequence}"
+            workflow_id = self._default_child_id(sequence)
         self._reach(workflow_id)
 
         # On replay the child may already have ended — return a handle

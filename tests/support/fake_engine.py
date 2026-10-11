@@ -114,6 +114,12 @@ class FakeEngine:
     def complete_child(self, workflow_id: str, value: Any) -> None:
         self._journal("child_completed", workflow_id=workflow_id, result=_bytes(value))
 
+    def start_child(self, workflow_id: str, workflow_type: str) -> None:
+        """Journal a child as started, as a run whose code started it would
+        have: the journal holds it, and the run issued it."""
+        self._journal("child_started", workflow_id=workflow_id, workflow_type=workflow_type)
+        self.issued.setdefault(workflow_id, ("StartChildWorkflow", workflow_type))
+
     def end_child(self, workflow_id: str, how: str, reason: str = "") -> None:
         """End a child without a result: canceled, terminated or timed_out."""
         self._journal(f"child_{how}", workflow_id=workflow_id, reason=reason)
@@ -224,6 +230,11 @@ class FakeEngine:
                     }
                 )
                 resolved_at.setdefault(f"child:{a['workflow_id']}", at_ms)
+        # The children the journal records, as the native layer reads them.
+        journaled_children: list[str] = []
+        for kind, a, _ in self.journal:
+            if kind.startswith("child_") and a["workflow_id"] not in journaled_children:
+                journaled_children.append(a["workflow_id"])
         return {
             "run_id": self.run_id,
             "execution": {"workflow_id": self.workflow_id, "run_id": self.run_id},
@@ -236,6 +247,7 @@ class FakeEngine:
                 "resolved_at": resolved_at,
                 "events": events,
             },
+            "journaled_children": journaled_children,
         }
 
     async def activate(self) -> Activation:
@@ -309,6 +321,15 @@ class FakeEngine:
             self._issue(kind, body["timer_id"], "", activation)
         elif kind == "StartChildWorkflow":
             self._issue(kind, body["workflow_id"], body["workflow_type"], activation)
+            if not any(
+                k == "child_started" and a["workflow_id"] == body["workflow_id"]
+                for k, a, _ in self.journal
+            ):
+                self._journal(
+                    "child_started",
+                    workflow_id=body["workflow_id"],
+                    workflow_type=body["workflow_type"],
+                )
         elif kind == "RecordStepResult":
             name = body["step_name"]
             self.closure_records.append(name)

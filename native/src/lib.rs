@@ -30,6 +30,7 @@ mod client;
 mod codec;
 mod convert;
 mod error;
+mod journal_children;
 mod journal_times;
 mod journal_updates;
 mod runtime;
