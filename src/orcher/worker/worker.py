@@ -1136,7 +1136,8 @@ class Worker:
             # of its completion: an event it sent, a child it started without
             # waiting. Closures it left running are waited for first.
             await ctx._closures_settled()
-            result_bytes = json.dumps(result).encode("utf-8") if result else b"null"
+            # Only None is null: 0, False, "" and empty containers are results.
+            result_bytes = json.dumps(result).encode("utf-8") if result is not None else b"null"
             return {
                 "run_id": run_id,
                 "successful": True,
@@ -1722,7 +1723,7 @@ class Worker:
             # Protobuf bytes decoded as a list of ints.
             operation_input = json.loads(bytes(payload_bytes)) if payload_bytes else {}
         else:
-            operation_input = payload_bytes if payload_bytes else {}
+            operation_input = payload_bytes if payload_bytes is not None else {}
 
         actor_key = ActorKey(actor_name=actor_name, key=key)
 
