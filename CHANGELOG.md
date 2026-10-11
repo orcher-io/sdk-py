@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.8](https://github.com/orcher-io/sdk-py/compare/v0.4.7...v0.4.8) (2026-10-11)
+
+
+### Bug Fixes
+
+* derive a child workflow's default id from its parent ([#43](https://github.com/orcher-io/sdk-py/issues/43)) ([5eb71e6](https://github.com/orcher-io/sdk-py/commit/5eb71e635ad0b8e6aa2c7d64d2203f3bb11767dd)), closes [#41](https://github.com/orcher-io/sdk-py/issues/41)
+* import auto-discovered modules once and report failures ([#39](https://github.com/orcher-io/sdk-py/issues/39)) ([8976996](https://github.com/orcher-io/sdk-py/commit/89769961fea4ef2750b43af8d1d4b6d1b549ad76)), closes [#21](https://github.com/orcher-io/sdk-py/issues/21)
+* keep the state an update handler sets across activations ([#40](https://github.com/orcher-io/sdk-py/issues/40)) ([ad0c010](https://github.com/orcher-io/sdk-py/commit/ad0c0108da0e1c2d7b9779518a44c5a4fbffa7f1)), closes [#19](https://github.com/orcher-io/sdk-py/issues/19)
+* pass several start args to a workflow one to one ([#38](https://github.com/orcher-io/sdk-py/issues/38)) ([80a2f93](https://github.com/orcher-io/sdk-py/commit/80a2f933b8086cf8ea41da17545eb638fa368ade)), closes [#14](https://github.com/orcher-io/sdk-py/issues/14)
+* return falsy workflow results instead of None ([#37](https://github.com/orcher-io/sdk-py/issues/37)) ([8b5d152](https://github.com/orcher-io/sdk-py/commit/8b5d152908ab77c305f1aaaa1f93a75b40ca83e7)), closes [#6](https://github.com/orcher-io/sdk-py/issues/6)
+
 ## [0.4.7](https://github.com/orcher-io/sdk-py/compare/v0.4.6...v0.4.7) (2026-10-10)
 
 
