@@ -1086,6 +1086,9 @@ class Worker:
                 logger.debug(f"Replayed update '{name}' raised again: {e}")
 
         ctx._record_journaled_updates(request.get("journaled_updates") or [], replay_update)
+        # The children the run started, so a child started without an id keeps
+        # the id the journal holds for it, whichever SDK chose it.
+        ctx._record_journaled_children(request.get("journaled_children") or [])
 
         ictx = InterceptorContext(
             workflow_id=workflow_id,

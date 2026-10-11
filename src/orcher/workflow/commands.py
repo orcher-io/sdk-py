@@ -133,7 +133,7 @@ class StartChildWorkflowCommand(WorkflowCommand):
 
     Attributes:
         workflow_type: Type/name of the child workflow.
-        workflow_id: Unique identifier for the child workflow.
+        workflow_id: Identifier for the child workflow.
         args: Arguments to pass to the child workflow.
         task_queue: Optional task queue (defaults to parent's queue).
         namespace: Optional namespace (defaults to parent's namespace).

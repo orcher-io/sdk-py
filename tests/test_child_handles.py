@@ -30,24 +30,24 @@ async def test_a_child_handle_sends_an_event_and_cancels_once_across_replays() -
     first = await engine.activate()
     assert engine.failure is None, engine.failure
     assert first.steps == [
-        ("StartChildWorkflow", "child_1"),
-        ("StartChildWorkflow", "child_3"),
+        ("StartChildWorkflow", "wf-1-child-1"),
+        ("StartChildWorkflow", "wf-1-child-3"),
     ]
 
-    engine.complete_child("child_1", "approved")
+    engine.complete_child("wf-1-child-1", "approved")
     await engine.activate()
 
     assert engine.completed == "approved"
     assert engine.sent_events == [
         {
-            "workflow_id": "child_1",
+            "workflow_id": "wf-1-child-1",
             "run_id": None,
             "event_name": "approve",
             "payload": {"data": list(b'{"by": "ops"}'), "metadata": {}},
             "headers": [],
         }
     ]
-    assert engine.cancelled_children == ["child_3"]
+    assert engine.cancelled_children == ["wf-1-child-3"]
     assert engine.drift == []
 
 
@@ -72,7 +72,7 @@ async def test_a_child_that_ends_without_a_result_fails_the_wait(
 
     engine = FakeEngine(parent)
     await engine.activate()
-    engine.end_child("child_1", how, reason)
+    engine.end_child("wf-1-child-1", how, reason)
     await engine.activate()
 
     assert engine.completed == f"failed: {message}"
@@ -88,7 +88,7 @@ async def test_execute_child_workflow_fails_for_a_child_that_ended_without_a_res
 
     engine = FakeEngine(parent)
     await engine.activate()
-    engine.end_child("child_1", "canceled")
+    engine.end_child("wf-1-child-1", "canceled")
     await engine.activate()
 
     assert engine.completed == "failed: child workflow was canceled"
