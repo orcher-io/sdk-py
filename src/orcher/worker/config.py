@@ -6,7 +6,27 @@ Defines the WorkerConfig dataclass that configures the Worker runtime.
 
 import os
 import uuid
+import warnings
 from dataclasses import dataclass, field
+
+# The defaults of the options the worker no longer uses, which it warns about
+# when they are set to anything else.
+_IGNORED_DEFAULTS = {
+    "workflow_poll_interval_ms": 100,
+    "task_poll_interval_ms": 100,
+    "force_shutdown_timeout_ms": 60000,
+}
+
+
+def warn_ignored(option: str) -> None:
+    """Warn that a worker option is deprecated and has no effect."""
+    warnings.warn(
+        f"the worker option {option} is deprecated and has no effect: the worker host "
+        "waits for work in long polls, and a stopping worker is bounded by its "
+        "shutdown grace",
+        DeprecationWarning,
+        stacklevel=3,
+    )
 
 
 def _generate_identity() -> str:
@@ -43,17 +63,22 @@ class WorkerConfig:
         max_concurrent_workflow_executions: Maximum concurrent workflow executions (default: 100)
         max_concurrent_task_executions: Maximum concurrent task executions (default: 100)
         identity: Unique identity for this worker (auto-generated if not provided)
-        workflow_poll_interval_ms: Interval between workflow polls in milliseconds (default: 100)
-        task_poll_interval_ms: Interval between task polls in milliseconds (default: 100)
-        workflow_poller_count: Number of concurrent workflow pollers (default: 4)
-        task_poller_count: Number of concurrent task pollers (default: 4)
-        shutdown_grace_time_ms: Grace period for shutdown in milliseconds (default: 30000)
-        force_shutdown_timeout_ms: Force shutdown timeout in milliseconds (default: 60000)
+        workflow_poll_interval_ms: Deprecated and ignored: the worker host waits
+            for work in long polls, with no interval between them
+        task_poll_interval_ms: Deprecated and ignored, as workflow_poll_interval_ms
+        workflow_poller_count: Number of workflow polls kept open (default: 4)
+        task_poller_count: Number of task polls kept open (default: 4)
+        shutdown_grace_time_ms: How long a stopping worker gives the work it is
+            running to finish, in milliseconds (default: 30000). Workflow
+            activations still unfinished after it are handed back to the
+            engine; tasks still running are asked to cancel.
+        force_shutdown_timeout_ms: Deprecated and ignored: a stopping worker is
+            bounded by its shutdown grace
         version_id: Optional code release this worker runs. The server binds an
             execution to it on first claim, so replay stays on the code the
             execution started on. from_env reads it from {prefix}VERSION_ID.
         binary_checksum: Optional binary checksum for versioning
-        actor_poller_count: Number of concurrent actor pollers (default: 4)
+        actor_poller_count: Number of actor polls kept open (default: 4)
         max_concurrent_actor_operations: Maximum concurrent actor operations (default: 100)
         organization_id: Optional organization ID, sent as the `X-Organization-Id` header
         api_key: Optional API key, sent as `authorization: Bearer <key>` on every
@@ -127,6 +152,9 @@ class WorkerConfig:
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
         self._validate()
+        for option, default in _IGNORED_DEFAULTS.items():
+            if getattr(self, option) != default:
+                warn_ignored(option)
 
     def _validate(self) -> None:
         """Validate configuration values."""

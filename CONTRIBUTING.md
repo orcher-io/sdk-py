@@ -21,9 +21,15 @@ maturin develop --extras dev   # builds the native extension into the venv
 
 Rerun `maturin develop` after changing anything under `native/`.
 
-To build against local checkouts of `sdk-core` and `protos` instead of the
-crates.io releases in `Cargo.toml`, copy `.cargo/config.example.toml` to
-`.cargo/config.toml`.
+The native module binds the Rust SDK core (`orcher-sdk-core`) and the worker
+host shared with the other SDKs (`orcher-sdk-host`, in the `sdk-core`
+repository). The worker pulls workflow activations, tasks and actor
+operations from the host; workflow activations cross as the kernel
+protocol's messages (`src/orcher/worker/activation.py`).
+
+To build against local checkouts of `sdk-core` (core and host) and `protos`
+instead of the crates.io releases in `Cargo.toml`, copy
+`.cargo/config.example.toml` to `.cargo/config.toml`.
 
 ## Checks
 
@@ -32,7 +38,13 @@ Pull requests must pass the same checks CI runs:
 ```bash
 ruff check .
 python -m pytest -rs
+PYTHONPATH=src:contract python contract/replay_check.py
 ```
+
+The replay check runs recorded workflow activations through the worker
+without an engine and compares what it answers with committed expected
+results; a change to what the worker sends shows up there first. See
+[contract/README.md](contract/README.md).
 
 Unit tests do not need an engine. The suite in `contract/` does: it runs a
 real worker against a running engine and checks the durable behavior end to

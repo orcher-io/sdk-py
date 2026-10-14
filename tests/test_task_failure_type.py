@@ -23,7 +23,7 @@ class AccountClosed(Exception):  # noqa: N818 - named as the other SDKs name it
     non_retryable = True
 
 
-class _Bridge:
+class _Host:
     def __init__(self) -> None:
         self.failures: list[tuple[Any, ...]] = []
 
@@ -33,30 +33,30 @@ class _Bridge:
 
 async def _report(error: Exception) -> tuple[Any, ...]:
     worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
-    bridge = _Bridge()
-    worker._bridge_worker = bridge
+    host = _Host()
+    worker._host = host
 
     async def raise_it(_request: dict[str, Any]) -> Any:
         raise error
 
     worker._execute_task = raise_it  # type: ignore[method-assign]
-    await worker._handle_task({"task_id": "t", "task_token": "tok"}, "k")
-    assert len(bridge.failures) == 1
-    return bridge.failures[0]
+    await worker._handle_task({"task_id": "t", "token": list(b"tok")})
+    assert len(host.failures) == 1
+    return host.failures[0]
 
 
 @pytest.mark.asyncio
 async def test_a_failure_is_reported_under_its_class_name() -> None:
-    assert await _report(CardDeclined("declined")) == ("tok", "declined", "CardDeclined", False)
+    assert await _report(CardDeclined("declined")) == (b"tok", "declined", "CardDeclined", False)
 
 
 @pytest.mark.asyncio
 async def test_a_non_retryable_attribute_marks_the_failure() -> None:
-    assert await _report(AccountClosed("closed")) == ("tok", "closed", "AccountClosed", True)
+    assert await _report(AccountClosed("closed")) == (b"tok", "closed", "AccountClosed", True)
 
 
 @pytest.mark.asyncio
 async def test_the_attribute_can_be_set_on_one_instance() -> None:
     error = ValueError("bad input")
     error.non_retryable = True  # type: ignore[attr-defined]
-    assert await _report(error) == ("tok", "bad input", "ValueError", True)
+    assert await _report(error) == (b"tok", "bad input", "ValueError", True)

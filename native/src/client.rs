@@ -221,6 +221,8 @@ impl PyClientConfig {
 struct ClientInner {
     client: WorkflowClient,
     config: PyClientConfig,
+    /// The connection actor invocations go out on, with the client's key.
+    actors: crate::actor_invoke::ActorChannels,
 }
 
 /// Client for starting, listing, and searching workflows.
@@ -316,8 +318,28 @@ impl PyClient {
                 None => client,
             };
 
+            // Actor invocations dial lazily, on first use, with the same TLS.
+            let manager = match tls_config {
+                Some(tls) => orcher_sdk_core::poller::channel::ChannelManager::with_tls(
+                    server_url.clone(),
+                    tls,
+                ),
+                None => orcher_sdk_core::poller::channel::ChannelManager::new(server_url.clone()),
+            };
+            let actors = crate::actor_invoke::ActorChannels::new(
+                manager,
+                crate::actor_invoke::Credentials {
+                    api_key: config.api_key.clone(),
+                    organization_id: None,
+                },
+            );
+
             let mut guard = inner.lock().await;
-            *guard = Some(ClientInner { client, config });
+            *guard = Some(ClientInner {
+                client,
+                config,
+                actors,
+            });
 
             Ok(())
         })
@@ -575,6 +597,38 @@ impl PyClient {
             })?;
 
             Python::with_gil(|py| json_value_to_py(py, &json_value))
+        })
+    }
+
+    /// Invoke an actor operation and wait for its result.
+    ///
+    /// The server queues the operation under its concurrency rules, a worker
+    /// runs it, and its result bytes come back. Raises `RuntimeError` when
+    /// the operation does not succeed.
+    #[pyo3(signature = (actor_name, key, operation, payload, timeout_ms = None))]
+    fn invoke_actor_operation<'py>(
+        &self,
+        py: Python<'py>,
+        actor_name: String,
+        key: String,
+        operation: String,
+        payload: Vec<u8>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let actors = {
+                let guard = inner.lock().await;
+                guard
+                    .as_ref()
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err("Client not connected")
+                    })?
+                    .actors
+                    .clone()
+            };
+            crate::actor_invoke::invoke(&actors, actor_name, key, operation, payload, timeout_ms)
+                .await
         })
     }
 

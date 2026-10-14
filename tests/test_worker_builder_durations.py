@@ -5,6 +5,8 @@ of 1000. These tests pin the conversion every duration option goes through."""
 
 from datetime import timedelta
 
+import pytest
+
 from orcher.worker.builder import WorkerBuilder, _to_millis
 
 
@@ -31,13 +33,16 @@ def test_seconds_are_not_silently_read_as_milliseconds() -> None:
 
 
 def test_builder_accepts_both_forms() -> None:
-    builder = (
-        WorkerBuilder()
-        .workflow_poll_interval(timedelta(milliseconds=250))
-        .task_poll_interval(500)
-        .shutdown_grace_time(timedelta(seconds=45))
-        .force_shutdown_timeout(90_000)
-    )
+    # The poll intervals and the force shutdown timeout are deprecated and
+    # ignored, and say so; they still take both forms.
+    with pytest.warns(DeprecationWarning, match="no effect"):
+        builder = (
+            WorkerBuilder()
+            .workflow_poll_interval(timedelta(milliseconds=250))
+            .task_poll_interval(500)
+            .shutdown_grace_time(timedelta(seconds=45))
+            .force_shutdown_timeout(90_000)
+        )
 
     assert builder._workflow_poll_interval_ms == 250
     assert builder._task_poll_interval_ms == 500

@@ -34,13 +34,13 @@ async def double(ctx: TaskContext, n: int) -> int:
     return n * 2
 
 
-class FakeBridge:
-    """The bridge calls a task execution makes: no cancellation ever comes."""
+class FakeHost:
+    """The worker host calls a task execution makes: no cancellation ever comes."""
 
-    def heartbeat_task(self, token: str, details: Any) -> bool:
+    def heartbeat(self, token: bytes, details: Any) -> bool:
         return False
 
-    async def wait_task_cancelled(self, token: str) -> bool:
+    async def task_cancelled(self, token: bytes) -> bool:
         await asyncio.Event().wait()
         return False
 
@@ -65,7 +65,7 @@ class RecordingTaskInterceptor(TaskInterceptor):
 
 def _worker(**kwargs: Any) -> Worker:
     worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"), **kwargs)
-    worker._bridge_worker = FakeBridge()
+    worker._host = FakeHost()
     worker._task_handlers["intercepted-double"] = double.__orcher_task__
     return worker
 
@@ -74,7 +74,7 @@ def _task_request(attempt: int = 1) -> dict[str, Any]:
     return {
         "task_id": "intercepted-double_1",
         "task_type": "intercepted-double",
-        "task_token": "dG9rZW4=",
+        "task_token": b"token",
         "workflow_id": "wf",
         "execution_id": "run",
         "task_queue": "q",

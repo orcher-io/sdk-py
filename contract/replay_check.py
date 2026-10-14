@@ -8,26 +8,21 @@ each an encoded ``orcher.v1.PollWorkflowExecutionResponse``), and
 the steps reached, the query and update answers, or the failure, as sdk-core
 reads them before sending them to the engine.
 
-Each activation is answered two ways, and both must give its expected result:
+The expected results were produced while the worker still had its
+journal-reading path as well, and both paths agreed on every one.
 
-- the kernel path: resolved by the kernel into a ``RunActivation``, answered
-  by ``Worker.run_activation``, and the answer turned back by the kernel, as
-  the worker host does on a live worker;
-- the journal path: the jobs sdk-core derives from the journal, answered by
-  the worker's journal-reading execution, as the worker runs today.
-
-The kernel protocol of sdk-core 0.14 carries neither a failed run's traceback
-nor the steps it reached, so for a failed run those two fields are left out of
-what is compared.
+Each activation is resolved by the kernel into a ``RunActivation``, answered
+by ``Worker.run_activation``, and the answer turned back by the kernel, as the
+worker host does on a live worker.
 
 No engine is needed. Requires the native module (``maturin develop``)::
 
     PYTHONPATH=src:contract python contract/replay_check.py [--bless]
 
-``--bless`` rewrites ``expected.json`` from what the journal path answers,
-and requires the kernel path to answer the same. Exits non-zero if any
-activation differs from its expected result or cannot be run, or if there is
-no activation to check.
+``--bless`` rewrites ``expected.json`` from what the SDK answers now, for a
+change meant to alter what it sends. Exits non-zero if any activation differs
+from its expected result or cannot be run, or if there is no activation to
+check.
 """
 
 from __future__ import annotations
@@ -65,30 +60,14 @@ def recorded_activations(corpus: Path) -> list[tuple[str, bytes]]:
     return out
 
 
-def comparable(result: dict[str, Any]) -> dict[str, Any]:
-    """A result as sdk-core reads it, without what the kernel protocol of
-    sdk-core 0.14 does not carry for a failed run."""
-    if not result.get("successful") and isinstance(result.get("error"), dict):
-        result = dict(result, error=dict(result["error"], details=None))
-        result.pop("reached_steps", None)
-    return result
-
-
-async def kernel_answer(worker: Worker, recorded: bytes) -> dict[str, Any]:
+async def answer(worker: Worker, recorded: bytes) -> dict[str, Any]:
     activation = json.loads(_native._kernel_resolve(recorded, NAMESPACE))
     # Some catalog workflows count their activations in the process; each
     # activation is answered as if it were the run's first in this process.
     catalog.ACTIVATIONS.clear()
-    answer = await worker.run_activation(activation)
+    reply = await worker.run_activation(activation)
     run_id = activation["run"]["run_id"]
-    return json.loads(_native._kernel_execution_result(run_id, json.dumps(answer)))
-
-
-async def journal_answer(worker: Worker, recorded: bytes) -> dict[str, Any]:
-    request = json.loads(_native._legacy_execution_request(recorded))
-    catalog.ACTIVATIONS.clear()
-    result = await worker._execute_workflow(request)
-    return comparable(json.loads(_native._parse_execution_result(json.dumps(result))))
+    return json.loads(_native._kernel_execution_result(run_id, json.dumps(reply)))
 
 
 async def main() -> int:
@@ -112,36 +91,28 @@ async def main() -> int:
         for key, recorded in recorded_activations(corpus):
             checked += 1
             try:
-                kernel = await kernel_answer(worker, recorded)
+                result = await answer(worker, recorded)
             except ValueError as e:
                 problems.append(f"{key}: the kernel refused the answer: {e}")
                 continue
-            journal = await journal_answer(worker, recorded)
+            answered[key] = result
             if args.bless:
-                answered[key] = journal
-                if kernel != journal:
-                    problems.append(
-                        f"{key}: the kernel path differs from the journal path\n"
-                        f"  journal: {json.dumps(journal)}\n  kernel:  {json.dumps(kernel)}"
-                    )
                 continue
             if key not in expected:
                 problems.append(f"{key}: no expected result")
-                continue
-            for path, result in (("kernel", kernel), ("journal", journal)):
-                if result != expected[key]:
-                    problems.append(
-                        f"{key} ({path} path):\n"
-                        f"  expected: {json.dumps(expected[key])}\n"
-                        f"  answered: {json.dumps(result)}"
-                    )
+            elif result != expected[key]:
+                problems.append(
+                    f"{key}:\n"
+                    f"  expected: {json.dumps(expected[key])}\n"
+                    f"  answered: {json.dumps(result)}"
+                )
         if args.bless:
             if not problems:
                 expected_path.write_text(json.dumps(answered, indent=2, sort_keys=True) + "\n")
                 print(f"blessed {expected_path} ({len(answered)} activations)")
         else:
             for key in expected:
-                if key not in dict(recorded_activations(corpus)):
+                if key not in answered:
                     problems.append(f"{key}: expected, but not in the corpus")
 
     for problem in problems:

@@ -1,25 +1,33 @@
 """
 Worker implementation.
 
-The Worker polls the Orcher server for workflow and task executions, runs the
-registered handlers, and reports results back to the server.
+The Worker runs the registered workflows, tasks and actors for one task queue
+of an Orcher engine.
 
-## Architecture: Python-owned event loop with a Rust bridge
+## Architecture: Python runs the code, the worker host does the rest
 
-Python owns the event loop and calls into Rust for server I/O:
+The native module binds the worker host shared with the Rust and TypeScript
+SDKs (``orcher-sdk-host``). The host polls the engine, keeps the worker
+registered and heartbeated, runs sessions, and drains on shutdown. Python
+pulls work from it when it has room to run some, runs it, and hands back the
+outcome:
 
-- The Python asyncio event loop drives everything.
-- Rust exposes poll and complete operations as awaitables (via future_into_py()).
+- Workflow activations arrive as the kernel protocol's ``RunActivation``: the
+  run's history already resolved into the outcomes its code observes. The
+  workflow's code runs once against them, and the answer is every durable
+  call it made (see ``orcher.worker.activation``).
+- Tasks arrive one at a time; their heartbeats and cancellation go through
+  the host while they run.
+- Actor operations arrive one at a time; the actor's state is read and
+  written through the host, on the worker's connection.
+
+The asyncio event loop drives everything:
+
 - Sync tasks run in an executor (ThreadPoolExecutor or ProcessPoolExecutor).
-- Async tasks run directly in the event loop.
-
-This supports:
-- CPU-bound tasks via ProcessPoolExecutor (true parallelism)
-- I/O-bound sync tasks via ThreadPoolExecutor
-- Full asyncio compatibility for async tasks
+- Async tasks and workflow code run directly in the event loop.
 
 Terminology:
-- Worker: a process that polls for and executes work
+- Worker: a process that runs registered workflows, tasks and actors
 - Task: a unit of work that may have side effects
 - Event: an external message delivered to a running workflow
 """
@@ -31,10 +39,12 @@ import inspect
 import json
 import logging
 import traceback
+import warnings
+from collections.abc import Awaitable, Callable
 from concurrent.futures import Executor as ConcurrentExecutor
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
@@ -51,7 +61,6 @@ from orcher.decorators.registry import (
 
 if TYPE_CHECKING:
     from orcher.worker.builder import WorkerBuilder
-    from orcher.worker.session import SessionManager
 from orcher.errors import ErrorCode, OrcherError, WorkflowSuspendedError
 from orcher.interceptors.base import (
     ExecutionInfo,
@@ -70,29 +79,33 @@ from orcher.worker.activation import (
     workflow_failure,
 )
 from orcher.worker.config import WorkerConfig
-from orcher.workflow.sentinels import CHILD_FAILED_SENTINEL, TASK_FAILED_SENTINEL
 
 logger = logging.getLogger(__name__)
 
-# How long the workflow and task pollers have to notice that their channels
-# closed after their drivers stopped. They normally notice at once; this only
-# bounds shutdown when a driver could not be stopped.
-DRIVER_POLLER_STOP_TIMEOUT_SECS = 5.0
+# The SDK the worker reports to the engine when it registers.
+SDK_NAME = "python"
+
+# How much longer than its shutdown grace a worker takes to stop: the host
+# keeps its drivers running past the grace to send the last results and hand
+# back unfinished activations, then deregisters.
+SHUTDOWN_MARGIN_SECS = 20.0
 
 
-async def _watch_task_cancellation(bridge: Any, task_token: str, token: Any) -> None:
-    """Cancel ``token`` once the engine asks the task to stop.
+async def _watch_task_cancellation(host: Any, token: bytes, cancellation: Any) -> None:
+    """Cancel ``cancellation`` once the task is asked to stop.
 
-    The worker heartbeats the task on its own. The engine answers a heartbeat
-    with a stop request when the workflow was cancelled or the attempt is no
-    longer running. Returns without cancelling once the task is reported.
+    The host heartbeats the task on its own, and the engine answers a
+    heartbeat with a stop request when the workflow was cancelled or the
+    attempt is no longer running; the host asks too when the worker stops
+    past its shutdown grace. Returns without cancelling once the task's
+    outcome is reported.
     """
     try:
-        if await bridge.wait_task_cancelled(task_token):
-            token.cancel()
+        if await host.task_cancelled(token):
+            cancellation.cancel()
     except asyncio.CancelledError:
         raise
-    except Exception as e:  # a native build without this call, or a bad token
+    except Exception as e:  # a host without this call
         logger.debug(f"Not watching task cancellation: {e}")
 
 
@@ -130,22 +143,6 @@ def _workflow_error_type(error: BaseException) -> str:
     return "WorkflowCode"
 
 
-def _workflow_started_at(journal_times: dict[str, Any], run_id: str) -> datetime:
-    """When the workflow started, as its journal recorded it.
-
-    A request from the engine always carries it; one built by hand (a test
-    driving the worker directly) may not, and the clock then starts now.
-    """
-    started_at_ms = journal_times.get("started_at_ms")
-    if isinstance(started_at_ms, int):
-        return datetime.fromtimestamp(started_at_ms / 1000, tz=UTC)
-    if journal_times:
-        logger.warning(
-            "The journal of run %s records no start time; workflow time starts now", run_id
-        )
-    return datetime.now(UTC)
-
-
 def _max_attempts(retry_policy: Any) -> int:
     """The attempts a task's declared retry policy allows; 0 when it declares none."""
     if isinstance(retry_policy, dict):
@@ -153,17 +150,42 @@ def _max_attempts(retry_policy: Any) -> int:
     return int(getattr(retry_policy, "max_attempts", 0) or 0)
 
 
-def _first_argument(arguments: list[Any]) -> bytes | None:
-    """The JSON bytes of a job's first argument payload; None when it has none."""
-    if arguments and isinstance(arguments[0], dict) and "data" in arguments[0]:
-        return bytes(arguments[0]["data"])
-    return None
+def _package_version() -> str:
+    """This SDK's release, reported to the engine when the worker registers."""
+    from orcher import __version__
+
+    return __version__
 
 
-def _payload_bytes(payload: Any) -> bytes:
-    """The bytes of a job's payload; empty when it has none."""
-    raw = payload.get("data", []) if isinstance(payload, dict) else []
-    return bytes(raw)
+def _task_request(assignment: dict[str, Any]) -> dict[str, Any]:
+    """A task as the worker host hands it over, as the task runner reads it.
+
+    The input is the JSON encoding of the task's keyword arguments; empty or
+    invalid input becomes no arguments.
+    """
+    raw = bytes(assignment.get("input") or [])
+    task_input: Any = {}
+    if raw:
+        try:
+            task_input = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            logger.error(f"Failed to deserialize task input: {e}")
+    return {
+        "task_id": assignment.get("task_id", ""),
+        "task_type": assignment.get("task_type", ""),
+        "task_token": bytes(assignment.get("token") or []),
+        "workflow_id": assignment.get("workflow_id", ""),
+        "execution_id": assignment.get("run_id", ""),
+        "task_queue": assignment.get("task_queue", ""),
+        "namespace": assignment.get("namespace", "default"),
+        "input": task_input,
+        "attempt": assignment.get("attempt"),
+        # The limits this attempt runs under, so a handler can pace its
+        # heartbeats against the interval it is judged by. Milliseconds, or
+        # None when the engine set no limit.
+        "heartbeat_timeout_ms": assignment.get("heartbeat_timeout_ms"),
+        "start_to_close_timeout_ms": assignment.get("attempt_timeout_ms"),
+    }
 
 
 @dataclass
@@ -232,10 +254,11 @@ class Worker:
     Worker runtime for executing workflows and tasks.
 
     The Worker:
-    - Polls the Orcher server for workflow execution steps
-    - Polls for task executions
-    - Executes workflow and task code
-    - Reports results back to the server
+    - Starts the worker host, which polls the Orcher server and keeps the
+      worker registered
+    - Pulls workflow activations, tasks and actor operations from it
+    - Executes workflow, task and actor code
+    - Hands the results back to it, which reports them to the server
 
     ## CPU-Bound Task Support
 
@@ -317,12 +340,8 @@ class Worker:
         self._workflow_handlers: dict[str, WorkflowMetadata] = {}
         self._task_handlers: dict[str, TaskMetadata] = {}
         self._actor_handlers: dict[str, ActorMetadata] = {}
-        self._actor_registration_id: str | None = None
         self._query_handlers: dict[str, QueryMetadata] = {}
         self._update_handlers: dict[str, UpdateMetadata] = {}
-
-        # Created together with the bridge worker.
-        self._session_manager: SessionManager | None = None
 
         self._workflow_interceptor_chain = WorkflowInterceptorChain()
         self._task_interceptor_chain = TaskInterceptorChain()
@@ -331,19 +350,14 @@ class Worker:
         for ti in task_interceptors or []:
             self._task_interceptor_chain.add(ti)
 
-        # The Rust side of the bridge; None until initialized.
-        self._bridge_worker: Any | None = None
+        # The worker host (native); None until the worker starts.
+        self._host: Any | None = None
 
-        # Actor poller tasks. Workflow and task pollers are tracked separately.
-        self._poller_tasks: list[asyncio.Task[None]] = []
+        # The work pulled from the host and still running.
+        self._running: set[asyncio.Task[None]] = set()
 
         # Pre-built task class instances, for dependency injection.
         self._task_instances: dict[type[Any], Any] = {}
-
-        # Keys of executions currently running, used to skip duplicates.
-        self._workflow_in_flight: set[str] = set()
-        self._task_in_flight: set[str] = set()
-        self._actor_in_flight: set[str] = set()
 
         self._load_handlers_from_registry()
 
@@ -527,18 +541,19 @@ class Worker:
             max_concurrent_tasks=self._config.max_concurrent_task_executions,
         )
 
-    def _get_bridge_worker(self) -> Any:
-        """Get the bridge worker, raising if not initialized."""
-        if self._bridge_worker is None:
-            raise RuntimeError("Bridge worker not initialized")
-        return self._bridge_worker
+    def _get_host(self) -> Any:
+        """Get the worker host, raising if the worker has not started."""
+        if self._host is None:
+            raise RuntimeError("Worker host not started")
+        return self._host
 
     async def run(self) -> None:
         """
         Run the worker until shutdown.
 
-        Starts the worker and blocks until shutdown is requested. Python owns
-        the event loop and drives polling through the Rust bridge.
+        Starts the worker host and blocks until shutdown is requested and the
+        host has stopped. Python owns the event loop and pulls work from the
+        host when it has room to run some.
 
         Raises:
             RuntimeError: If the worker is already running, a task class is
@@ -569,7 +584,7 @@ class Worker:
                 f"Polling {self._config.task_queue} in namespace {self._config.namespace}"
             )
 
-            await self._run_polling_loops()
+            await self._run_pull_loops()
 
         except Exception as e:
             logger.error(f"Service failed: {e}")
@@ -588,12 +603,25 @@ class Worker:
         Request shutdown of the worker.
 
         Returns once shutdown is requested; run() returns when it completes.
-        A second call waits for the first request.
+        The worker stops claiming work at once, gives the work it is running
+        the configured shutdown grace (``shutdown_grace_time_ms``) to finish,
+        hands back the workflow activations still unfinished, and asks the
+        tasks still running to cancel. A second call waits for the first
+        request.
 
         Args:
-            force: If True, cancel pollers at once instead of draining work
-            timeout_ms: Custom timeout for graceful shutdown
+            force: If True, cancel the work running now instead of letting it
+                finish within the grace.
+            timeout_ms: Deprecated and ignored: the shutdown grace is fixed
+                when the worker starts, from ``shutdown_grace_time_ms``.
         """
+        if timeout_ms is not None:
+            warnings.warn(
+                "Worker.shutdown(timeout_ms=...) is ignored; the shutdown grace is "
+                "WorkerConfig.shutdown_grace_time_ms, fixed when the worker starts",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if self._state == WorkerState.STOPPED:
             return
 
@@ -602,24 +630,63 @@ class Worker:
             return
 
         self._shutdown_requested = True
-        timeout = timeout_ms or self._config.shutdown_grace_time_ms
 
         if force:
             logger.info("Force shutdown requested")
             self._state = WorkerState.FORCE_SHUTDOWN
         else:
-            logger.info(f"Graceful shutdown requested (timeout: {timeout}ms)")
+            logger.info(
+                f"Graceful shutdown requested (grace: {self._config.shutdown_grace_time_ms}ms)"
+            )
             self._state = WorkerState.SHUTTING_DOWN
 
         self._stats.state = self._state
-
-        if self._bridge_worker is not None:
-            self._bridge_worker.request_shutdown()
-
         self._shutdown_event.set()
 
+    def _host_config(self) -> dict[str, Any]:
+        """The worker host's configuration, from this worker's."""
+        config = self._config
+        return {
+            "server_url": config.server_url,
+            "task_queue": config.task_queue,
+            "namespace": config.namespace,
+            "identity": config.identity,
+            "api_key": config.api_key,
+            "organization_id": config.organization_id,
+            "version_id": config.version_id,
+            "tls_ca_cert_path": config.tls_ca_cert_path,
+            "tls_client_cert_path": config.tls_client_cert_path,
+            "tls_client_key_path": config.tls_client_key_path,
+            "max_concurrent_workflows": config.max_concurrent_workflow_executions,
+            "max_concurrent_tasks": config.max_concurrent_task_executions,
+            "max_concurrent_actor_operations": config.max_concurrent_actor_operations,
+            "workflow_pollers": config.workflow_poller_count,
+            "task_pollers": config.task_poller_count,
+            "actor_pollers": config.actor_poller_count,
+            "shutdown_grace_ms": config.shutdown_grace_time_ms,
+            "sdk_name": SDK_NAME,
+            "sdk_version": _package_version(),
+        }
+
+    def _registrations(self) -> dict[str, Any]:
+        """What the worker runs: its workflow and task types, and every
+        operation of its actors with whether it may share its actor."""
+        return {
+            "workflow_types": list(self._workflow_handlers),
+            "task_types": list(self._task_handlers),
+            "actor_handlers": [
+                {
+                    "actor_name": actor_name,
+                    "operation": op_name,
+                    "shared": op.mode.value == "shared",
+                }
+                for actor_name, meta in self._actor_handlers.items()
+                for op_name, op in meta.operations.items()
+            ],
+        }
+
     async def _initialize(self) -> None:
-        """Create the task executor and the native bridge worker."""
+        """Create the task executor and start the worker host."""
         logger.debug("Initializing service...")
 
         if not self._workflow_handlers and not self._task_handlers:
@@ -639,379 +706,170 @@ class Worker:
 
         if is_native_available():
             native = get_native_module()
-
-            native_config = native.WorkerConfig(
-                server_url=self._config.server_url,
-                task_queue=self._config.task_queue,
-                namespace=self._config.namespace,
-                max_concurrent_workflows=self._config.max_concurrent_workflow_executions,
-                max_concurrent_tasks=self._config.max_concurrent_task_executions,
-                identity=self._config.identity,
-                workflow_poller_count=self._config.workflow_poller_count,
-                task_poller_count=self._config.task_poller_count,
-                actor_poller_count=self._config.actor_poller_count if self._actor_handlers else 0,
-                max_concurrent_actors=self._config.max_concurrent_actor_operations,
-                organization_id=self._config.organization_id,
-                api_key=self._config.api_key,
-                version_id=self._config.version_id,
-                tls_ca_cert_path=self._config.tls_ca_cert_path,
-                tls_client_cert_path=self._config.tls_client_cert_path,
-                tls_client_key_path=self._config.tls_client_key_path,
+            # Registers the worker, and its actor handlers with their modes,
+            # so the server can tell shared operations from exclusive ones.
+            self._host = await native.WorkerHost.start(
+                json.dumps(self._host_config()), json.dumps(self._registrations())
             )
-
-            self._bridge_worker = native.BridgeWorker(native_config)
-            logger.debug("Bridge worker initialized")
-
-            # Register actor handlers with their per-operation modes so the
-            # server can tell shared operations from exclusive ones. Without
-            # registration every operation runs exclusive, which is safe, so a
-            # failure here is logged loudly and the worker stays up.
-            if self._actor_handlers:
-                handlers = [
-                    {
-                        "actor_name": actor_name,
-                        "operation": op_name,
-                        "mode": op.mode.value,
-                    }
-                    for actor_name, meta in self._actor_handlers.items()
-                    for op_name, op in meta.operations.items()
-                ]
-                try:
-                    registration_id = await self._bridge_worker.register_actor_handlers(
-                        json.dumps(handlers),
-                        json.dumps({"sdk": "python"}),
-                    )
-                    self._actor_registration_id = registration_id
-                    logger.info(
-                        "Registered %d actor handler(s) with the server "
-                        "(registration_id=%s)",
-                        len(handlers),
-                        registration_id,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Actor handler registration failed — actor operations "
-                        "will run in exclusive mode (shared concurrency "
-                        "disabled) until the worker restarts",
-                        exc_info=True,
-                    )
-
-            from orcher.worker.session import SessionManager
-
-            self._session_manager = SessionManager(
-                max_sessions=10,
-                bridge_worker=self._bridge_worker,
-            )
+            logger.debug("Worker host started")
         else:
             logger.warning("Native module not available, running in mock mode")
 
         logger.debug("Service initialized")
 
-    async def _run_polling_loops(self) -> None:
+    async def _run_pull_loops(self) -> None:
         """
-        Run the polling loops until shutdown, then drain and stop them.
+        Pull work from the host until shutdown, then drain and stop it.
 
-        Python owns the event loop and calls into Rust, which handles server
-        I/O. Without a bridge worker this only waits for shutdown.
+        One pull loop per kind of work: workflow activations, tasks and actor
+        operations. Each takes room to run one more, pulls the next one, runs
+        it and hands back its outcome. A kind the worker registered nothing
+        for ends its loop at once. Without a host this only waits for
+        shutdown.
         """
-        logger.info(
-            f"Starting {self._config.workflow_poller_count} workflow poller(s) and "
-            f"{self._config.task_poller_count} task poller(s)"
-        )
-
-        if self._bridge_worker is None:
+        host = self._host
+        if host is None:
             logger.info("Running in mock mode - waiting for shutdown")
             await self._shutdown_event.wait()
             return
 
-        # The workflow and task pollers are kept apart from the actor pollers
-        # because they stop later; see below.
-        driver_pollers: list[asyncio.Task[None]] = []
+        config = self._config
+        pullers = [
+            asyncio.create_task(
+                self._pull(
+                    "workflow activation",
+                    asyncio.Semaphore(config.max_concurrent_workflow_executions),
+                    host.next_activation,
+                    self._handle_activation,
+                ),
+                name="pull-activations",
+            ),
+            asyncio.create_task(
+                self._pull(
+                    "task",
+                    asyncio.Semaphore(config.max_concurrent_task_executions),
+                    host.next_task,
+                    self._handle_task,
+                ),
+                name="pull-tasks",
+            ),
+            asyncio.create_task(
+                self._pull(
+                    "actor operation",
+                    asyncio.Semaphore(config.max_concurrent_actor_operations),
+                    host.next_actor_operation,
+                    self._handle_actor_operation,
+                ),
+                name="pull-actor-operations",
+            ),
+        ]
+        logger.info("Pulling work from the worker host")
         try:
-            # Raised by the bridge when a poll ends because of shutdown.
-            native = get_native_module()
-            shutdown_event_cls = native.WorkerShutdownEvent
-
-            driver_pollers = [
-                asyncio.create_task(
-                    self._workflow_polling_loop(i, shutdown_event_cls),
-                    name=f"workflow-poller-{i}",
-                )
-                for i in range(self._config.workflow_poller_count)
-            ]
-
-            driver_pollers += [
-                asyncio.create_task(
-                    self._task_polling_loop(i, shutdown_event_cls),
-                    name=f"task-poller-{i}",
-                )
-                for i in range(self._config.task_poller_count)
-            ]
-
-            # Actor pollers run only when actors are registered.
-            if self._actor_handlers:
-                for i in range(self._config.actor_poller_count):
-                    task = asyncio.create_task(
-                        self._actor_polling_loop(i, shutdown_event_cls),
-                        name=f"actor-poller-{i}",
-                    )
-                    self._poller_tasks.append(task)
-
-            logger.info("All pollers started")
-
             await self._shutdown_event.wait()
             logger.info("Shutdown signal received")
-
-            for task in self._poller_tasks:
-                task.cancel()
-            if self._poller_tasks:
-                await asyncio.gather(*self._poller_tasks, return_exceptions=True)
-
             if self._state == WorkerState.FORCE_SHUTDOWN:
-                for task in driver_pollers:
-                    task.cancel()
-            else:
-                # The workflow and task pollers keep running until their
-                # drivers stop. During the shutdown grace period each driver
-                # still delivers the results of polls it already had in
-                # flight, and the engine has already claimed that work. If
-                # nothing here took it, the engine would wait out the claim
-                # timeout before another worker could run it. Stopping the
-                # drivers closes the pollers' channels, which ends the pollers.
-                await self._wait_for_in_flight_executions()
-                await self._stop_drivers()
-                # Still bounded: if a driver could not be stopped its channel
-                # may never close, and shutdown must still return.
-                _, still_polling = await asyncio.wait(
-                    driver_pollers, timeout=DRIVER_POLLER_STOP_TIMEOUT_SECS
-                )
-                for task in still_polling:
-                    task.cancel()
-            await asyncio.gather(*driver_pollers, return_exceptions=True)
-
+                self._cancel_running()
+            # The host stops claiming work at once, waits out the grace for
+            # the work running here, hands back what is left, and stops; the
+            # pulls then end.
+            await host.shutdown()
+            await asyncio.gather(*pullers, return_exceptions=True)
+            # Work still running past the grace was handed back or asked to
+            # cancel; nothing takes its outcome any more.
+            self._cancel_running()
+            await self._wait_for_running()
         except asyncio.CancelledError:
             logger.info("Polling cancelled")
-            # The workflow and task pollers do not watch for shutdown, so
-            # nothing else would stop them.
-            for task in driver_pollers:
-                task.cancel()
+            for puller in pullers:
+                puller.cancel()
+            self._cancel_running()
             raise
 
-    async def _workflow_polling_loop(
-        self, poller_index: int, shutdown_event_cls: type[BaseException]
-    ) -> None:
-        """
-        Poll for workflow tasks through the Rust bridge and dispatch them.
-
-        Each poller uses its index as the slot_index, so it polls its own
-        dedicated channel and does not contend on a mutex with other pollers.
-
-        Args:
-            poller_index: Index of this poller (used as slot_index)
-            shutdown_event_cls: Exception class for shutdown signals
-        """
-        logger.info(f"Workflow poller {poller_index} started (slot {poller_index})")
-
-        # Not bounded by `_shutdown_requested`: this loop ends when the bridge
-        # closes its channel after the workflow driver stops, so work the
-        # driver delivers during shutdown still runs.
-        while True:
-            try:
-                task_bytes = await self._get_bridge_worker().poll_workflow_task(poller_index)
-
-                if task_bytes is None:
-                    # No work available; back off briefly before polling again.
-                    await asyncio.sleep(0.1)
-                    continue
-
-                # Response fields: execution_request, workflow_id, run_id,
-                # task_token, stream_entry_id.
-                response = json.loads(task_bytes)
-
-                request = response.get("execution_request", {})
-                workflow_id = response.get("workflow_id", "")
-                run_id = response.get("run_id", "")
-                task_token = response.get("task_token", "")
-                stream_entry_id = response.get("stream_entry_id")
-
-                dedup_key = f"{workflow_id}:{run_id}"
-
-                if dedup_key in self._workflow_in_flight:
-                    # Nothing will answer this activation, so the engine keeps
-                    # it claimed until its claim timeout expires.
-                    logger.error(
-                        "Dropping workflow activation while another for the same run "
-                        "is in flight: workflow_id=%s run_id=%s",
-                        workflow_id,
-                        run_id,
-                    )
-                    await asyncio.sleep(0.01)
-                    continue
-
-                self._workflow_in_flight.add(dedup_key)
-
-                # Fire-and-forget so the poller can return to polling at once.
-                asyncio.create_task(
-                    self._handle_workflow_task(
-                        request, dedup_key, workflow_id, run_id, task_token, stream_entry_id
-                    ),
-                    name=f"workflow-{run_id}",
-                )
-
-            except shutdown_event_cls:
-                logger.debug(f"Workflow poller {poller_index} received shutdown signal")
-                break
-            except asyncio.CancelledError:
-                logger.debug(f"Workflow poller {poller_index} cancelled")
-                break
-            except Exception as e:
-                if self._bridge_worker is None:
-                    # Torn down: there is nothing left to poll.
-                    break
-                logger.error(f"Workflow poller {poller_index} error: {e}")
-                await asyncio.sleep(1.0)
-
-        logger.info(f"Workflow poller {poller_index} stopped")
-
-    async def _task_polling_loop(
-        self, poller_index: int, shutdown_event_cls: type[BaseException]
-    ) -> None:
-        """
-        Poll for tasks through the Rust bridge and dispatch them.
-
-        Each poller uses its index as the slot_index, so it polls its own
-        dedicated channel and does not contend on a mutex with other pollers.
-
-        Args:
-            poller_index: Index of this poller (used as slot_index)
-            shutdown_event_cls: Exception class for shutdown signals
-        """
-        logger.info(f"Task poller {poller_index} started (slot {poller_index})")
-
-        # Not bounded by `_shutdown_requested`, like the workflow poller: this
-        # loop ends when the bridge closes its channel after the task driver
-        # stops, so work the driver delivers during shutdown still runs.
-        while True:
-            try:
-                task_bytes = await self._get_bridge_worker().poll_task(poller_index)
-
-                if task_bytes is None:
-                    # No work available; back off briefly before polling again.
-                    await asyncio.sleep(0.1)
-                    continue
-
-                request = json.loads(task_bytes)
-
-                workflow_id = request.get("workflow_id", "")
-                task_id = request.get("task_id", "")
-                dedup_key = f"{workflow_id}:{task_id}"
-
-                if dedup_key in self._task_in_flight:
-                    logger.debug(f"Skipping duplicate task: {dedup_key}")
-                    await asyncio.sleep(0.01)
-                    continue
-
-                self._task_in_flight.add(dedup_key)
-
-                # Fire-and-forget so the poller can return to polling at once.
-                asyncio.create_task(
-                    self._handle_task(request, dedup_key),
-                    name=f"task-{task_id}",
-                )
-
-            except shutdown_event_cls:
-                logger.debug(f"Task poller {poller_index} received shutdown signal")
-                break
-            except asyncio.CancelledError:
-                logger.debug(f"Task poller {poller_index} cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Task poller {poller_index} error: {e}")
-                await asyncio.sleep(1.0)
-
-        logger.info(f"Task poller {poller_index} stopped")
-
-    async def _handle_workflow_task(
+    async def _pull(
         self,
-        request: dict[str, Any],
-        dedup_key: str,
-        workflow_id: str,
-        run_id: str,
-        task_token: str,
-        stream_entry_id: str | None,
+        kind: str,
+        room: asyncio.Semaphore,
+        pull: Callable[[], Awaitable[str | None]],
+        handle: Callable[[dict[str, Any]], Awaitable[None]],
     ) -> None:
-        """
-        Execute a workflow task and report its result or failure.
+        """Take room, pull the next piece of work, run it, hand back its
+        outcome; until the host has stopped and handed over everything."""
+        while True:
+            await room.acquire()
+            try:
+                work = await pull()
+            except asyncio.CancelledError:
+                room.release()
+                raise
+            except Exception as e:
+                room.release()
+                logger.error(f"Pulling the next {kind} failed: {e}")
+                await asyncio.sleep(1.0)
+                continue
+            if work is None:
+                room.release()
+                logger.debug(f"No more {kind}s: the worker host has stopped")
+                return
+            running = asyncio.create_task(self._run_in_room(room, handle(json.loads(work))))
+            self._running.add(running)
+            running.add_done_callback(self._running.discard)
 
-        Args:
-            request: The workflow execution request from the native core
-            dedup_key: Key for deduplication tracking
-            workflow_id: The workflow ID
-            run_id: The run/execution ID
-            task_token: Token for completing/failing the task
-            stream_entry_id: Optional stream entry ID for acknowledgment
-        """
+    @staticmethod
+    async def _run_in_room(room: asyncio.Semaphore, work: Awaitable[None]) -> None:
+        try:
+            await work
+        finally:
+            room.release()
+
+    def _cancel_running(self) -> None:
+        for running in list(self._running):
+            running.cancel()
+
+    async def _wait_for_running(self) -> None:
+        if self._running:
+            await asyncio.gather(*list(self._running), return_exceptions=True)
+
+    async def _handle_activation(self, activation: dict[str, Any]) -> None:
+        """Run a workflow activation and hand back its answer."""
+        run_id = (activation.get("run") or {}).get("run_id", "")
         try:
             self._stats.workflows_in_progress += 1
-
-            result = await self._execute_workflow(request)
-
-            result_json = json.dumps(result)
-            await self._get_bridge_worker().complete_workflow_task(
-                workflow_id=workflow_id,
-                execution_id=run_id,
-                result_json=result_json,
-                task_token=task_token,
-                stream_entry_id=stream_entry_id,
-            )
-
+            answer = await self.run_activation(activation)
+            await self._get_host().complete_activation(json.dumps(answer))
             self._stats.workflows_executed += 1
-            logger.debug(f"Completed workflow: {run_id}")
-
+            logger.debug(f"Answered workflow activation: {run_id}")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.exception(f"Workflow execution failed: {e}")
+            # The host hands an unanswered activation back to the engine.
+            logger.exception(f"Workflow activation not answered: {e}")
             self._stats.errors += 1
-
-            try:
-                await self._get_bridge_worker().fail_workflow_task(
-                    workflow_id=workflow_id,
-                    execution_id=run_id,
-                    task_token=task_token,
-                    error_message=str(e),
-                    error_type="WorkflowExecutionError",
-                )
-            except Exception as fail_error:
-                logger.error(f"Failed to report workflow failure: {fail_error}")
-
         finally:
             self._stats.workflows_in_progress -= 1
-            self._workflow_in_flight.discard(dedup_key)
 
-    async def _handle_task(self, request: dict[str, Any], dedup_key: str) -> None:
+    async def _handle_task(self, assignment: dict[str, Any]) -> None:
         """
-        Execute a task and report its result or failure.
+        Run a task and report its result or failure.
 
         Args:
-            request: The task request
-            dedup_key: Key for deduplication tracking
+            assignment: The task, as the worker host hands it over
         """
-        task_id = request.get("task_id", "")
-        task_token = request.get("task_token", "")
+        request = _task_request(assignment)
+        task_id = request["task_id"]
+        token = request["task_token"]
 
         try:
             self._stats.tasks_in_progress += 1
 
             result = await self._execute_task(request)
 
-            result_json = json.dumps(result)
-            await self._get_bridge_worker().complete_task(
-                task_token=task_token,
-                result_json=result_json,
-            )
+            await self._get_host().complete_task(token, json.dumps(result).encode("utf-8"))
 
             self._stats.tasks_executed += 1
             logger.debug(f"Completed task: {task_id}")
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception(f"Task execution failed: {e}")
             self._stats.errors += 1
@@ -1021,8 +879,8 @@ class Worker:
             # class name is sent. A truthy `non_retryable` attribute on the
             # exception stops retries regardless of the policy.
             try:
-                await self._get_bridge_worker().fail_task(
-                    task_token,
+                await self._get_host().fail_task(
+                    token,
                     str(e),
                     type(e).__name__,
                     bool(getattr(e, "non_retryable", False)),
@@ -1032,144 +890,6 @@ class Worker:
 
         finally:
             self._stats.tasks_in_progress -= 1
-            self._task_in_flight.discard(dedup_key)
-
-    async def _execute_workflow(self, request: dict[str, Any]) -> dict[str, Any]:
-        """
-        Execute a workflow activation from the jobs sdk-core derived from its
-        journal.
-
-        Workflows always run in the event loop.
-
-        Args:
-            request: ExecutionRequest dict
-
-        Returns:
-            ExecutionResult dict
-        """
-        run_id = request.get("run_id", "unknown")
-
-        # Extract workflow info from jobs
-        workflow_type = "unknown"
-        workflow_input = {}
-        workflow_id = ""
-        task_queue = ""
-
-        jobs = request.get("jobs", [])
-        for job in jobs:
-            if isinstance(job, dict) and "StartWorkflow" in job:
-                start_job = job["StartWorkflow"]
-                workflow_type = start_job.get("workflow_type", "unknown")
-                workflow_input = start_job.get("input", {})
-                workflow_id = start_job.get("workflow_id", "")
-                task_queue = start_job.get("task_queue", "")
-                break
-
-        if not workflow_id:
-            execution = request.get("execution", {})
-            workflow_id = execution.get("workflow_id", "")
-
-        logger.debug(f"Executing workflow: type={workflow_type}, run_id={run_id}")
-
-        if workflow_type not in self._workflow_handlers:
-            return {
-                "run_id": run_id,
-                "successful": False,
-                "commands": [],
-                "query_responses": [],
-                "update_results": [],
-                "error": {
-                    "message": f"Unknown workflow type: {workflow_type}",
-                    "error_type": "WorkflowCode",
-                    "details": None,
-                    "retryable": False,
-                },
-                "restart_fresh": None,
-            }
-
-        from orcher.workflow.context import WorkflowContext
-        from orcher.workflow.info import WorkflowInfo
-
-        # When the engine journaled what this activation hands the workflow.
-        # The jobs carry no times, so the native layer reads them from the
-        # journal; the workflow's clock is built from them and nothing else.
-        journal_times = request.get("journal_times") or {}
-        info = WorkflowInfo(
-            workflow_id=workflow_id,
-            run_id=run_id,
-            workflow_type=workflow_type,
-            task_queue=task_queue,
-            namespace=request.get("namespace", "default"),
-            attempt=request.get("attempt", 1),
-            started_at=_workflow_started_at(journal_times, run_id),
-        )
-        ctx = WorkflowContext(info=info, replaying=request.get("is_replaying", False))
-        ctx._record_journal_times(journal_times)
-        # A request to cancel the workflow: it is told at its first wait whose
-        # result the journal did not record before it, by the journal's times.
-        # The engine adds step results after the journal's own entries, so where
-        # a job sits says nothing about when it happened.
-        if any(isinstance(job, dict) and "CancelWorkflow" in job for job in jobs):
-            ctx._note_cancel_requested(journal_times.get("cancel_requested_at"))
-        # The children the run started, so a child started without an id keeps
-        # the id the journal holds for it, whichever SDK chose it.
-        ctx._record_journaled_children(request.get("journaled_children") or [])
-        # Results of already-completed commands, returned as-is on replay.
-        cached_results = self._extract_cached_results_from_jobs(jobs)
-        if cached_results:
-            ctx._set_cached_results(cached_results)
-
-        queries = [
-            AskedQuery(
-                query_id=job["ProcessQuery"].get("query_id", ""),
-                query_type=job["ProcessQuery"].get("query_type", ""),
-                args=_first_argument(job["ProcessQuery"].get("arguments", [])),
-            )
-            for job in jobs
-            if isinstance(job, dict) and "ProcessQuery" in job
-        ]
-        updates = [
-            AskedUpdate(
-                update_id=job["UpdateState"].get("update_id", ""),
-                update_type=job["UpdateState"].get("update_name", ""),
-                args=_payload_bytes(job["UpdateState"].get("payload", {})),
-            )
-            for job in jobs
-            if isinstance(job, dict) and "UpdateState" in job
-        ]
-
-        run = await self._run_workflow(
-            ctx,
-            workflow_type,
-            workflow_input,
-            queries,
-            updates,
-            request.get("journaled_updates") or [],
-        )
-
-        answered: dict[str, Any] = {
-            "run_id": run_id,
-            "successful": True,
-            "commands": [],
-            "query_responses": run.query_responses,
-            "update_results": run.update_results,
-            "error": None,
-            "restart_fresh": None,
-            # The steps the code reached, which sdk-core checks against the
-            # journal to tell code that no longer replays the run.
-            "reached_steps": [step_id for _, step_id in run.reached],
-        }
-        if run.failure is not None:
-            answered["successful"] = False
-            answered["error"] = {
-                "message": str(run.failure),
-                "error_type": _workflow_error_type(run.failure),
-                "details": run.failure_details,
-                "retryable": False,
-            }
-        else:
-            answered["commands"] = run.commands
-        return answered
 
     async def run_activation(self, activation: dict[str, Any]) -> dict[str, Any]:
         """Run a workflow activation as the kernel protocol carries it.
@@ -1555,18 +1275,6 @@ class Worker:
 
         logger.debug(f"Executing task: type={task_type}, task_id={task_id}")
 
-        # Internal session tasks are handled by the SessionManager.
-        from orcher.workflow.session import SESSION_COMPLETE_TASK, SESSION_CREATE_TASK
-
-        if task_type == SESSION_CREATE_TASK and self._session_manager is not None:
-            task_input = request.get("input", {})
-            task_queue = request.get("task_queue", "")
-            return await self._session_manager.handle_create_session(task_input, task_queue)
-
-        if task_type == SESSION_COMPLETE_TASK and self._session_manager is not None:
-            task_input = request.get("input", {})
-            return await self._session_manager.handle_complete_session(task_input)
-
         metadata = self._task_handlers.get(task_type)
         if metadata is None:
             raise ValueError(f"Unknown task type: {task_type}")
@@ -1589,17 +1297,17 @@ class Worker:
             heartbeat_timeout=_optional_millis(request.get("heartbeat_timeout_ms")),
             start_to_close_timeout=_optional_millis(request.get("start_to_close_timeout_ms")),
         )
-        # The worker heartbeats the task on its own. The context forwards the
-        # task's explicit heartbeats to the bridge, and the engine's request to
-        # stop the task reaches the context's cancellation token.
-        bridge = self._get_bridge_worker()
-        task_token = request.get("task_token", "")
+        # The host heartbeats the task on its own. The context forwards the
+        # task's explicit heartbeats to the host, and a request to stop the
+        # task reaches the context's cancellation token.
+        host = self._get_host()
+        task_token = request.get("task_token", b"")
         ctx = TaskContext(
             info=task_info,
-            heartbeat_sender=lambda details: bool(bridge.heartbeat_task(task_token, details)),
+            heartbeat_sender=lambda details: bool(host.heartbeat(task_token, details)),
         )
         cancellation_watch = asyncio.ensure_future(
-            _watch_task_cancellation(bridge, task_token, ctx.cancellation_token)
+            _watch_task_cancellation(host, task_token, ctx.cancellation_token)
         )
 
         if metadata.is_function:
@@ -1684,65 +1392,11 @@ class Worker:
         finally:
             cancellation_watch.cancel()
 
-    async def _actor_polling_loop(
-        self, poller_index: int, shutdown_event_cls: type[BaseException]
-    ) -> None:
-        """Poll for actor operations through the Rust bridge and dispatch them.
-
-        Unlike the workflow and task pollers, this loop stops as soon as
-        shutdown is requested.
+    async def _handle_actor_operation(self, request: dict[str, Any]) -> None:
+        """Run an actor operation and report its result or failure.
 
         Args:
-            poller_index: Index of this poller (used as slot_index)
-            shutdown_event_cls: Exception class for shutdown signals
-        """
-        logger.info(f"Actor poller {poller_index} started (slot {poller_index})")
-
-        while not self._shutdown_requested:
-            try:
-                task_bytes = await self._get_bridge_worker().poll_actor_operation(poller_index)
-
-                if task_bytes is None:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                request = json.loads(task_bytes)
-
-                operation_id = request.get("operation_id", "")
-                dedup_key = (
-                    f"{request.get('actor_name', '')}:{request.get('key', '')}:{operation_id}"
-                )
-
-                if dedup_key in self._actor_in_flight:
-                    logger.debug(f"Skipping duplicate actor op: {dedup_key}")
-                    await asyncio.sleep(0.01)
-                    continue
-
-                self._actor_in_flight.add(dedup_key)
-
-                asyncio.create_task(
-                    self._handle_actor_operation(request, dedup_key),
-                    name=f"actor-op-{operation_id}",
-                )
-
-            except shutdown_event_cls:
-                logger.debug(f"Actor poller {poller_index} received shutdown signal")
-                break
-            except asyncio.CancelledError:
-                logger.debug(f"Actor poller {poller_index} cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Actor poller {poller_index} error: {e}")
-                await asyncio.sleep(1.0)
-
-        logger.info(f"Actor poller {poller_index} stopped")
-
-    async def _handle_actor_operation(self, request: dict[str, Any], dedup_key: str) -> None:
-        """Handle an actor operation.
-
-        Args:
-            request: The actor operation request from the native bridge
-            dedup_key: Key for deduplication tracking
+            request: The actor operation, as the worker host hands it over
         """
         operation_id = request.get("operation_id", "")
         execution_id = request.get("execution_id", "")
@@ -1750,31 +1404,24 @@ class Worker:
         try:
             result = await self._execute_actor_operation(request)
 
-            result_json = json.dumps(result)
-            await self._get_bridge_worker().complete_actor_operation(
-                operation_id=operation_id,
-                execution_id=execution_id,
-                result_json=result_json,
+            await self._get_host().complete_actor_operation(
+                operation_id, execution_id, json.dumps(result).encode("utf-8")
             )
 
             logger.debug(f"Completed actor operation: {operation_id}")
 
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception(f"Actor operation failed: {e}")
             self._stats.errors += 1
 
             try:
-                await self._get_bridge_worker().fail_actor_operation(
-                    operation_id=operation_id,
-                    execution_id=execution_id,
-                    error_message=str(e),
-                    error_type="ActorOperationError",
+                await self._get_host().fail_actor_operation(
+                    operation_id, execution_id, str(e), type(e).__name__
                 )
             except Exception as fail_error:
                 logger.error(f"Failed to report actor failure: {fail_error}")
-
-        finally:
-            self._actor_in_flight.discard(dedup_key)
 
     async def _execute_actor_operation(self, request: dict[str, Any]) -> Any:
         """Execute an actor operation.
@@ -1817,34 +1464,18 @@ class Worker:
                 f"Available: {actor_meta.operation_names()}"
             )
 
-        payload_bytes = request.get("payload", b"")
-        if isinstance(payload_bytes, str):
-            # The native bridge encodes payload bytes as base64 in JSON. A plain
-            # JSON string is also accepted.
-            if payload_bytes:
-                try:
-                    operation_input = json.loads(payload_bytes)
-                except ValueError:
-                    import base64
-
-                    operation_input = json.loads(base64.b64decode(payload_bytes))
-            else:
-                operation_input = {}
-        elif isinstance(payload_bytes, (bytes, bytearray)):
-            operation_input = json.loads(payload_bytes) if payload_bytes else {}
-        elif isinstance(payload_bytes, list):
-            # Protobuf bytes decoded as a list of ints.
-            operation_input = json.loads(bytes(payload_bytes)) if payload_bytes else {}
-        else:
-            operation_input = payload_bytes if payload_bytes is not None else {}
+        # The operation's argument as its JSON encoding, the bytes as a list
+        # of integers; none is no arguments.
+        payload_bytes = bytes(request.get("payload") or [])
+        operation_input: Any = json.loads(payload_bytes) if payload_bytes else {}
 
         actor_key = ActorKey(actor_name=actor_name, key=key)
 
-        # State is read and written through the native bridge when present.
-        if self._bridge_worker is not None:
+        # State is read and written through the worker host when present.
+        if self._host is not None:
             state_client = ActorStateClient(
                 server_url=self._config.server_url,
-                bridge=self._bridge_worker,
+                bridge=self._host,
             )
         else:
             state_client = ActorStateClient.new_mock()
@@ -1893,137 +1524,6 @@ class Worker:
 
         return self._make_json_serializable(result)
 
-    def _extract_cached_results_from_jobs(self, jobs: list[dict[str, Any]]) -> dict[str, Any]:
-        """Extract completed results from journal jobs for replay."""
-        cached_results: dict[str, Any] = {}
-
-        # Jobs arrive in journal order. The index lets a wait with a timeout
-        # tell whether its event or its deadline came first.
-        for position, job in enumerate(jobs):
-            if not isinstance(job, dict):
-                continue
-
-            if "CompleteTask" in job:
-                task_job = job["CompleteTask"]
-                task_id = task_job.get("task_id", "")
-                result = task_job.get("result", {})
-
-                if isinstance(result, dict):
-                    if "Success" in result:
-                        success_data = result["Success"]
-                        output = success_data.get("output", {})
-                        data_bytes = output.get("data", [])
-                        if isinstance(data_bytes, list):
-                            try:
-                                result_str = bytes(data_bytes).decode("utf-8")
-                                cached_results[f"task:{task_id}"] = json.loads(result_str)
-                            except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                                logger.warning(f"Failed to decode task result: {e}")
-                    elif "Failed" in result:
-                        failed = result["Failed"]
-                        cached_results[f"task:{task_id}"] = {
-                            TASK_FAILED_SENTINEL: True,
-                            "message": failed.get("message", "Task failed"),
-                            "error_type": failed.get("error_type", ""),
-                        }
-
-            elif "FireTimer" in job:
-                timer_job = job["FireTimer"]
-                timer_id = timer_job.get("timer_id", "")
-                # The marker carries the job's journal position for waits
-                # with a timeout; it stays truthy for sleep().
-                cached_results[f"timer:{timer_id}"] = {"fired_at": position}
-
-            elif "CompleteStep" in job:
-                step_job = job["CompleteStep"]
-                step_name = step_job.get("step_name", "")
-                result = step_job.get("result")
-                failure = step_job.get("failure")
-
-                if failure:
-                    cached_results[f"task:{step_name}"] = {
-                        TASK_FAILED_SENTINEL: True,
-                        "message": failure.get("message", "Task failed"),
-                        "error_type": failure.get("error_type", ""),
-                        # How many times the task ran. Without it the decode side
-                        # assumes 1, so a task that exhausted its retries would
-                        # report a single attempt.
-                        "attempts": step_job.get("execution_attempt"),
-                    }
-                elif result is not None and isinstance(result, list):
-                    try:
-                        result_str = bytes(result).decode("utf-8")
-                        cached_results[f"task:{step_name}"] = json.loads(result_str)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass
-
-            elif "HandleEvent" in job:
-                event_job = job["HandleEvent"]
-                event_name = event_job.get("event_name", "")
-                payload = event_job.get("payload", {})
-                data_bytes = payload.get("data", []) if isinstance(payload, dict) else []
-                buffer_key = f"event_buffer:{event_name}"
-                if buffer_key not in cached_results:
-                    cached_results[buffer_key] = []
-                cached_results[buffer_key].append(data_bytes)
-                positions_key = f"event_positions:{event_name}"
-                cached_results.setdefault(positions_key, []).append(position)
-
-            elif "ChildWorkflowCompleted" in job:
-                child_job = job["ChildWorkflowCompleted"]
-                child_wf_id = child_job.get("workflow_id", "")
-                result = child_job.get("result", {})
-                data_bytes = result.get("data", []) if isinstance(result, dict) else []
-                if isinstance(data_bytes, list) and data_bytes:
-                    try:
-                        result_str = bytes(data_bytes).decode("utf-8")
-                        cached_results[f"child:{child_wf_id}"] = json.loads(result_str)
-                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-                        logger.warning(f"Failed to decode child workflow result: {e}")
-                else:
-                    cached_results[f"child:{child_wf_id}"] = None
-
-            elif (
-                "ChildWorkflowCanceled" in job
-                or "ChildWorkflowTerminated" in job
-                or "ChildWorkflowTimedOut" in job
-            ):
-                # A child that ended without a result failed as far as its
-                # parent is concerned. Without these the parent would wait on
-                # the child forever.
-                ((kind, ended),) = job.items()
-                if kind == "ChildWorkflowCanceled":
-                    message = "child workflow was canceled"
-                elif kind == "ChildWorkflowTerminated":
-                    reason = ended.get("reason") if isinstance(ended, dict) else ""
-                    message = (
-                        f"child workflow was terminated: {reason}"
-                        if reason
-                        else "child workflow was terminated"
-                    )
-                else:
-                    message = "child workflow timed out"
-                cached_results[f"child:{ended.get('workflow_id', '')}"] = {
-                    CHILD_FAILED_SENTINEL: True,
-                    "message": message,
-                }
-
-            elif "ChildWorkflowFailed" in job:
-                child_job = job["ChildWorkflowFailed"]
-                child_wf_id = child_job.get("workflow_id", "")
-                failure = child_job.get("failure", {})
-                message = (
-                    failure.get("message", "Child workflow failed")
-                    if isinstance(failure, dict)
-                    else "Child workflow failed"
-                )
-                cached_results[f"child:{child_wf_id}"] = {
-                    CHILD_FAILED_SENTINEL: True,
-                    "message": message,
-                }
-
-        return cached_results
-
     def _make_json_serializable(self, obj: Any) -> Any:
         """Convert an object to a JSON-serializable format."""
         import dataclasses
@@ -2050,41 +1550,8 @@ class Worker:
         else:
             return str(obj)
 
-    async def _wait_for_in_flight_executions(self) -> None:
-        """Wait for in-flight executions to complete, up to the shutdown grace time."""
-        timeout_ms = self._config.shutdown_grace_time_ms
-        start_time = asyncio.get_event_loop().time()
-        check_interval = 0.1
-
-        in_flight = self._stats.workflows_in_progress + self._stats.tasks_in_progress
-        if in_flight > 0:
-            logger.info(f"Waiting for {in_flight} in-flight execution(s) to complete...")
-
-        while self._stats.workflows_in_progress > 0 or self._stats.tasks_in_progress > 0:
-            elapsed_ms = (asyncio.get_event_loop().time() - start_time) * 1000
-            if elapsed_ms >= timeout_ms:
-                remaining = self._stats.workflows_in_progress + self._stats.tasks_in_progress
-                logger.warning(f"Shutdown timeout with {remaining} execution(s) in progress")
-                break
-            await asyncio.sleep(check_interval)
-
-        logger.debug("All in-flight executions completed")
-
-    async def _stop_drivers(self) -> None:
-        """Stop the workflow and task drivers and wait for them; later calls do nothing.
-
-        Each driver sends every result it holds before it stops, so when this
-        returns, every workflow and task result handed to it has been reported.
-        """
-        if self._bridge_worker is None:
-            return
-        try:
-            await self._bridge_worker.stop_drivers()
-        except Exception:
-            logger.warning("Failed to stop the drivers cleanly", exc_info=True)
-
     async def _cleanup(self) -> None:
-        """Release the owned executor and stop and drop the bridge worker."""
+        """Release the owned executor and stop and drop the worker host."""
         logger.debug("Cleaning up service resources...")
 
         # A caller-provided executor is left for the caller to shut down.
@@ -2092,13 +1559,18 @@ class Worker:
             self._task_executor.shutdown(wait=False)
             self._task_executor = None
 
-        # The drivers are normally stopped already, when the polling loops
-        # wind down. This covers paths that skip that, such as a failed start.
-        # A driver dropped without stopping would leave each activation or task
-        # it holds claimed on the engine until the claim timed out.
-        await self._stop_drivers()
+        # The host is normally stopped already, when the pull loops wind
+        # down. This covers paths that skip that, such as a cancelled run: a
+        # host dropped without stopping would leave the work it holds claimed
+        # on the engine until the claim timed out.
+        if self._host is not None:
+            try:
+                await self._host.shutdown()
+            except Exception:
+                logger.warning("Failed to stop the worker host cleanly", exc_info=True)
+        self._cancel_running()
 
-        self._bridge_worker = None
+        self._host = None
 
         logger.debug("Cleanup complete")
 
@@ -2139,7 +1611,7 @@ class Worker:
 
         if hasattr(self, "_run_task"):
             try:
-                timeout = (self._config.shutdown_grace_time_ms / 1000.0) + 5.0
+                timeout = (self._config.shutdown_grace_time_ms / 1000.0) + SHUTDOWN_MARGIN_SECS
                 await asyncio.wait_for(self._run_task, timeout=timeout)
             except asyncio.CancelledError:
                 pass

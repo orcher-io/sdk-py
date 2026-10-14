@@ -22,12 +22,14 @@ __all__ = ["ActorInvocationClient"]
 class ActorInvocationClient:
     """Client for invoking actor operations.
 
-    Wraps the native bridge to send operation requests to actors
-    and receive results.
+    Sends operation requests to an actor through anything that invokes
+    actor operations, normally a connected :class:`~orcher.Client`, and
+    receives their results.
 
     Example::
 
-        client = ActorInvocationClient(bridge, "ShoppingCart", "user-123")
+        async with Client(ClientConfig(server_url="http://localhost:50051")) as orcher:
+            client = ActorInvocationClient(orcher, "ShoppingCart", "user-123")
         items = await client.invoke("get_items")
         await client.invoke("add_item", {"name": "Widget", "price": 9.99})
     """
@@ -65,8 +67,9 @@ class ActorInvocationClient:
             timeout_ms: Optional timeout in milliseconds.
 
         Returns:
-            The operation result (JSON-deserialized), or None if no native
-            bridge is attached; that case is logged as a warning.
+            The operation result (JSON-deserialized), or None if nothing that
+            invokes actor operations is attached; that case is logged as a
+            warning.
         """
         payload = json.dumps(input_data).encode("utf-8") if input_data is not None else b"null"
 
@@ -98,8 +101,8 @@ class ActorInvocationClient:
     ) -> None:
         """Invoke an operation without waiting for its result.
 
-        The bridge must provide ``send_actor_operation``. The native
-        ``BridgeWorker`` does not, so with it this call only logs a warning.
+        The operation is invoked as :meth:`invoke` does, in a task of its own
+        that nothing waits for; a failure is logged.
 
         Args:
             operation: Operation name to invoke.

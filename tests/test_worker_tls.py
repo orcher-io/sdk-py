@@ -9,10 +9,8 @@ config the connections are built from.
 
 from __future__ import annotations
 
-import asyncio
 import os
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -82,34 +80,16 @@ def test_from_env_reads_tls_paths() -> None:
     )
 
 
-def test_the_worker_hands_tls_paths_to_the_native_config() -> None:
-    # The paths only matter if they reach the native config every driver's
-    # connection is built from. Stop at the bridge, which would connect.
-    native = pytest.importorskip("orcher._native")
-    from orcher.worker import worker as worker_module
+def test_the_worker_hands_tls_paths_to_the_worker_host() -> None:
+    # The paths only matter if they reach the host every connection is built
+    # from.
+    from tests.test_worker_api_key import started_host_config
 
-    built: list[object] = []
-
-    class StopAtBridgeError(Exception):
-        pass
-
-    def bridge(config: object) -> None:
-        built.append(config)
-        raise StopAtBridgeError
-
-    stub = SimpleNamespace(WorkerConfig=native.WorkerConfig, BridgeWorker=bridge)
     worker = _builder().tls(ca_cert_path=CA, client_cert_path=CERT, client_key_path=KEY).build()
-    with (
-        mock.patch.object(worker_module, "is_native_available", return_value=True),
-        mock.patch.object(worker_module, "get_native_module", return_value=stub),
-        pytest.raises(StopAtBridgeError),
-    ):
-        asyncio.run(worker._initialize())
-
-    (native_config,) = built
-    assert native_config.tls_ca_cert_path == CA
-    assert native_config.tls_client_cert_path == CERT
-    assert native_config.tls_client_key_path == KEY
+    host_config = started_host_config(worker)
+    assert host_config["tls_ca_cert_path"] == CA
+    assert host_config["tls_client_cert_path"] == CERT
+    assert host_config["tls_client_key_path"] == KEY
 
 
 def test_the_client_reads_the_api_key_from_the_environment() -> None:

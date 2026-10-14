@@ -24,6 +24,7 @@ from orcher.worker.activation import AskedQuery, AskedUpdate
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
 from orcher.workflow.info import WorkflowInfo
+from tests.support.kernel import activation, run
 
 
 async def echo(ctx: WorkflowContext, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -55,21 +56,7 @@ async def run_on_worker(workflow_type: str, sent: Any) -> Any:
         workflow(name=workflow_type)(WORKFLOWS[workflow_type])
     worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
     worker._workflow_handlers[workflow_type] = registry.get_workflow(workflow_type)
-    response = await worker._execute_workflow(
-        {
-            "run_id": "run-1",
-            "jobs": [
-                {
-                    "StartWorkflow": {
-                        "workflow_type": workflow_type,
-                        "workflow_id": "wf-1",
-                        "task_queue": "q",
-                        "input": json.loads(sent),
-                    }
-                }
-            ],
-        }
-    )
+    response = await run(worker, activation(workflow_type, json.loads(sent)))
     assert response["successful"], response["error"]
     (done,) = [c["CompleteWorkflow"] for c in response["commands"] if "CompleteWorkflow" in c]
     return json.loads(bytes(done["result"]["data"]))

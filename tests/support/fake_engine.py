@@ -1,12 +1,13 @@
-"""A small stand-in for the engine and sdk-core, to drive a workflow through
-activations the way a worker sees them.
+"""A small stand-in for the engine and the worker host, to drive a workflow
+through activations the way a worker sees them.
 
-It keeps a journal, builds each activation's request in the shape the native
-layer hands the worker (the jobs sdk-core derives from the journal, and the
-journal times read beside them), runs the worker's own workflow execution on
-it, checks the result against sdk-core's deserializer when the native module
-is built, and applies the commands: closure results are journaled at once,
-scheduled work waits until the test resolves it.
+It keeps a journal, builds each activation as the worker host hands it over
+(the kernel protocol's ``RunActivation``: the journal resolved into the
+outcomes the run observes, each with its time), runs it through
+``Worker.run_activation``, turns the answer back into the engine's commands
+with the kernel, as the host does, and applies them: closure results are
+journaled at once, scheduled work waits until the test resolves it. It needs
+the native module.
 
 What it records is what a replay must keep stable: the ids each activation
 issued, the closure results it journaled, the sends and cancellations it made.
@@ -18,18 +19,18 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
+import pytest
+
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
+
+pytest.importorskip("orcher._native")
 
 START_MS = 1_700_000_000_000
 
 
 def _bytes(value: Any) -> list[int]:
     return list(json.dumps(value).encode())
-
-
-def _system_time(ms: int) -> dict[str, int]:
-    return {"secs_since_epoch": ms // 1000, "nanos_since_epoch": (ms % 1000) * 1_000_000}
 
 
 class NonDeterministicError(AssertionError):
@@ -126,139 +127,116 @@ class FakeEngine:
 
     # ── activations ─────────────────────────────────────────────────────
 
-    def request(self) -> dict[str, Any]:
-        """The activation request, as the native layer hands it to the worker."""
-        jobs: list[dict[str, Any]] = [
+    def activation(self) -> dict[str, Any]:
+        """The activation, as the worker host hands it to the worker: the
+        kernel protocol's ``RunActivation``, the journal resolved into the
+        outcomes the run observes, in the JSON the native module writes."""
+        resolutions: list[dict[str, Any]] = [
             {
-                "StartWorkflow": {
-                    "workflow_type": self.workflow_type,
-                    "workflow_id": self.workflow_id,
-                    "task_queue": "q",
-                    "input": self.workflow_input,
-                    "headers": [],
-                    "scheduled_time": _system_time(self.now_ms),
-                    "namespace": "default",
-                }
+                "step_id": "",
+                "at_ms": self.start_ms,
+                "replaying": False,
+                "started": {
+                    "input": [{"data": _bytes(self.workflow_input), "metadata": {}}],
+                    "attempt": 1,
+                    "started_at_ms": self.start_ms,
+                },
             }
         ]
-        resolved_at: dict[str, int] = {}
-        events: dict[str, list[int]] = {}
-        for index, (kind, a, at_ms) in enumerate(self.journal):
+
+        def resolve(step_id: str, at_ms: int, kind: str, what: dict[str, Any]) -> None:
+            resolutions.append({"step_id": step_id, "at_ms": at_ms, "replaying": False, kind: what})
+
+        def child_ended(a: dict[str, Any], end: str, message: str) -> dict[str, Any]:
+            return {
+                "child_workflow_id": a["workflow_id"],
+                "child_run_id": "child-run",
+                "outcome": {"failure": {"message": message}, "end": end},
+            }
+
+        # By recorded time, then journal position, as the kernel orders them.
+        entries = sorted(enumerate(self.journal), key=lambda e: (e[1][2], e[0]))
+        for index, (kind, a, at_ms) in entries:
             if kind == "step":
-                jobs.append(
-                    {
-                        "CompleteStep": {
-                            "step_name": a["step_name"],
-                            "step_type": a["step_type"],
-                            "result": a["result"],
-                            "failure": a["failure"],
-                            "execution_attempt": 1,
-                            "completed_at": None,
-                            "duration_ms": 0,
-                        }
+                if a["failure"]:
+                    outcome = {
+                        "failure": {
+                            "message": a["failure"]["message"],
+                            "error_type": a["failure"]["failure_type"],
+                        },
+                        "end": "failed",
+                        "attempts": 1,
                     }
-                )
-                resolved_at.setdefault(a["step_name"], at_ms)
+                else:
+                    outcome = {"value": {"data": a["result"]}, "end": "completed", "attempts": 1}
+                resolve(a["step_name"], at_ms, "step", {"outcome": outcome})
             elif kind == "timer":
-                jobs.append(
-                    {
-                        "FireTimer": {
-                            "sequence": index,
-                            "timer_id": a["timer_id"],
-                            "scheduled_time": _system_time(self.now_ms),
-                            "fired_time": _system_time(self.now_ms),
-                        }
-                    }
-                )
-                resolved_at.setdefault(f"timer:{a['timer_id']}", at_ms)
+                resolve(a["timer_id"], at_ms, "timer", {})
             elif kind == "event":
-                jobs.append(
+                resolve(
+                    "",
+                    at_ms,
+                    "event",
                     {
-                        "HandleEvent": {
-                            "sequence": index,
-                            "event_name": a["event_name"],
-                            "payload": {"data": a["payload"], "metadata": {}},
-                            "headers": [],
-                            "event_id": str(index),
-                            "sent_time": _system_time(self.now_ms),
-                        }
-                    }
+                        "event_id": str(index),
+                        "name": a["event_name"],
+                        "payload": {"data": a["payload"]},
+                    },
                 )
-                events.setdefault(a["event_name"], []).append(at_ms)
+            elif kind == "child_started":
+                started = {"child_workflow_id": a["workflow_id"]}
+                resolve(a["workflow_id"], at_ms, "child_started", started)
             elif kind == "child_completed":
-                jobs.append(
+                resolve(
+                    a["workflow_id"],
+                    at_ms,
+                    "child",
                     {
-                        "ChildWorkflowCompleted": {
-                            "workflow_id": a["workflow_id"],
-                            "execution_id": "child-run",
-                            "result": {"data": a["result"], "metadata": {}},
-                        }
-                    }
+                        "child_workflow_id": a["workflow_id"],
+                        "child_run_id": "child-run",
+                        "outcome": {"value": {"data": a["result"]}, "end": "completed"},
+                    },
                 )
-                resolved_at.setdefault(f"child:{a['workflow_id']}", at_ms)
             elif kind == "child_canceled":
-                jobs.append(
-                    {
-                        "ChildWorkflowCanceled": {
-                            "workflow_id": a["workflow_id"],
-                            "execution_id": "child-run",
-                            "details": None,
-                        }
-                    }
+                resolve(
+                    a["workflow_id"], at_ms, "child",
+                    child_ended(a, "cancelled", "Child workflow was canceled"),
                 )
-                resolved_at.setdefault(f"child:{a['workflow_id']}", at_ms)
             elif kind == "child_terminated":
-                jobs.append(
-                    {
-                        "ChildWorkflowTerminated": {
-                            "workflow_id": a["workflow_id"],
-                            "execution_id": "child-run",
-                            "reason": a["reason"],
-                            "details": None,
-                        }
-                    }
+                # The kernel does not carry the reason a child was terminated.
+                resolve(
+                    a["workflow_id"], at_ms, "child",
+                    child_ended(a, "terminated", "Child workflow was terminated"),
                 )
-                resolved_at.setdefault(f"child:{a['workflow_id']}", at_ms)
             elif kind == "child_timed_out":
-                jobs.append(
-                    {
-                        "ChildWorkflowTimedOut": {
-                            "workflow_id": a["workflow_id"],
-                            "execution_id": "child-run",
-                            "timeout_type": "Execution",
-                        }
-                    }
+                resolve(
+                    a["workflow_id"], at_ms, "child",
+                    child_ended(a, "timed_out", "Child workflow timed out"),
                 )
-                resolved_at.setdefault(f"child:{a['workflow_id']}", at_ms)
-        # The children the journal records, as the native layer reads them.
-        journaled_children: list[str] = []
-        for kind, a, _ in self.journal:
-            if kind.startswith("child_") and a["workflow_id"] not in journaled_children:
-                journaled_children.append(a["workflow_id"])
         return {
-            "run_id": self.run_id,
-            "execution": {"workflow_id": self.workflow_id, "run_id": self.run_id},
-            "timestamp": _system_time(self.now_ms),
-            "jobs": jobs,
-            "journal_length": len(self.journal) + 1,
-            "is_replaying": bool(self.journal),
-            "journal_times": {
-                "started_at_ms": self.start_ms,
-                "resolved_at": resolved_at,
-                "events": events,
+            "activation_id": list(f"{self.run_id}:{len(self.activations)}".encode()),
+            "run": {
+                "workflow_id": self.workflow_id,
+                "run_id": self.run_id,
+                "workflow_type": self.workflow_type,
+                "task_queue": "q",
+                "namespace": "default",
             },
-            "journaled_children": journaled_children,
+            "resolutions": resolutions,
+            "queries": [],
         }
 
     async def activate(self) -> Activation:
         """Run one activation and apply what it issued.
 
-        Raises ``NonDeterministicError`` where sdk-core would refuse the
-        activation: a step the journal recorded that the code did not reach,
-        while it issues new work or ends the workflow.
+        The worker's answer is turned back into the engine's commands by the
+        kernel, as the worker host does. Raises ``NonDeterministicError``
+        where sdk-core would refuse the activation: a step the journal
+        recorded that the code did not reach, while it issues new work or
+        ends the workflow.
         """
-        result = await self.worker._execute_workflow(self.request())
-        self._check_with_core(result)
+        answer = await self.worker.run_activation(self.activation())
+        result = self._with_core(answer)
         self._check_left_behind(result)
         activation = Activation(result=result, commands=list(result["commands"]))
         if not result["successful"]:
@@ -268,16 +246,19 @@ class FakeEngine:
         self.activations.append(activation)
         return activation
 
-    def _check_with_core(self, result: dict[str, Any]) -> None:
-        try:
-            from orcher import _native
-        except ImportError:
-            return
-        # Raises ValueError for anything sdk-core would refuse.
-        _native._parse_execution_result(json.dumps(result))
+    def _with_core(self, answer: dict[str, Any]) -> dict[str, Any]:
+        """The answer as the kernel turns it into what the workflow driver
+        checks and sends. Raises ValueError for anything the kernel refuses."""
+        from orcher import _native
+
+        return dict(json.loads(_native._kernel_execution_result(self.run_id, json.dumps(answer))))
 
     def _check_left_behind(self, result: dict[str, Any]) -> None:
         reached = result.get("reached_steps")
+        if not result["successful"]:
+            # The kernel protocol of sdk-core 0.14 does not carry the steps a
+            # failed run reached.
+            reached = []
         if not isinstance(reached, list):
             raise AssertionError("the activation does not report the steps it reached")
         step_kinds = ("ScheduleTask", "StartTimer", "StartChildWorkflow")

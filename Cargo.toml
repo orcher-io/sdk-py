@@ -24,6 +24,9 @@ pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 # (orcher_sdk_core::proto), so the build has one orcher-proto. To build
 # against local checkouts instead, see .cargo/config.example.toml.
 orcher-sdk-core = "0.14.1"
+# The worker host: one worker's drivers, lifecycle and registration, shared
+# with the Rust and TypeScript SDKs. This crate binds it for Python.
+orcher-sdk-host = "0.14.1"
 
 # gRPC client
 tonic = { version = "0.12", features = ["transport", "tls", "tls-native-roots"] }
