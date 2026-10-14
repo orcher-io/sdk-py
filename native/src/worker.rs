@@ -42,8 +42,8 @@
 //! - **Scalable**: more slots give more parallelism.
 
 use pyo3::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, watch, Mutex};
@@ -72,6 +72,56 @@ pub(crate) fn parse_execution_result(result_json: &str) -> PyResult<ExecutionRes
         );
         pyo3::exceptions::PyValueError::new_err(format!("Invalid result JSON: {}", e))
     })
+}
+
+/// The execution request the worker hands Python for a workflow task: the
+/// jobs sdk-core derives from its journal, with what Python reads from the
+/// journal beside them.
+pub(crate) fn execution_request_json(
+    task: &orcher_sdk_core::WorkflowExecutionTask,
+) -> Result<serde_json::Value, String> {
+    let exec_request = task_to_execution_request(task.clone()).map_err(|e| e.to_string())?;
+    // The jobs carry no times; the workflow's clock is read from the journal
+    // they came from.
+    let mut execution_request = serde_json::to_value(&exec_request).map_err(|e| e.to_string())?;
+    if let Some(request) = execution_request.as_object_mut() {
+        request.insert(
+            "journal_times".to_string(),
+            serde_json::json!(JournalTimes::read(&task.journal)),
+        );
+        // The updates already answered, which the workflow runs again on
+        // replay to rebuild the state they set.
+        request.insert(
+            "journaled_updates".to_string(),
+            serde_json::json!(JournaledUpdate::read(&task.journal)),
+        );
+        // The children the run started, so a child started without an id
+        // keeps the id the journal holds for it.
+        request.insert(
+            "journaled_children".to_string(),
+            serde_json::json!(crate::journal_children::read(&task.journal)),
+        );
+    }
+    Ok(execution_request)
+}
+
+/// `_legacy_execution_request(poll_response: bytes) -> str`
+///
+/// The execution request JSON the worker hands Python today for a recorded
+/// activation (an encoded `orcher.v1.PollWorkflowExecutionResponse`), so a
+/// recorded activation can be run through the journal path without an engine.
+#[pyfunction]
+pub(crate) fn _legacy_execution_request(poll_response: &[u8]) -> PyResult<String> {
+    use orcher_sdk_core::proto::prost::Message;
+    let response =
+        orcher_sdk_core::proto::orcher::v1::PollWorkflowExecutionResponse::decode(poll_response)
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("not a recorded activation: {e}"))
+            })?;
+    let task = orcher_sdk_core::WorkflowExecutionTask::from(response);
+    execution_request_json(&task)
+        .map(|request| request.to_string())
+        .map_err(pyo3::exceptions::PyValueError::new_err)
 }
 
 // ============================================================================
@@ -383,16 +433,18 @@ type RunningTasks = Arc<std::sync::Mutex<HashMap<Vec<u8>, RunningTask>>>;
 /// the driver has sent the outcome, and anything waiting on its cancellation
 /// is released.
 fn task_reported(running: &RunningTasks, token: &[u8]) {
-    let task = running.lock().unwrap_or_else(|p| p.into_inner()).remove(token);
+    let task = running
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(token);
     if let Some(task) = task {
         task.reported.cancel();
     }
 }
 
 fn decode_task_token(task_token: &str) -> PyResult<Vec<u8>> {
-    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, task_token).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(format!("Invalid task token: {}", e))
-    })
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, task_token)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Invalid task token: {}", e)))
 }
 
 // ============================================================================
@@ -544,7 +596,11 @@ pub struct PyBridgeWorker {
     /// heartbeats) and handler registration so the server can correlate them.
     service_id: String,
     /// Lets Python add and remove session queues at run time.
-    session_queue_tx: Arc<std::sync::Mutex<Option<mpsc::UnboundedSender<orcher_sdk_core::poller::SessionQueueChange>>>>,
+    session_queue_tx: Arc<
+        std::sync::Mutex<
+            Option<mpsc::UnboundedSender<orcher_sdk_core::poller::SessionQueueChange>>,
+        >,
+    >,
     /// The tasks handed to Python and not yet reported.
     running_tasks: RunningTasks,
 }
@@ -586,7 +642,7 @@ impl PyBridgeWorker {
 
         let tls_config = config
             .build_tls_config()
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
         let workflow_driver_config = config.to_workflow_driver_config(tls_config.clone());
         let task_driver_config = config.to_task_driver_config(tls_config.clone());
@@ -797,8 +853,8 @@ impl PyBridgeWorker {
 
                     while let Some(workflow_work) = workflow_work_rx.recv().await {
                         // Serialize the work once
-                        let exec_request = match task_to_execution_request(workflow_work.task.clone()) {
-                            Ok(req) => req,
+                        let execution_request = match execution_request_json(&workflow_work.task) {
+                            Ok(request) => request,
                             Err(e) => {
                                 // Nothing will answer this activation, so it
                                 // stays claimed until the engine's claim
@@ -812,39 +868,6 @@ impl PyBridgeWorker {
                                 continue;
                             }
                         };
-
-                        // The jobs carry no times; the workflow's clock is
-                        // read from the journal they came from.
-                        let mut execution_request = match serde_json::to_value(&exec_request) {
-                            Ok(value) => value,
-                            Err(e) => {
-                                tracing::error!(
-                                    workflow_id = %workflow_work.task.execution.workflow_id,
-                                    run_id = %workflow_work.task.execution.run_id,
-                                    "Failed to serialize workflow task; activation dropped: {}",
-                                    e
-                                );
-                                continue;
-                            }
-                        };
-                        if let Some(request) = execution_request.as_object_mut() {
-                            request.insert(
-                                "journal_times".to_string(),
-                                serde_json::json!(JournalTimes::read(&workflow_work.task.journal)),
-                            );
-                            // The updates already answered, which the workflow
-                            // runs again on replay to rebuild the state they set.
-                            request.insert(
-                                "journaled_updates".to_string(),
-                                serde_json::json!(JournaledUpdate::read(&workflow_work.task.journal)),
-                            );
-                            // The children the run started, so a child started
-                            // without an id keeps the id the journal holds for it.
-                            request.insert(
-                                "journaled_children".to_string(),
-                                serde_json::json!(crate::journal_children::read(&workflow_work.task.journal)),
-                            );
-                        }
 
                         let response = serde_json::json!({
                             "execution_request": execution_request,
@@ -1136,16 +1159,12 @@ impl PyBridgeWorker {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             use orcher_sdk_core::proto::orcher::v1::{
-                ActorHandler, OperationMode,
-                RegisterHandlersRequest,
+                ActorHandler, OperationMode, RegisterHandlersRequest,
             };
 
             let entries: Vec<serde_json::Value> =
                 serde_json::from_str(&handlers_json).map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid handlers JSON: {}",
-                        e
-                    ))
+                    pyo3::exceptions::PyValueError::new_err(format!("Invalid handlers JSON: {}", e))
                 })?;
 
             let handlers: Vec<ActorHandler> = entries
@@ -1223,10 +1242,7 @@ impl PyBridgeWorker {
         let channel_manager = self.state_channel_manager.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            use orcher_sdk_core::proto::orcher::v1::{
-                ExecutionStatus,
-                InvokeOperationRequest,
-            };
+            use orcher_sdk_core::proto::orcher::v1::{ExecutionStatus, InvokeOperationRequest};
 
             // This await can last the whole operation (seconds), and the
             // executing operation's own state RPCs need the same channel. The
@@ -1801,8 +1817,7 @@ impl PyBridgeWorker {
     ) -> PyResult<Bound<'py, PyAny>> {
         let channels = self.state_channel_manager.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            actor_state::set_state(&channels, actor_name, key, state_key, value, execution_id)
-                .await
+            actor_state::set_state(&channels, actor_name, key, state_key, value, execution_id).await
         })
     }
 
@@ -1929,10 +1944,9 @@ impl PyBridgeWorker {
     ///
     /// Called by Python's SessionManager when a worker accepts a session.
     fn add_session_queue(&self, queue_name: String) -> PyResult<()> {
-        let guard = self
-            .session_queue_tx
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let guard = self.session_queue_tx.lock().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
+        })?;
         match guard.as_ref() {
             Some(tx) => tx
                 .send(orcher_sdk_core::poller::SessionQueueChange::Add(queue_name))
@@ -1952,10 +1966,9 @@ impl PyBridgeWorker {
     ///
     /// Called by Python's SessionManager when a session completes or fails.
     fn remove_session_queue(&self, queue_name: String) -> PyResult<()> {
-        let guard = self
-            .session_queue_tx
-            .lock()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+        let guard = self.session_queue_tx.lock().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
+        })?;
         match guard.as_ref() {
             Some(tx) => tx
                 .send(orcher_sdk_core::poller::SessionQueueChange::Remove(

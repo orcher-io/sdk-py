@@ -19,6 +19,9 @@
 // field is set today: a field added to the protocol then leaves an older
 // release of this crate building, sending the field unset.
 #![allow(clippy::needless_update)]
+// sdk-core's `Error` and tonic's `Status` are large; a rich error is worth its
+// size on paths that are not hot, as sdk-core itself decides.
+#![allow(clippy::result_large_err)]
 
 use once_cell::sync::Lazy;
 use pyo3::prelude::*;
@@ -33,10 +36,11 @@ mod error;
 mod journal_children;
 mod journal_times;
 mod journal_updates;
+mod kernel;
 mod runtime;
 mod tls;
-mod worker;
 mod types;
+mod worker;
 
 // Re-exported for use within the crate.
 pub use convert::*;
@@ -110,6 +114,9 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_get_core_version, m)?)?;
     m.add_function(wrap_pyfunction!(_health_check, m)?)?;
     m.add_function(wrap_pyfunction!(_parse_execution_result, m)?)?;
+    m.add_function(wrap_pyfunction!(kernel::_kernel_resolve, m)?)?;
+    m.add_function(wrap_pyfunction!(kernel::_kernel_execution_result, m)?)?;
+    m.add_function(wrap_pyfunction!(worker::_legacy_execution_request, m)?)?;
 
     // Types
     m.add_class::<types::PyWorkflowExecution>()?;
@@ -157,7 +164,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "WorkflowTerminatedError",
         m.py().get_type::<error::WorkflowTerminatedError>(),
     )?;
-    m.add("TaskFailedError", m.py().get_type::<error::TaskFailedError>())?;
+    m.add(
+        "TaskFailedError",
+        m.py().get_type::<error::TaskFailedError>(),
+    )?;
     m.add(
         "TaskCancelledError",
         m.py().get_type::<error::TaskCancelledError>(),

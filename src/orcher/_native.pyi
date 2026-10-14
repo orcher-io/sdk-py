@@ -25,6 +25,21 @@ def _parse_execution_result(result_json: str) -> str:
     """Read an activation's result as sdk-core does; raise ValueError if it would reject it."""
     ...
 
+def _kernel_resolve(poll_response: bytes, namespace: str) -> str:
+    """A recorded activation resolved by the kernel, as ``RunActivation`` JSON."""
+    ...
+
+def _kernel_execution_result(run_id: str, result_json: str) -> str:
+    """A ``RunActivationResult`` (JSON) as the kernel turns it into what is sent.
+
+    Raises ValueError when the kernel refuses it.
+    """
+    ...
+
+def _legacy_execution_request(poll_response: bytes) -> str:
+    """A recorded activation as the journal path's execution request JSON."""
+    ...
+
 # =============================================================================
 # Core Types
 # =============================================================================

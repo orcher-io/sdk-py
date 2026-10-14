@@ -83,6 +83,9 @@ mod tests {
             ),
         ];
 
-        assert_eq!(read(&journal), vec!["child_0".to_string(), "wf-child-2".to_string()]);
+        assert_eq!(
+            read(&journal),
+            vec!["child_0".to_string(), "wf-child-2".to_string()]
+        );
     }
 }

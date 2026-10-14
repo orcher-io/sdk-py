@@ -60,6 +60,15 @@ from orcher.interceptors.base import (
     WorkflowInterceptor,
 )
 from orcher.interceptors.chain import TaskInterceptorChain, WorkflowInterceptorChain
+from orcher.worker.activation import (
+    AskedQuery,
+    AskedUpdate,
+    ProtocolRefusalError,
+    answer_activation,
+    load_activation,
+    protocol_error,
+    workflow_failure,
+)
 from orcher.worker.config import WorkerConfig
 from orcher.workflow.sentinels import CHILD_FAILED_SENTINEL, TASK_FAILED_SENTINEL
 
@@ -142,6 +151,34 @@ def _max_attempts(retry_policy: Any) -> int:
     if isinstance(retry_policy, dict):
         return int(retry_policy.get("max_attempts", 0) or 0)
     return int(getattr(retry_policy, "max_attempts", 0) or 0)
+
+
+def _first_argument(arguments: list[Any]) -> bytes | None:
+    """The JSON bytes of a job's first argument payload; None when it has none."""
+    if arguments and isinstance(arguments[0], dict) and "data" in arguments[0]:
+        return bytes(arguments[0]["data"])
+    return None
+
+
+def _payload_bytes(payload: Any) -> bytes:
+    """The bytes of a job's payload; empty when it has none."""
+    raw = payload.get("data", []) if isinstance(payload, dict) else []
+    return bytes(raw)
+
+
+@dataclass
+class _WorkflowRun:
+    """What running a workflow's code once produced."""
+
+    # The commands it issued, as the workflow context hands them over.
+    commands: list[dict[str, Any]]
+    # Every step it reached, as its kind and id, in order.
+    reached: list[tuple[str, str]]
+    query_responses: list[dict[str, Any]]
+    update_results: list[dict[str, Any]]
+    # What the code raised, when it failed, and its traceback.
+    failure: BaseException | None = None
+    failure_details: str | None = None
 
 
 class WorkerState(Enum):
@@ -999,7 +1036,8 @@ class Worker:
 
     async def _execute_workflow(self, request: dict[str, Any]) -> dict[str, Any]:
         """
-        Execute a workflow.
+        Execute a workflow activation from the jobs sdk-core derived from its
+        journal.
 
         Workflows always run in the event loop.
 
@@ -1033,8 +1071,7 @@ class Worker:
 
         logger.debug(f"Executing workflow: type={workflow_type}, run_id={run_id}")
 
-        metadata = self._workflow_handlers.get(workflow_type)
-        if metadata is None:
+        if workflow_type not in self._workflow_handlers:
             return {
                 "run_id": run_id,
                 "successful": False,
@@ -1074,6 +1111,133 @@ class Worker:
         # a job sits says nothing about when it happened.
         if any(isinstance(job, dict) and "CancelWorkflow" in job for job in jobs):
             ctx._note_cancel_requested(journal_times.get("cancel_requested_at"))
+        # The children the run started, so a child started without an id keeps
+        # the id the journal holds for it, whichever SDK chose it.
+        ctx._record_journaled_children(request.get("journaled_children") or [])
+        # Results of already-completed commands, returned as-is on replay.
+        cached_results = self._extract_cached_results_from_jobs(jobs)
+        if cached_results:
+            ctx._set_cached_results(cached_results)
+
+        queries = [
+            AskedQuery(
+                query_id=job["ProcessQuery"].get("query_id", ""),
+                query_type=job["ProcessQuery"].get("query_type", ""),
+                args=_first_argument(job["ProcessQuery"].get("arguments", [])),
+            )
+            for job in jobs
+            if isinstance(job, dict) and "ProcessQuery" in job
+        ]
+        updates = [
+            AskedUpdate(
+                update_id=job["UpdateState"].get("update_id", ""),
+                update_type=job["UpdateState"].get("update_name", ""),
+                args=_payload_bytes(job["UpdateState"].get("payload", {})),
+            )
+            for job in jobs
+            if isinstance(job, dict) and "UpdateState" in job
+        ]
+
+        run = await self._run_workflow(
+            ctx,
+            workflow_type,
+            workflow_input,
+            queries,
+            updates,
+            request.get("journaled_updates") or [],
+        )
+
+        answered: dict[str, Any] = {
+            "run_id": run_id,
+            "successful": True,
+            "commands": [],
+            "query_responses": run.query_responses,
+            "update_results": run.update_results,
+            "error": None,
+            "restart_fresh": None,
+            # The steps the code reached, which sdk-core checks against the
+            # journal to tell code that no longer replays the run.
+            "reached_steps": [step_id for _, step_id in run.reached],
+        }
+        if run.failure is not None:
+            answered["successful"] = False
+            answered["error"] = {
+                "message": str(run.failure),
+                "error_type": _workflow_error_type(run.failure),
+                "details": run.failure_details,
+                "retryable": False,
+            }
+        else:
+            answered["commands"] = run.commands
+        return answered
+
+    async def run_activation(self, activation: dict[str, Any]) -> dict[str, Any]:
+        """Run a workflow activation as the kernel protocol carries it.
+
+        ``activation`` is a ``RunActivation`` in the JSON shape the native
+        module hands over: the run's history already resolved into the
+        outcomes its code observes. The workflow's code runs once against them
+        and the answer is a ``RunActivationResult`` in the same JSON shape:
+        every durable call the code made, in issue order, those answered from
+        history marked satisfied, with the activation's queries and updates
+        answered. A workflow that raised answers its failure; an activation
+        this SDK cannot process answers a protocol error, which hands it back
+        to the engine.
+        """
+        activation_id = list(activation.get("activation_id") or [])
+        try:
+            loaded = load_activation(activation, self._config.namespace)
+        except ProtocolRefusalError as refusal:
+            logger.error(f"Cannot run the workflow activation: {refusal}")
+            return protocol_error(activation_id, str(refusal), refusal.kind)
+
+        if loaded.workflow_type not in self._workflow_handlers:
+            return answer_activation(
+                activation_id,
+                failure=workflow_failure(f"Unknown workflow type: {loaded.workflow_type}"),
+            )
+
+        run = await self._run_workflow(
+            loaded.context,
+            loaded.workflow_type,
+            loaded.input,
+            loaded.queries,
+            loaded.updates,
+            loaded.journaled_updates,
+        )
+        if run.failure is not None:
+            return answer_activation(
+                activation_id,
+                failure=workflow_failure(
+                    str(run.failure),
+                    non_determinism=_workflow_error_type(run.failure) == "NonDeterminism",
+                ),
+                query_responses=run.query_responses,
+                update_results=run.update_results,
+            )
+        return answer_activation(
+            activation_id,
+            commands=run.commands,
+            reached=run.reached,
+            query_responses=run.query_responses,
+            update_results=run.update_results,
+        )
+
+    async def _run_workflow(
+        self,
+        ctx: Any,
+        workflow_type: str,
+        workflow_input: Any,
+        queries: list[AskedQuery],
+        updates: list[AskedUpdate],
+        journaled_updates: list[dict[str, Any]],
+    ) -> _WorkflowRun:
+        """Run a registered workflow's code once in ``ctx``, already loaded with
+        what the run's history holds, and answer the activation's queries and
+        updates."""
+        metadata = self._workflow_handlers[workflow_type]
+        workflow_id = ctx.info.workflow_id
+        run_id = ctx.info.run_id
 
         # The updates already answered run again as the code reaches the point
         # where each came, so the state they set is there on every replay.
@@ -1085,10 +1249,7 @@ class Worker:
                 # Its result was answered and journaled when it first ran.
                 logger.debug(f"Replayed update '{name}' raised again: {e}")
 
-        ctx._record_journaled_updates(request.get("journaled_updates") or [], replay_update)
-        # The children the run started, so a child started without an id keeps
-        # the id the journal holds for it, whichever SDK chose it.
-        ctx._record_journaled_children(request.get("journaled_children") or [])
+        ctx._record_journaled_updates(journaled_updates, replay_update)
 
         ictx = InterceptorContext(
             workflow_id=workflow_id,
@@ -1102,10 +1263,6 @@ class Worker:
         start_time = datetime.now()
 
         try:
-            # Results of already-completed commands, returned as-is on replay.
-            cached_results = self._extract_cached_results_from_jobs(jobs)
-            if cached_results:
-                ctx._set_cached_results(cached_results)
 
             async def run_workflow(data: Any) -> Any:
                 # The input becomes call arguments as unpack_arguments
@@ -1138,8 +1295,8 @@ class Worker:
             await self._workflow_interceptor_chain.notify_exit(ictx, exec_info)
 
             await ctx._replay_updates(every=True)
-            query_responses = self._process_query_jobs(jobs, ctx)
-            update_results = await self._process_update_jobs(jobs, ctx)
+            query_responses = self._answer_queries(queries, ctx)
+            update_results = await self._answer_updates(updates, ctx)
 
             # What the workflow issued in this last activation goes out ahead
             # of its completion: an event it sent, a child it started without
@@ -1147,10 +1304,8 @@ class Worker:
             await ctx._closures_settled()
             # Only None is null: 0, False, "" and empty containers are results.
             result_bytes = json.dumps(result).encode("utf-8") if result is not None else b"null"
-            return {
-                "run_id": run_id,
-                "successful": True,
-                "commands": [
+            return _WorkflowRun(
+                commands=[
                     *ctx._take_commands(),
                     {
                         "CompleteWorkflow": {
@@ -1161,14 +1316,10 @@ class Worker:
                         }
                     },
                 ],
-                "query_responses": query_responses,
-                "update_results": update_results,
-                "error": None,
-                "restart_fresh": None,
-                # The steps the code reached, which sdk-core checks against
-                # the journal to tell code that no longer replays the run.
-                "reached_steps": ctx._take_reached_steps(),
-            }
+                reached=ctx._take_reached(),
+                query_responses=query_responses,
+                update_results=update_results,
+            )
 
         except WorkflowSuspendedError as e:
             # Suspension is not a failure: the workflow is waiting on commands,
@@ -1179,23 +1330,16 @@ class Worker:
             # not run again on the next one.
             await ctx._closures_settled()
             commands = ctx._take_commands()
-            reached_steps = ctx._take_reached_steps()
+            reached = ctx._take_reached()
 
             # Queries and updates are answered even while suspended.
             await ctx._replay_updates(every=True)
-            query_responses = self._process_query_jobs(jobs, ctx)
-            update_results = await self._process_update_jobs(jobs, ctx)
-
-            return {
-                "run_id": run_id,
-                "successful": True,
-                "commands": commands,
-                "query_responses": query_responses,
-                "update_results": update_results,
-                "error": None,
-                "restart_fresh": None,
-                "reached_steps": reached_steps,
-            }
+            return _WorkflowRun(
+                commands=commands,
+                reached=reached,
+                query_responses=self._answer_queries(queries, ctx),
+                update_results=await self._answer_updates(updates, ctx),
+            )
 
         except Exception as e:
             told_and_not_caught = (
@@ -1210,24 +1354,23 @@ class Worker:
                 exec_info.duration_ms = (datetime.now() - start_time).total_seconds() * 1000
                 await self._workflow_interceptor_chain.notify_exit(ictx, exec_info)
                 await ctx._replay_updates(every=True)
-                return {
-                    "run_id": run_id,
-                    "successful": True,
-                    "commands": [
+                query_responses = self._answer_queries(queries, ctx)
+                update_results = await self._answer_updates(updates, ctx)
+                return _WorkflowRun(
+                    commands=[
                         *ctx._take_commands(),
                         {"CancelWorkflowExecution": {"details": None}},
                     ],
-                    "query_responses": self._process_query_jobs(jobs, ctx),
-                    "update_results": await self._process_update_jobs(jobs, ctx),
-                    "error": None,
-                    "restart_fresh": None,
-                    "reached_steps": ctx._take_reached_steps(),
-                }
+                    reached=ctx._take_reached(),
+                    query_responses=query_responses,
+                    update_results=update_results,
+                )
             logger.exception(f"Workflow execution failed: {e}")
+            details = traceback.format_exc()
             # The activation fails and its commands are dropped; closures it
             # left running still finish, rather than being abandoned mid-way.
             await ctx._closures_settled()
-            reached_steps = ctx._take_reached_steps()
+            reached = ctx._take_reached()
 
             duration_ms = (datetime.now() - start_time).total_seconds() * 1000
             exec_info.error = e
@@ -1238,29 +1381,17 @@ class Worker:
 
             # Queries and updates are answered even when the workflow fails.
             await ctx._replay_updates(every=True)
-            query_responses = self._process_query_jobs(jobs, ctx)
-            update_results = await self._process_update_jobs(jobs, ctx)
+            return _WorkflowRun(
+                commands=[],
+                reached=reached,
+                query_responses=self._answer_queries(queries, ctx),
+                update_results=await self._answer_updates(updates, ctx),
+                failure=e,
+                failure_details=details,
+            )
 
-            return {
-                "run_id": run_id,
-                "successful": False,
-                "commands": [],
-                "query_responses": query_responses,
-                "update_results": update_results,
-                "error": {
-                    "message": str(e),
-                    "error_type": _workflow_error_type(e),
-                    "details": traceback.format_exc(),
-                    "retryable": False,
-                },
-                "restart_fresh": None,
-                "reached_steps": reached_steps,
-            }
-
-    def _process_query_jobs(
-        self, jobs: list[dict[str, Any]], ctx: Any
-    ) -> list[dict[str, Any]]:
-        """Process ProcessQuery jobs and return query responses.
+    def _answer_queries(self, queries: list[AskedQuery], ctx: Any) -> list[dict[str, Any]]:
+        """Answer the activation's queries.
 
         Queries are synchronous, read-only handlers that inspect workflow state.
         A handler is looked up first in the GlobalRegistry (populated by the
@@ -1269,13 +1400,9 @@ class Worker:
         """
         query_responses: list[dict[str, Any]] = []
 
-        for job in jobs:
-            if not isinstance(job, dict) or "ProcessQuery" not in job:
-                continue
-
-            query_job = job["ProcessQuery"]
-            query_id = query_job.get("query_id", "")
-            query_type = query_job.get("query_type", "")
+        for query in queries:
+            query_id = query.query_id
+            query_type = query.query_type
 
             # The worker's registry takes precedence over the context.
             query_metadata = self._query_handlers.get(query_type)
@@ -1300,13 +1427,7 @@ class Worker:
 
             try:
                 # Only the first argument payload is used.
-                arguments = query_job.get("arguments", [])
-                args_data = None
-                if arguments:
-                    first_arg = arguments[0]
-                    if isinstance(first_arg, dict) and "data" in first_arg:
-                        raw_bytes = bytes(first_arg["data"])
-                        args_data = json.loads(raw_bytes)
+                args_data = json.loads(query.args) if query.args is not None else None
 
                 q_args, q_kwargs = unpack_arguments(args_data)
                 result = handler(ctx, *q_args, **q_kwargs)
@@ -1337,10 +1458,8 @@ class Worker:
 
         return query_responses
 
-    async def _process_update_jobs(
-        self, jobs: list[dict[str, Any]], ctx: Any
-    ) -> list[dict[str, Any]]:
-        """Process UpdateState jobs and return update results.
+    async def _answer_updates(self, updates: list[AskedUpdate], ctx: Any) -> list[dict[str, Any]]:
+        """Apply and answer the updates waiting for this activation.
 
         Updates are handlers, sync or async, that can mutate workflow state and
         return results. A handler is looked up first in the GlobalRegistry
@@ -1350,13 +1469,9 @@ class Worker:
         """
         update_results: list[dict[str, Any]] = []
 
-        for job in jobs:
-            if not isinstance(job, dict) or "UpdateState" not in job:
-                continue
-
-            update_job = job["UpdateState"]
-            update_id = update_job.get("update_id", "")
-            update_name = update_job.get("update_name", "")
+        for update in updates:
+            update_id = update.update_id
+            update_name = update.update_type
 
             if self._update_handler(ctx, update_name) is None:
                 update_results.append({
@@ -1370,9 +1485,7 @@ class Worker:
                 continue
 
             try:
-                payload = update_job.get("payload", {})
-                raw = payload.get("data", []) if isinstance(payload, dict) else []
-                result = await self._run_update_handler(ctx, update_name, raw)
+                result = await self._run_update_handler(ctx, update_name, update.args)
 
                 result_bytes = json.dumps(result).encode("utf-8") if result is not None else b"null"
                 update_results.append({

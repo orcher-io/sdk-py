@@ -292,9 +292,7 @@ mod tests {
         // One operation's read is waiting on the server...
         let reading = tokio::spawn({
             let channels = channels.clone();
-            async move {
-                get_state(&channels, "a".into(), "k".into(), "s".into(), "e".into()).await
-            }
+            async move { get_state(&channels, "a".into(), "k".into(), "s".into(), "e".into()).await }
         });
         tokio::time::timeout(Duration::from_secs(10), arrived.recv())
             .await
@@ -311,7 +309,14 @@ mod tests {
         assert_eq!(listed.unwrap(), vec!["k".to_string()]);
         tokio::time::timeout(
             Duration::from_secs(5),
-            set_state(&channels, "a".into(), "k".into(), "s".into(), vec![1], "e".into()),
+            set_state(
+                &channels,
+                "a".into(),
+                "k".into(),
+                "s".into(),
+                vec![1],
+                "e".into(),
+            ),
         )
         .await
         .expect("SetState waited for an unrelated GetState to finish")
@@ -373,9 +378,16 @@ mod tests {
         list_state_keys(&channels, "a".into(), "k".into(), "e".into(), String::new())
             .await
             .unwrap();
-        set_state(&channels, "a".into(), "k".into(), "s".into(), vec![1], "e".into())
-            .await
-            .unwrap();
+        set_state(
+            &channels,
+            "a".into(),
+            "k".into(),
+            "s".into(),
+            vec![1],
+            "e".into(),
+        )
+        .await
+        .unwrap();
         delete_state(&channels, "a".into(), "k".into(), "s".into(), "e".into())
             .await
             .unwrap();

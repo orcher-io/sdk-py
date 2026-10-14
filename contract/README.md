@@ -21,6 +21,8 @@ the Rust, Python and TypeScript SDKs, so the same scenarios drive every worker.
   engine, checks the results, and exits non-zero on any failure.
 - `long_wait.py` — a standalone check that runs on its own because it takes
   over a minute (see below).
+- `replay_check.py` — an engine-free replay of recorded activations against
+  committed expected results (`replay/`), described below.
 
 ## Running
 
@@ -81,6 +83,34 @@ python contract/long_wait.py --sleep-secs 75
 # claim the long wait works.
 python contract/long_wait.py --sleep-secs 5
 ```
+
+## Replay check
+
+`replay/<corpus>/` holds workflow activations recorded from this catalog
+(`<workflow>/<run>/<n>-activation.pb`, each an encoded
+`orcher.v1.PollWorkflowExecutionResponse`) and, in `expected.json`, what the
+SDK answered each with, as sdk-core reads it before sending it to the engine.
+`replay_check.py` replays every activation and fails on any difference. It
+needs no engine:
+
+```bash
+PYTHONPATH=src:contract python contract/replay_check.py
+```
+
+Each activation is answered through the kernel protocol (resolved by the
+kernel, answered by `Worker.run_activation`, turned back by the kernel) and
+through the worker's journal path, and both must give the expected result.
+For a failed run, the traceback and the steps reached are left out of the
+comparison: the kernel protocol of sdk-core 0.14 carries neither.
+
+A change meant to alter what the SDK sends updates the expected results with
+`--bless`, which writes them from the journal path and requires the kernel
+path to agree. Review the diff of `expected.json` like code.
+
+To record a corpus, run the suite with `ORCHER_RECORD_ACTIVATIONS` set to an
+empty directory; the worker writes every activation it receives and every
+answer it gives there. Commit only the `*-activation.pb` files: the answers
+carry the worker's identity, which names the machine.
 
 ## Differences between SDKs
 

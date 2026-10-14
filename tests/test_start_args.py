@@ -20,6 +20,7 @@ from orcher import Client, ClientConfig, WorkflowContext, workflow
 from orcher.client.workflow_handle import WorkflowHandle
 from orcher.decorators import GlobalRegistry
 from orcher.errors import WorkflowSuspendedError
+from orcher.worker.activation import AskedQuery, AskedUpdate
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
 from orcher.workflow.info import WorkflowInfo
@@ -167,10 +168,6 @@ async def test_query_and_update_args_are_passed_one_to_one() -> None:
     ctx.register_query_handler("q", handler)
     ctx.register_update_handler("u", handler)
     query_args, update_args = (list(json.dumps(data).encode()) for data in sent)
-    query = {"query_id": "1", "query_type": "q", "arguments": [{"data": query_args}]}
-    worker._process_query_jobs([{"ProcessQuery": query}], ctx)
-    await worker._process_update_jobs(
-        [{"UpdateState": {"update_id": "2", "update_name": "u", "payload": {"data": update_args}}}],
-        ctx,
-    )
+    worker._answer_queries([AskedQuery("1", "q", bytes(query_args))], ctx)
+    await worker._answer_updates([AskedUpdate("2", "u", bytes(update_args))], ctx)
     assert seen == [[1, [2]], [1, [2]]]
