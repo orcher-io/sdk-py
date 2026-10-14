@@ -192,24 +192,27 @@ class TestWorkerBuilder:
 
     def test_all_options(self) -> None:
         """Test building with all configuration options."""
-        service = (
-            WorkerBuilder.create()
-            .server_url("http://localhost:50051")
-            .namespace("production")
-            .task_queue("order-queue")
-            .max_concurrent_workflows(50)
-            .max_concurrent_tasks(200)
-            .identity("my-worker")
-            .workflow_poll_interval(200)
-            .task_poll_interval(150)
-            .workflow_poller_count(8)
-            .task_poller_count(16)
-            .shutdown_grace_time(60000)
-            .force_shutdown_timeout(120000)
-            .version_id("v1.0.0")
-            .binary_checksum("abc123")
-            .build()
-        )
+        # The poll intervals and the force shutdown timeout are deprecated and
+        # ignored, and say so; they are still carried.
+        with pytest.warns(DeprecationWarning, match="no effect"):
+            service = (
+                WorkerBuilder.create()
+                .server_url("http://localhost:50051")
+                .namespace("production")
+                .task_queue("order-queue")
+                .max_concurrent_workflows(50)
+                .max_concurrent_tasks(200)
+                .identity("my-worker")
+                .workflow_poll_interval(200)
+                .task_poll_interval(150)
+                .workflow_poller_count(8)
+                .task_poller_count(16)
+                .shutdown_grace_time(60000)
+                .force_shutdown_timeout(120000)
+                .version_id("v1.0.0")
+                .binary_checksum("abc123")
+                .build()
+            )
 
         config = service.config
         assert config.server_url == "http://localhost:50051"

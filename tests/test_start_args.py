@@ -20,9 +20,11 @@ from orcher import Client, ClientConfig, WorkflowContext, workflow
 from orcher.client.workflow_handle import WorkflowHandle
 from orcher.decorators import GlobalRegistry
 from orcher.errors import WorkflowSuspendedError
+from orcher.worker.activation import AskedQuery, AskedUpdate
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
 from orcher.workflow.info import WorkflowInfo
+from tests.support.kernel import activation, run
 
 
 async def echo(ctx: WorkflowContext, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -54,21 +56,7 @@ async def run_on_worker(workflow_type: str, sent: Any) -> Any:
         workflow(name=workflow_type)(WORKFLOWS[workflow_type])
     worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
     worker._workflow_handlers[workflow_type] = registry.get_workflow(workflow_type)
-    response = await worker._execute_workflow(
-        {
-            "run_id": "run-1",
-            "jobs": [
-                {
-                    "StartWorkflow": {
-                        "workflow_type": workflow_type,
-                        "workflow_id": "wf-1",
-                        "task_queue": "q",
-                        "input": json.loads(sent),
-                    }
-                }
-            ],
-        }
-    )
+    response = await run(worker, activation(workflow_type, json.loads(sent)))
     assert response["successful"], response["error"]
     (done,) = [c["CompleteWorkflow"] for c in response["commands"] if "CompleteWorkflow" in c]
     return json.loads(bytes(done["result"]["data"]))
@@ -167,10 +155,6 @@ async def test_query_and_update_args_are_passed_one_to_one() -> None:
     ctx.register_query_handler("q", handler)
     ctx.register_update_handler("u", handler)
     query_args, update_args = (list(json.dumps(data).encode()) for data in sent)
-    query = {"query_id": "1", "query_type": "q", "arguments": [{"data": query_args}]}
-    worker._process_query_jobs([{"ProcessQuery": query}], ctx)
-    await worker._process_update_jobs(
-        [{"UpdateState": {"update_id": "2", "update_name": "u", "payload": {"data": update_args}}}],
-        ctx,
-    )
+    worker._answer_queries([AskedQuery("1", "q", bytes(query_args))], ctx)
+    await worker._answer_updates([AskedUpdate("2", "u", bytes(update_args))], ctx)
     assert seen == [[1, [2]], [1, [2]]]

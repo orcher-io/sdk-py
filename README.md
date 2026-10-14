@@ -30,7 +30,7 @@ Write async functions; ORCHER journals each step and resumes interrupted runs wh
 - <img height="14" src="https://octicons-col.vercel.app/database/38BDF0"> **Actors**: stateful objects with a single writer per key
 - <img height="14" src="https://octicons-col.vercel.app/beaker/38BDF0"> **Testing**: run workflows in memory with mocks and a fake clock
 - <img height="14" src="https://octicons-col.vercel.app/shield-lock/38BDF0"> **Multi-tenant**: API keys, organizations and namespaces built in
-- <img height="14" src="https://octicons-col.vercel.app/cpu/38BDF0"> **Native core**: the engine protocol and state machine run in Rust
+- <img height="14" src="https://octicons-col.vercel.app/cpu/38BDF0"> **Native core**: the engine protocol, replay and the worker run in Rust, shared with the Rust and TypeScript SDKs
 
 <br />
 
@@ -312,6 +312,27 @@ async def test_confirms_the_order() -> None:
 
 Mocks can also raise, return a sequence or compute their result, and the
 environment controls the clock.
+
+</details>
+
+<details>
+<summary><b>Workers</b>: concurrency and stopping</summary>
+
+<br />
+
+A worker runs at most `max_concurrent_workflows` workflow activations,
+`max_concurrent_tasks` tasks and `max_concurrent_actor_operations` actor
+operations at once (set on the builder), and takes no more work from the
+engine while it is full. It
+registers with the engine when it starts, and the engine sees which SDK and
+release it runs.
+
+`await worker.shutdown()` stops it taking work at once, and gives the work it
+is running the shutdown grace (`shutdown_grace_time`, 30 seconds unless set)
+to finish. Workflow activations still unfinished after that are handed back
+to the engine for another worker; tasks still running are asked to cancel
+(`ctx.cancellation_token`) and are retried once they time out.
+`shutdown(force=True)` cancels the running work without waiting for it.
 
 </details>
 

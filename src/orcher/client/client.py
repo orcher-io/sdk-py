@@ -124,6 +124,43 @@ class Client:
                 str(e),
             ) from e
 
+    async def invoke_actor_operation(
+        self,
+        *,
+        actor_name: str,
+        key: str,
+        operation: str,
+        payload: bytes,
+        timeout_ms: int | None = None,
+    ) -> bytes:
+        """Invoke an actor operation and wait for its result.
+
+        The server queues the operation under its concurrency rules, a worker
+        that registered the actor runs it, and its result comes back. Most
+        code calls this through
+        :class:`~orcher.actor.client.ActorInvocationClient`, which encodes the
+        input and decodes the result as JSON.
+
+        Args:
+            actor_name: The actor type.
+            key: Which instance of the actor.
+            operation: The operation to run.
+            payload: The operation's input, as its JSON encoding.
+            timeout_ms: How long to wait for the result; 30 seconds when None.
+
+        Returns:
+            The operation's result, as its JSON encoding.
+
+        Raises:
+            ClientError: If the client is not connected.
+            RuntimeError: If the operation does not succeed.
+        """
+        self._ensure_connected()
+        result: bytes = await self._native_client.invoke_actor_operation(
+            actor_name, key, operation, payload, timeout_ms
+        )
+        return bytes(result)
+
     async def close(self) -> None:
         """Close the client connection.
 

@@ -9,33 +9,38 @@
 //!     ↓
 //! PyO3 (this module)
 //!     ↓
-//! Orcher SDK core (Rust)
+//! Orcher worker host and SDK core (Rust)
 //! ```
 //!
 //! The Python package calls into this module, which delegates to the Rust
-//! SDK core for networking, polling, and serialization.
+//! SDK core for networking and serialization. The worker is a binding over
+//! the worker host shared with the Rust and TypeScript SDKs (`host`):
+//! Python pulls workflow activations, as the kernel protocol's messages
+//! (`kernel`), tasks and actor operations from it, and hands back what they
+//! produced.
 
 // Protocol messages are built with `..Default::default()` even when every
 // field is set today: a field added to the protocol then leaves an older
 // release of this crate building, sending the field unset.
 #![allow(clippy::needless_update)]
+// sdk-core's `Error` and tonic's `Status` are large; a rich error is worth its
+// size on paths that are not hot, as sdk-core itself decides.
+#![allow(clippy::result_large_err)]
 
 use once_cell::sync::Lazy;
 use pyo3::prelude::*;
 use std::sync::Mutex;
 use tracing_subscriber::{fmt, EnvFilter};
 
-mod actor_state;
+mod actor_invoke;
 mod client;
 mod codec;
 mod convert;
 mod error;
-mod journal_children;
-mod journal_times;
-mod journal_updates;
+mod host;
+mod kernel;
 mod runtime;
 mod tls;
-mod worker;
 mod types;
 
 // Re-exported for use within the crate.
@@ -57,10 +62,13 @@ fn initialize() {
     }
 
     // RUST_LOG overrides the default filter. The default includes
-    // orcher_sdk_py (this crate's name with underscores) so its logs show.
+    // orcher_sdk_py (this crate's name with underscores) and the worker host
+    // so their logs show.
     let _ = fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("orcher=info,orcher_sdk_core=info,orcher_sdk_py=info")
+            EnvFilter::new(
+                "orcher=info,orcher_sdk_core=info,orcher_sdk_host=info,orcher_sdk_py=info",
+            )
         }))
         .try_init();
 
@@ -86,17 +94,6 @@ fn _health_check() -> bool {
     true
 }
 
-/// Reads an activation's result the way the worker hands it to sdk-core, and
-/// returns it as sdk-core serializes it back. Raises `ValueError` for a result
-/// sdk-core would reject. For tests: it checks the commands the Python side
-/// builds against the types sdk-core deserializes.
-#[pyfunction]
-fn _parse_execution_result(result_json: &str) -> PyResult<String> {
-    let result = worker::parse_execution_result(result_json)?;
-    serde_json::to_string(&result)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
-}
-
 /// Python module definition.
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -109,7 +106,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_get_native_version, m)?)?;
     m.add_function(wrap_pyfunction!(_get_core_version, m)?)?;
     m.add_function(wrap_pyfunction!(_health_check, m)?)?;
-    m.add_function(wrap_pyfunction!(_parse_execution_result, m)?)?;
+    m.add_function(wrap_pyfunction!(kernel::_kernel_resolve, m)?)?;
+    m.add_function(wrap_pyfunction!(kernel::_kernel_execution_result, m)?)?;
 
     // Types
     m.add_class::<types::PyWorkflowExecution>()?;
@@ -124,8 +122,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::PyWorkflowHandle>()?;
 
     // Worker
-    m.add_class::<worker::PyWorkerConfig>()?;
-    m.add_class::<worker::PyBridgeWorker>()?;
+    m.add_class::<host::PyWorkerHost>()?;
 
     // Codecs
     m.add_class::<codec::PyGzipCodec>()?;
@@ -157,7 +154,10 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "WorkflowTerminatedError",
         m.py().get_type::<error::WorkflowTerminatedError>(),
     )?;
-    m.add("TaskFailedError", m.py().get_type::<error::TaskFailedError>())?;
+    m.add(
+        "TaskFailedError",
+        m.py().get_type::<error::TaskFailedError>(),
+    )?;
     m.add(
         "TaskCancelledError",
         m.py().get_type::<error::TaskCancelledError>(),
@@ -165,10 +165,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add(
         "DeterminismError",
         m.py().get_type::<error::DeterminismError>(),
-    )?;
-    m.add(
-        "WorkerShutdownEvent",
-        m.py().get_type::<worker::WorkerShutdownEvent>(),
     )?;
 
     tracing::info!("ORCHER Python SDK native module loaded successfully");

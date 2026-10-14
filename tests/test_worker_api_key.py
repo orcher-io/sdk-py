@@ -10,6 +10,7 @@ connections are built from, and that printing a config does not print it.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from types import SimpleNamespace
 from unittest import mock
@@ -76,45 +77,52 @@ def test_the_built_worker_carries_the_key() -> None:
     assert worker.config.api_key == KEY
 
 
-def test_the_worker_hands_the_key_to_the_native_config() -> None:
-    # The Python value only matters if it reaches the native config every
-    # connection is built from. Stop at the bridge, which would connect.
-    native = pytest.importorskip("orcher._native")
+def started_host_config(worker: object) -> dict[str, object]:
+    """The configuration ``worker`` starts its worker host with. Stops at the
+    host, which would connect."""
     from orcher.worker import worker as worker_module
 
-    built: list[object] = []
+    started: list[str] = []
 
-    class StopAtBridgeError(Exception):
+    class StopAtHostError(Exception):
         pass
 
-    def bridge(config: object) -> None:
-        built.append(config)
-        raise StopAtBridgeError
+    async def start(config_json: str, registrations_json: str) -> None:
+        started.append(config_json)
+        raise StopAtHostError
 
-    stub = SimpleNamespace(WorkerConfig=native.WorkerConfig, BridgeWorker=bridge)
+    stub = SimpleNamespace(WorkerHost=SimpleNamespace(start=start))
+    with (
+        mock.patch.object(worker_module, "is_native_available", return_value=True),
+        mock.patch.object(worker_module, "get_native_module", return_value=stub),
+        pytest.raises(StopAtHostError),
+    ):
+        asyncio.run(worker._initialize())  # type: ignore[attr-defined]
+    (config_json,) = started
+    return dict(json.loads(config_json))
+
+
+def test_the_worker_hands_the_key_to_the_worker_host() -> None:
+    # The Python value only matters if it reaches the host every connection
+    # is built from.
+    from orcher.worker import worker as worker_module
+
     config = WorkerConfig(
         server_url="http://localhost:50051",
         task_queue="q",
         api_key=KEY,
         organization_id="org_123",
     )
-    worker = worker_module.Worker(config)
-    with (
-        mock.patch.object(worker_module, "is_native_available", return_value=True),
-        mock.patch.object(worker_module, "get_native_module", return_value=stub),
-        pytest.raises(StopAtBridgeError),
-    ):
-        asyncio.run(worker._initialize())
-
-    (native_config,) = built
-    assert native_config.api_key == KEY
-    assert native_config.organization_id == "org_123"
+    host_config = started_host_config(worker_module.Worker(config))
+    assert host_config["api_key"] == KEY
+    assert host_config["organization_id"] == "org_123"
 
 
-def test_the_native_config_refuses_a_key_it_could_not_send() -> None:
+def test_the_worker_host_refuses_a_key_it_could_not_send() -> None:
     native = pytest.importorskip("orcher._native")
+    config = {"server_url": "http://localhost:50051", "task_queue": "q", "namespace": "n"}
     with pytest.raises(ValueError, match="api_key"):
-        native.WorkerConfig(server_url="http://localhost:50051", task_queue="q", api_key="a\nb")
+        native.WorkerHost.start(json.dumps({**config, "api_key": "a\nb"}), "{}")
 
 
 def test_no_config_prints_the_key() -> None:
@@ -122,7 +130,6 @@ def test_no_config_prints_the_key() -> None:
     configs = [
         WorkerConfig(server_url="http://localhost:50051", task_queue="q", api_key=KEY),
         ClientConfig(server_url="http://localhost:50051", api_key=KEY),
-        native.WorkerConfig(server_url="http://localhost:50051", task_queue="q", api_key=KEY),
         native.ClientConfig(server_url="http://localhost:50051", api_key=KEY),
     ]
     for config in configs:

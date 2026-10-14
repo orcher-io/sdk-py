@@ -14,30 +14,16 @@ import pytest
 
 from orcher import WorkflowContext, workflow
 from orcher.decorators import GlobalRegistry
+from orcher.worker.activation import load_activation
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
+from tests.support.kernel import activation, payload, query, resolution, run, update
 
 FALSY = [0, False, "", [], {}, 0.0, None]
 
 
 def make_worker() -> Worker:
     return Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
-
-
-def start_request(workflow_type: str, data: Any = None) -> dict[str, Any]:
-    return {
-        "run_id": "run-1",
-        "jobs": [
-            {
-                "StartWorkflow": {
-                    "workflow_type": workflow_type,
-                    "workflow_id": "wf-1",
-                    "task_queue": "q",
-                    "input": data,
-                }
-            }
-        ],
-    }
 
 
 def completed_with(response: dict[str, Any]) -> Any:
@@ -56,7 +42,7 @@ async def test_a_workflow_result_comes_back_as_returned(value: Any) -> None:
     worker = make_worker()
     worker._workflow_handlers[name] = GlobalRegistry.get_instance().get_workflow(name)
 
-    response = await worker._execute_workflow(start_request(name))
+    response = await run(worker, activation(name))
 
     assert response["successful"], response["error"]
     result = completed_with(response)
@@ -76,30 +62,25 @@ async def test_a_query_and_an_update_answer_as_returned(value: Any) -> None:
 
     worker = make_worker()
     worker._workflow_handlers[name] = GlobalRegistry.get_instance().get_workflow(name)
-    request = start_request(name)
-    request["jobs"] += [
-        {"ProcessQuery": {"query_id": "q1", "query_type": "q", "arguments": []}},
-        {"UpdateState": {"update_id": "u1", "update_name": "u", "payload": {"data": []}}},
-    ]
+    request = activation(name, None, update("u1", "u"), queries=[query("q1", "q")])
 
-    response = await worker._execute_workflow(request)
+    response = await run(worker, request)
 
-    (query,) = response["query_responses"]
-    (update,) = response["update_results"]
-    assert json.loads(bytes(query["result"]["Success"]["output"]["data"])) == value
-    assert json.loads(bytes(update["result"]["Completed"]["output"]["data"])) == value
+    (answered_query,) = response["query_responses"]
+    (answered_update,) = response["update_results"]
+    assert json.loads(bytes(answered_query["result"]["Success"]["output"]["data"])) == value
+    assert json.loads(bytes(answered_update["result"]["Completed"]["output"]["data"])) == value
 
 
 @pytest.mark.parametrize("value", [0, False, "", []], ids=repr)
 def test_a_child_result_is_read_back_as_returned(value: Any) -> None:
-    jobs = [
-        {
-            "ChildWorkflowCompleted": {
-                "workflow_id": "child_1",
-                "result": {"data": list(json.dumps(value).encode())},
-            }
-        }
-    ]
-    cached = make_worker()._extract_cached_results_from_jobs(jobs)
+    child = {
+        "child_workflow_id": "child_1",
+        "outcome": {"value": payload(value), "end": "completed"},
+    }
+    loaded = load_activation(
+        activation("any", None, resolution("child", child, step_id="child_1")), "default"
+    )
+    cached = loaded.context._cached_results
     assert cached["child:child_1"] == value
     assert type(cached["child:child_1"]) is type(value)

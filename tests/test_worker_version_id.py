@@ -10,6 +10,7 @@ import os
 from unittest import mock
 
 from orcher.worker.config import WorkerConfig
+from orcher.worker.worker import Worker
 
 
 def test_version_id_defaults_to_undeclared() -> None:
@@ -44,24 +45,15 @@ def test_an_unset_environment_leaves_it_undeclared() -> None:
     assert config.version_id is None
 
 
-def test_the_native_config_carries_the_release() -> None:
-    # The Python value is only useful if it survives into the native config the
-    # pollers are built from.
-    from orcher._native import WorkerConfig as NativeWorkerConfig
+def test_the_worker_host_is_started_with_the_release() -> None:
+    # The Python value is only useful if it reaches the worker host the
+    # pollers are built from; the host treats a blank release as none.
+    from tests.test_worker_api_key import started_host_config
 
-    native = NativeWorkerConfig(
-        server_url="http://localhost:50051", task_queue="q", version_id="release-7"
+    worker = Worker(
+        WorkerConfig(server_url="http://localhost:50051", task_queue="q", version_id="release-7")
     )
-    assert native.version_id == "release-7"
-
-
-def test_the_native_config_normalises_blank_too() -> None:
-    from orcher._native import WorkerConfig as NativeWorkerConfig
-
-    native = NativeWorkerConfig(
-        server_url="http://localhost:50051", task_queue="q", version_id="  "
-    )
-    assert native.version_id is None
+    assert started_host_config(worker)["version_id"] == "release-7"
 
 
 def test_the_builder_also_defaults_from_the_environment() -> None:

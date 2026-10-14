@@ -18,7 +18,7 @@ from orcher.interceptors.base import (
     TaskInterceptor,
     WorkflowInterceptor,
 )
-from orcher.worker.config import WorkerConfig, _undeclared_if_blank
+from orcher.worker.config import WorkerConfig, _undeclared_if_blank, warn_ignored
 
 if TYPE_CHECKING:
     from orcher.worker.worker import Worker
@@ -192,7 +192,8 @@ class WorkerBuilder:
 
     def workflow_poll_interval(self, interval: timedelta | int) -> WorkerBuilder:
         """
-        Set workflow polling interval.
+        Deprecated, and ignored: the worker host waits for work in long polls
+        and hands it over as it arrives, with no interval between polls.
 
         Args:
             interval: Polling interval as a ``timedelta``, or milliseconds as an ``int``
@@ -200,12 +201,14 @@ class WorkerBuilder:
         Returns:
             Builder instance for chaining
         """
+        warn_ignored("workflow_poll_interval")
         self._workflow_poll_interval_ms = _to_millis(interval)
         return self
 
     def task_poll_interval(self, interval: timedelta | int) -> WorkerBuilder:
         """
-        Set task polling interval.
+        Deprecated, and ignored: the worker host waits for work in long polls
+        and hands it over as it arrives, with no interval between polls.
 
         Args:
             interval: Polling interval as a ``timedelta``, or milliseconds as an ``int``
@@ -213,6 +216,7 @@ class WorkerBuilder:
         Returns:
             Builder instance for chaining
         """
+        warn_ignored("task_poll_interval")
         self._task_poll_interval_ms = _to_millis(interval)
         return self
 
@@ -281,7 +285,9 @@ class WorkerBuilder:
 
     def force_shutdown_timeout(self, timeout: timedelta | int) -> WorkerBuilder:
         """
-        Set force shutdown timeout.
+        Deprecated, and ignored: a stopping worker is bounded by its shutdown
+        grace (``shutdown_grace_time``), after which the worker host hands
+        back what is unfinished and stops.
 
         Args:
             timeout: Timeout as a ``timedelta``, or milliseconds as an ``int``
@@ -289,6 +295,7 @@ class WorkerBuilder:
         Returns:
             Builder instance for chaining
         """
+        warn_ignored("force_shutdown_timeout")
         self._force_shutdown_timeout_ms = _to_millis(timeout)
         return self
 

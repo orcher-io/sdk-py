@@ -21,6 +21,8 @@ the Rust, Python and TypeScript SDKs, so the same scenarios drive every worker.
   engine, checks the results, and exits non-zero on any failure.
 - `long_wait.py` — a standalone check that runs on its own because it takes
   over a minute (see below).
+- `replay_check.py` — an engine-free replay of recorded activations against
+  committed expected results (`replay/`), described below.
 
 ## Running
 
@@ -81,6 +83,48 @@ python contract/long_wait.py --sleep-secs 75
 # claim the long wait works.
 python contract/long_wait.py --sleep-secs 5
 ```
+
+## Replay check
+
+`replay/<corpus>/` holds workflow activations recorded from this catalog
+(`<workflow>/<run>/<n>-activation.pb`, each an encoded
+`orcher.v1.PollWorkflowExecutionResponse`) and, in `expected.json`, what the
+SDK answered each with, as sdk-core reads it before sending it to the engine.
+`replay_check.py` replays every activation and fails on any difference. It
+needs no engine:
+
+```bash
+PYTHONPATH=src:contract python contract/replay_check.py
+```
+
+Each activation is resolved by the kernel into a `RunActivation`, answered by
+`Worker.run_activation`, and the answer turned back by the kernel, as the
+worker host does on a live worker. The expected results were recorded while
+the worker still had its journal-reading path as well, and both paths agreed
+on every activation, so the corpus stands in for that path now that it is
+gone.
+
+A change meant to alter what the SDK sends updates the expected results with
+`--bless`. Review the diff of `expected.json` like code.
+
+To record a corpus, run the suite with `ORCHER_RECORD_ACTIVATIONS` set to an
+empty directory; the worker writes every activation it receives and every
+answer it gives there. Commit only the `*-activation.pb` files: the answers
+carry the worker's identity, which names the machine.
+
+## Known gaps of the kernel protocol (sdk-core 0.14)
+
+Until the SDK moves to sdk-core 0.15:
+
+- A workflow restarted with fresh history and a timeout is refused with a
+  protocol error, which hands the activation back to the engine; the kernel
+  protocol does not carry the timeout. `ctx.restart_fresh()` takes no
+  timeout, so no workflow written against this SDK's API hits it.
+- The reason a child workflow was terminated for is lost: the parent's
+  `WorkflowError` says only that the child was terminated.
+- A failed workflow's traceback and the steps it reached do not reach the
+  engine, and its failure is reported as an ordinary workflow failure even
+  when the code no longer replays its history.
 
 ## Differences between SDKs
 

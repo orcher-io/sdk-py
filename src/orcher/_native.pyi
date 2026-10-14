@@ -21,8 +21,15 @@ def _health_check() -> bool:
     """Return whether the SDK core is reachable from Python."""
     ...
 
-def _parse_execution_result(result_json: str) -> str:
-    """Read an activation's result as sdk-core does; raise ValueError if it would reject it."""
+def _kernel_resolve(poll_response: bytes, namespace: str) -> str:
+    """A recorded activation resolved by the kernel, as ``RunActivation`` JSON."""
+    ...
+
+def _kernel_execution_result(run_id: str, result_json: str) -> str:
+    """A ``RunActivationResult`` (JSON) as the kernel turns it into what is sent.
+
+    Raises ValueError when the kernel refuses it.
+    """
     ...
 
 # =============================================================================
@@ -202,6 +209,14 @@ class Client:
         page_size: int = 100,
         next_page_token: bytes | None = None,
     ) -> dict[str, Any]: ...
+    async def invoke_actor_operation(
+        self,
+        actor_name: str,
+        key: str,
+        operation: str,
+        payload: bytes,
+        timeout_ms: int | None = None,
+    ) -> bytes: ...
     async def close(self) -> None: ...
     def __repr__(self) -> str: ...
 
@@ -242,231 +257,65 @@ class WorkflowHandle:
     def __repr__(self) -> str: ...
 
 # =============================================================================
-# Service API
+# Worker API
 # =============================================================================
 
-class WorkerConfig:
-    """Configuration for ``BridgeWorker``.
+class WorkerHost:
+    """The worker host shared with the Rust and TypeScript SDKs, running.
 
-    ``api_key`` is sent as ``authorization: Bearer <key>`` on every request the
-    worker makes; ``repr`` never shows it.
+    It polls the engine, keeps the worker registered, runs sessions and
+    drains on shutdown; ``orcher.Worker`` pulls work from it. Messages cross
+    as JSON: activations and their answers in the kernel protocol's shapes
+    (see ``orcher.worker.activation``). A pull returns None once the host has
+    stopped and handed over everything it took.
     """
 
-    def __init__(
-        self,
-        server_url: str,
-        task_queue: str,
-        namespace: str = "default",
-        max_concurrent_workflows: int = 100,
-        max_concurrent_tasks: int = 100,
-        identity: str | None = None,
-        workflow_poller_count: int = 2,
-        task_poller_count: int = 4,
-        actor_poller_count: int = 4,
-        max_concurrent_actors: int = 100,
-        organization_id: str | None = None,
-        tls_ca_cert_path: str | None = None,
-        tls_client_cert_path: str | None = None,
-        tls_client_key_path: str | None = None,
-        version_id: str | None = None,
-        api_key: str | None = None,
-    ) -> None: ...
-
-    server_url: str
-    namespace: str
-    task_queue: str
-    max_concurrent_workflows: int
-    max_concurrent_tasks: int
-    identity: str | None
-    workflow_poller_count: int
-    task_poller_count: int
-    actor_poller_count: int
-    max_concurrent_actors: int
-    organization_id: str | None
-    api_key: str | None
-    tls_ca_cert_path: str | None
-    tls_client_cert_path: str | None
-    tls_client_key_path: str | None
-    version_id: str | None
-
-    def __repr__(self) -> str: ...
-
-class BridgeWorker:
-    """
-    Worker bridge between Python handlers and the Rust SDK core.
-
-    The Rust core owns all gRPC traffic and execution state. Python receives
-    work from it, runs the user's handlers, and hands the results back.
-    """
-
-    def __init__(self, config: WorkerConfig) -> None: ...
-    async def register_actor_handlers(
-        self,
-        handlers_json: str,
-        metadata_json: str,
-    ) -> str:
-        """
-        Register actor handlers (with per-operation modes) with the server.
-
-        handlers_json is a JSON array of {"actor_name", "operation", "mode"}
-        entries where mode is "exclusive" or "shared". Registration is what
-        lets the server resolve an operation's concurrency mode — without it,
-        every operation conservatively runs exclusive.
-
-        Returns the server-issued registration_id. Raises on RPC failure.
-        """
+    @staticmethod
+    async def start(config_json: str, registrations_json: str) -> WorkerHost:
+        """Start a worker. Raises ValueError for a configuration it cannot use
+        and RuntimeError when the worker cannot start."""
         ...
-
-    async def invoke_actor_operation(
-        self,
-        actor_name: str,
-        key: str,
-        operation: str,
-        payload: bytes,
-        timeout_ms: int | None = None,
-    ) -> bytes:
-        """
-        Invoke an actor operation (client-side InvokeOperation RPC) and wait
-        for its result bytes. Raises on execution failure.
-        """
+    @property
+    def identity(self) -> str: ...
+    async def next_activation(self) -> str | None: ...
+    async def complete_activation(self, result_json: str) -> None: ...
+    async def next_task(self) -> str | None: ...
+    def heartbeat(self, token: bytes, details: bytes | None = None) -> bool:
+        """Record a heartbeat; return whether the task was asked to cancel."""
         ...
-
-    async def poll_workflow_task(self) -> bytes | None:
-        """
-        Wait for the next workflow execution the Rust core has received.
-
-        Returns JSON-encoded bytes with execution_request, workflow_id, run_id,
-        task_token and stream_entry_id, or None if no work is available.
-        Raises ServiceShutdownEvent when the worker is shutting down.
-        """
+    async def task_cancelled(self, token: bytes) -> bool:
+        """True once the task is asked to cancel, False once it is reported."""
         ...
-
-    async def poll_task(self) -> bytes | None:
-        """
-        Wait for the next task execution the Rust core has received.
-
-        Returns the JSON-encoded task request, or None if no work is available.
-        Raises ServiceShutdownEvent when the worker is shutting down.
-        """
-        ...
-
-    async def complete_workflow_task(
-        self,
-        workflow_id: str,
-        execution_id: str,
-        result_json: str,
-        task_token: str,
-        stream_entry_id: str | None = None,
-    ) -> None:
-        """
-        Complete a workflow execution by handing its result to the Rust core.
-
-        The core reports the completion to the server.
-        """
-        ...
-
-    async def fail_workflow_task(
-        self,
-        workflow_id: str,
-        execution_id: str,
-        task_token: str,
-        error_message: str,
-        error_type: str,
-    ) -> None:
-        """
-        Fail a workflow execution by handing its error to the Rust core.
-
-        The core reports the failure to the server.
-        """
-        ...
-
-    async def complete_task(
-        self,
-        task_token: str,
-        result_json: str,
-    ) -> None:
-        """Complete a task execution."""
-        ...
-
-    def heartbeat_task(self, task_token: str, details: bytes | None = None) -> bool:
-        """Record a heartbeat from a running task's code.
-
-        The worker heartbeats every task on its own; this is sent with the
-        next heartbeat due, never waiting. Returns whether the task has been
-        asked to stop.
-        """
-        ...
-
-    async def wait_task_cancelled(self, task_token: str) -> bool:
-        """Resolve ``True`` once the engine asks the task to stop, and
-        ``False`` once its outcome is reported."""
-        ...
-
+    async def complete_task(self, token: bytes, result: bytes) -> None: ...
     async def fail_task(
         self,
-        task_token: str,
-        error_message: str,
+        token: bytes,
+        message: str,
         error_type: str,
         non_retryable: bool = False,
-    ) -> None:
-        """Fail a task execution.
-
-        ``error_type`` is what a retry policy's non-retryable list is matched
-        against; ``non_retryable`` stops retries whatever the policy allows.
-        """
-        ...
-
-    def request_shutdown(self) -> None:
-        """Request shutdown of the worker."""
-        ...
-
-    async def stop_drivers(self) -> None:
-        """Stop the workflow and task drivers once they have sent the results they hold."""
-        ...
-
-    def is_shutdown_requested(self) -> bool:
-        """Check if shutdown has been requested."""
-        ...
-
-    def available_workflow_slots(self) -> int:
-        """Get available workflow execution slots."""
-        ...
-
-    def available_task_slots(self) -> int:
-        """Get available task execution slots."""
-        ...
-
-class Service:
-    """Native worker runtime that runs registered workflow and task handlers.
-
-    ``orcher.Worker`` does not use it; it drives ``BridgeWorker`` instead.
-    """
-
-    def __init__(self, config: WorkerConfig) -> None: ...
-    def register_workflow(
-        self,
-        workflow_type: str,
-        handler: Any,
     ) -> None: ...
-    def register_task(
-        self,
-        task_type: str,
-        handler: Any,
+    async def next_actor_operation(self) -> str | None: ...
+    async def complete_actor_operation(
+        self, operation_id: str, execution_id: str, result: bytes
     ) -> None: ...
-    @property
-    def state(self) -> str: ...
-    def is_running(self) -> bool: ...
-    async def run_with_handlers(
-        self,
-        workflow_executor: Any,
-        task_executor: Any,
+    async def fail_actor_operation(
+        self, operation_id: str, execution_id: str, message: str, error_type: str
     ) -> None: ...
-    def get_bridge_worker(self) -> BridgeWorker | None: ...
-    async def shutdown(
-        self,
-        force: bool = False,
-        timeout_ms: int | None = None,
+    async def actor_get_state(
+        self, actor_name: str, key: str, state_key: str, execution_id: str
+    ) -> bytes | None: ...
+    async def actor_set_state(
+        self, actor_name: str, key: str, state_key: str, value: bytes, execution_id: str
     ) -> None: ...
+    async def actor_delete_state(
+        self, actor_name: str, key: str, state_key: str, execution_id: str
+    ) -> bool: ...
+    async def actor_list_state_keys(
+        self, actor_name: str, key: str, execution_id: str, prefix: str
+    ) -> list[str]: ...
+    async def shutdown(self) -> None:
+        """Stop the worker, within its shutdown grace; pulls then return None."""
+        ...
     def __repr__(self) -> str: ...
 
 # =============================================================================
@@ -562,14 +411,5 @@ class CodecChain:
 
 class NativeError(Exception):
     """Base exception for native module errors."""
-
-    ...
-
-class ServiceShutdownEvent(Exception):  # noqa: N818
-    """
-    Raised when a poll returns because the worker is shutting down.
-
-    Polling loops catch it to exit cleanly.
-    """
 
     ...

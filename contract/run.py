@@ -50,7 +50,7 @@ def json_matches(expected: Any, actual: Any) -> bool:
 
 
 async def run_actor_scenario(
-    worker: Worker, args: argparse.Namespace, sc: dict
+    client: Client, args: argparse.Namespace, sc: dict
 ) -> tuple[bool, str]:
     """Run one actor scenario.
 
@@ -58,12 +58,8 @@ async def run_actor_scenario(
     per-run key and assert every invocation's result against ``expect_each``."""
     from orcher.actor.client import ActorInvocationClient
 
-    bridge = worker._bridge_worker  # noqa: SLF001 — harness drives the in-process worker's bridge
-    if bridge is None:
-        return False, "native bridge unavailable (mock mode cannot invoke actors)"
-
     key = f"conf-{uuid.uuid4()}"
-    inv = ActorInvocationClient(bridge, sc["actor"], key)
+    inv = ActorInvocationClient(client, sc["actor"], key)
 
     for step in sc["steps"]:
         n = int(step.get("parallel", 1))
@@ -625,7 +621,7 @@ async def main() -> None:
     for sc in scenarios:
         kind = sc.get("kind")
         if kind == "actor":
-            ok, msg = await run_actor_scenario(worker, args, sc)
+            ok, msg = await run_actor_scenario(client, args, sc)
             label = sc["actor"]
         elif kind == "client_error":
             ok, msg = await run_client_error_scenario(client, sc)

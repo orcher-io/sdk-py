@@ -8,7 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
-use orcher_sdk_core::client::{CancelWorkflowOpts, StartWorkflowOpts, WorkflowClient, WorkflowHandle};
+use orcher_sdk_core::client::{
+    CancelWorkflowOpts, StartWorkflowOpts, WorkflowClient, WorkflowHandle,
+};
 use orcher_sdk_core::types::{
     ListWorkflowsOptions, ListWorkflowsSortOrder, SearchWorkflowsOptions, WorkflowExecution,
     WorkflowStatus,
@@ -123,6 +125,7 @@ pub struct PyClientConfig {
 impl PyClientConfig {
     #[new]
     #[pyo3(signature = (server_url, namespace = "default".to_string(), timeout_ms = 10000, identity = None, tls_ca_cert_path = None, tls_client_cert_path = None, tls_client_key_path = None, api_key = None, connect_timeout_ms = 10000))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         server_url: String,
         namespace: String,
@@ -218,6 +221,8 @@ impl PyClientConfig {
 struct ClientInner {
     client: WorkflowClient,
     config: PyClientConfig,
+    /// The connection actor invocations go out on, with the client's key.
+    actors: crate::actor_invoke::ActorChannels,
 }
 
 /// Client for starting, listing, and searching workflows.
@@ -245,7 +250,7 @@ impl PyClient {
         // Build TLS config before entering async context (file I/O is sync)
         let tls_config = config
             .build_tls_config()
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e))?;
+            .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let client = if let Some(ref tls) = tls_config {
@@ -313,8 +318,28 @@ impl PyClient {
                 None => client,
             };
 
+            // Actor invocations dial lazily, on first use, with the same TLS.
+            let manager = match tls_config {
+                Some(tls) => orcher_sdk_core::poller::channel::ChannelManager::with_tls(
+                    server_url.clone(),
+                    tls,
+                ),
+                None => orcher_sdk_core::poller::channel::ChannelManager::new(server_url.clone()),
+            };
+            let actors = crate::actor_invoke::ActorChannels::new(
+                manager,
+                crate::actor_invoke::Credentials {
+                    api_key: config.api_key.clone(),
+                    organization_id: None,
+                },
+            );
+
             let mut guard = inner.lock().await;
-            *guard = Some(ClientInner { client, config });
+            *guard = Some(ClientInner {
+                client,
+                config,
+                actors,
+            });
 
             Ok(())
         })
@@ -462,6 +487,7 @@ impl PyClient {
 
     /// List workflow executions with optional filters
     #[pyo3(signature = (page_size = 100, next_page_token = None, workflow_type = None, task_queue = None, status_filter = None, sort_order = None))]
+    #[allow(clippy::too_many_arguments)]
     fn list_workflows<'py>(
         &self,
         py: Python<'py>,
@@ -571,6 +597,38 @@ impl PyClient {
             })?;
 
             Python::with_gil(|py| json_value_to_py(py, &json_value))
+        })
+    }
+
+    /// Invoke an actor operation and wait for its result.
+    ///
+    /// The server queues the operation under its concurrency rules, a worker
+    /// runs it, and its result bytes come back. Raises `RuntimeError` when
+    /// the operation does not succeed.
+    #[pyo3(signature = (actor_name, key, operation, payload, timeout_ms = None))]
+    fn invoke_actor_operation<'py>(
+        &self,
+        py: Python<'py>,
+        actor_name: String,
+        key: String,
+        operation: String,
+        payload: Vec<u8>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let actors = {
+                let guard = inner.lock().await;
+                guard
+                    .as_ref()
+                    .ok_or_else(|| {
+                        pyo3::exceptions::PyRuntimeError::new_err("Client not connected")
+                    })?
+                    .actors
+                    .clone()
+            };
+            crate::actor_invoke::invoke(&actors, actor_name, key, operation, payload, timeout_ms)
+                .await
         })
     }
 

@@ -55,7 +55,9 @@ async def test_a_child_handle_sends_an_event_and_cancels_once_across_replays() -
     ("how", "reason", "message"),
     [
         ("canceled", "", "child workflow was canceled"),
-        ("terminated", "operator", "child workflow was terminated: operator"),
+        # The kernel protocol of sdk-core 0.14 does not carry the reason a
+        # child was terminated for, so the message cannot name it.
+        ("terminated", "operator", "child workflow was terminated"),
         ("timed_out", "", "child workflow timed out"),
     ],
 )
