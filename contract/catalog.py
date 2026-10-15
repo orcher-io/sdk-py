@@ -618,3 +618,8 @@ async def task_timeout_terminal(ctx: WorkflowContext) -> dict:
             "timed_out": "timed out" in str(e).lower(),
         }
     return {"caught": False, "task_type": "", "timed_out": False}
+
+@workflow(name="report_attempt")
+async def report_attempt(ctx: WorkflowContext) -> dict:
+    """Return the attempt this run reads. A first run is attempt 1."""
+    return {"attempt": ctx.info.attempt}
