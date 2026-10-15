@@ -98,7 +98,11 @@ def test_settled_steps_children_and_timers_are_cached_with_their_times() -> None
                 "step",
                 {
                     "outcome": {
-                        "failure": {"message": "declined", "error_type": "CardDeclined"},
+                        "failure": {
+                            "message": "declined",
+                            "error_type": "CardDeclined",
+                            "code": "application",
+                        },
                         "end": "failed",
                         "attempts": 3,
                     }
@@ -136,6 +140,7 @@ def test_settled_steps_children_and_timers_are_cached_with_their_times() -> None
         TASK_FAILED_SENTINEL: True,
         "message": "declined",
         "error_type": "CardDeclined",
+        "code": "application",
         "attempts": 3,
     }
     # The timer's position among the resolutions, the start included.
