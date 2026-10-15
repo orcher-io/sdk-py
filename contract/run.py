@@ -363,6 +363,92 @@ async def run_cancel_scenario(
     return False, f"unknown expected status '{status}' for a cancel scenario"
 
 
+def _start_local_worker(
+    args: argparse.Namespace, task_queue: str, run_tasks: bool
+) -> tuple[Worker, asyncio.Task[None]]:
+    """Start a worker in this process serving ``task_queue`` alone.
+
+    With ``run_tasks`` unset it runs workflows and no tasks: with no task
+    registered it does not poll for tasks, so a task scheduled on its queue
+    waits. The SDK has no public way to leave tasks out, so the handlers it
+    loaded are dropped before it starts."""
+    worker = (
+        Worker.builder()
+        .server_url(args.server_url)
+        .namespace(args.namespace)
+        .task_queue(task_queue)
+        .build()
+    )
+    if not run_tasks:
+        worker._task_handlers.clear()
+    return worker, asyncio.create_task(worker.run())
+
+
+async def run_cancel_queued_task_scenario(
+    client: Client, args: argparse.Namespace, sc: dict
+) -> tuple[bool, str]:
+    """Cancel a workflow parked on a task no worker could start yet.
+
+    The workflow starts on a queue of its own, served by a worker that runs
+    workflows and no tasks, so the task it schedules and parks on waits for a
+    worker. Once it has parked it is cancelled, and only then is a worker that
+    runs tasks started on the queue: a queued task the cancellation failed to
+    end would start there. The workflow's cleanup runs on it too. The run must
+    end cancelled, and what the worker observed must match ``expect.observed``.
+    """
+    from orcher.types import WorkflowStatus
+
+    expect = sc["expect"]
+    key = f"conf-{uuid.uuid4()}"
+    task_queue = f"contract-queued-{uuid.uuid4()}"
+    scenario_input = sc.get("input", {})
+    payload = {**(scenario_input if isinstance(scenario_input, dict) else {}), "key": key}
+
+    workers = [_start_local_worker(args, task_queue, run_tasks=False)]
+    try:
+        handle = await client.start_workflow(
+            sc["workflow"], task_queue=task_queue, args=(payload,)
+        )
+        if not await _wait_until_parked(key, args.result_timeout_secs):
+            with contextlib.suppress(Exception):  # best effort
+                await handle.cancel()
+            return False, "the workflow never parked"
+        # Let the engine record the activation that scheduled the task, so the
+        # request comes after it, as it does for a task queued for real.
+        await asyncio.sleep(0.5)
+        await handle.cancel()
+        workers.append(_start_local_worker(args, task_queue, run_tasks=True))
+
+        deadline = time.monotonic() + args.result_timeout_secs
+        while True:
+            current = await handle.status()
+            if current == WorkflowStatus.CANCELLED:
+                break
+            if current != WorkflowStatus.RUNNING or time.monotonic() >= deadline:
+                return False, f"expected the workflow cancelled, it is {current}"
+            await asyncio.sleep(0.2)
+        # A queued task the cancellation missed would be claimed by now; give
+        # its handler a moment to be seen running.
+        await asyncio.sleep(1)
+
+        observed = {
+            "queued_task_ran": key in catalog.QUEUED_TASK_RAN,
+            "queued_task_wait": catalog.QUEUED_TASK_WAIT.get(key),
+            "cleanup_ran": key in catalog.CLEANUP_RAN,
+        }
+        if json_matches(expect.get("observed", {}), observed):
+            return True, ""
+        return False, (
+            f"observed mismatch\n    expected: {expect.get('observed')}\n    actual:   {observed}"
+        )
+    finally:
+        for worker, running in workers:
+            with contextlib.suppress(Exception):
+                await worker.shutdown()
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(running, timeout=30)
+
+
 async def run_workflow_id_reuse_scenario(
     client: Client, args: argparse.Namespace, sc: dict
 ) -> tuple[bool, str]:
@@ -634,6 +720,9 @@ async def main() -> None:
             label = sc["workflow"]
         elif kind == "cancel":
             ok, msg = await run_cancel_scenario(client, args, sc)
+            label = sc["workflow"]
+        elif kind == "cancel_queued_task":
+            ok, msg = await run_cancel_queued_task_scenario(client, args, sc)
             label = sc["workflow"]
         elif kind == "engine_restart":
             ok, msg = await run_engine_restart_scenario(client, args, sc)
