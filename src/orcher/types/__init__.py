@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any
 
 __all__ = [
+    "DEFAULT_MAX_ATTEMPTS",
     "WorkflowExecution",
     "WorkflowStatus",
     "Payload",
@@ -189,19 +190,25 @@ class Payload:
         return len(self.data)
 
 
+DEFAULT_MAX_ATTEMPTS = 3
+"""Attempts a retry policy allows when it leaves ``max_attempts`` out, the first included."""
+
+
 @dataclass
 class RetryPolicy:
     """Retry policy for workflows and tasks.
 
     Attributes:
-        max_attempts: Maximum number of retry attempts (0 = unlimited).
+        max_attempts: Maximum number of attempts, the first one included: 1
+            never retries and 3 (the default) allows two retries. 0 retries
+            without limit.
         initial_interval: Initial retry interval.
         max_interval: Maximum retry interval.
         backoff_coefficient: Backoff multiplier for each retry.
         non_retryable_error_types: List of error types that should not be retried.
     """
 
-    max_attempts: int = 3
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
     initial_interval: timedelta = field(default_factory=lambda: timedelta(seconds=1))
     max_interval: timedelta = field(default_factory=lambda: timedelta(seconds=60))
     backoff_coefficient: float = 2.0

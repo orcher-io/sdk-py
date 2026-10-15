@@ -128,3 +128,32 @@ class TestTaskDecoratorAcceptsRetryPolicy:
             return amount
 
         assert charge.__orcher_task_retry_policy__ == {"max_attempts": 3}
+
+
+class TestOmittedMaxAttempts:
+    """An omitted count takes the documented default, never 0 (unlimited)."""
+
+    def test_documented_default_is_three(self) -> None:
+        from orcher.types import DEFAULT_MAX_ATTEMPTS
+
+        assert DEFAULT_MAX_ATTEMPTS == 3
+        assert RetryPolicy().max_attempts == DEFAULT_MAX_ATTEMPTS
+
+    def test_task_dict_without_count_takes_the_default(self) -> None:
+        assert _normalize_retry_policy({"initial_interval_seconds": 2})["max_attempts"] == 3
+
+    def test_kernel_task_policy_without_count_takes_the_default(self) -> None:
+        from orcher.worker.activation import _retry_policy
+
+        assert _retry_policy({"initial_interval": {"secs": 1, "nanos": 0}})["max_attempts"] == 3
+        assert _retry_policy({"max_attempts": None})["max_attempts"] == 3
+
+    def test_kernel_task_policy_keeps_zero_as_unlimited(self) -> None:
+        from orcher.worker.activation import _retry_policy
+
+        assert _retry_policy({"max_attempts": 0})["max_attempts"] == 0
+
+    def test_kernel_task_policy_keeps_an_explicit_count(self) -> None:
+        from orcher.worker.activation import _retry_policy
+
+        assert _retry_policy({"max_attempts": 5})["max_attempts"] == 5

@@ -38,6 +38,19 @@ fn cancel_opts(cleanup_timeout: Option<Duration>) -> CancelWorkflowOpts {
     }
 }
 
+/// Attempts a retry policy allows when it leaves `max_attempts` out, the first one
+/// included. It is the SDK's documented `RetryPolicy` default.
+const DEFAULT_MAX_ATTEMPTS: i32 = 3;
+
+/// The `maximum_attempts` a retry policy sends for the `max_attempts` it was given.
+///
+/// An omitted count takes [`DEFAULT_MAX_ATTEMPTS`]; it must never become 0, which
+/// the engine reads as unlimited. An explicit 0 stays 0 (unlimited) and any other
+/// count is sent as given, the first attempt included.
+fn maximum_attempts(max_attempts: Option<i32>) -> i32 {
+    max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS)
+}
+
 /// Build a proto `RetryPolicy` from the `retry_policy` kwargs dict passed by the
 /// Python client. Fields are millisecond-based to match the native retry surface.
 /// Returns `None` when no policy dict is present.
@@ -74,12 +87,12 @@ fn extract_retry_policy(
             .and_then(|v| v.extract().ok())
             .unwrap_or(2.0),
         maximum_interval: get_u64("max_interval_ms").map(ms_to_proto_duration),
-        maximum_attempts: d
-            .get_item("max_attempts")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract().ok())
-            .unwrap_or(0),
+        maximum_attempts: maximum_attempts(
+            d.get_item("max_attempts")
+                .ok()
+                .flatten()
+                .and_then(|v| v.extract().ok()),
+        ),
         non_retryable_error_types: non_retryable,
         ..Default::default()
     }))
@@ -923,6 +936,22 @@ mod tests {
         assert_eq!(config.namespace, "default");
         assert_eq!(config.timeout_ms, 10000);
         assert_eq!(config.connect_timeout_ms, 2500);
+    }
+
+    #[test]
+    fn an_omitted_max_attempts_sends_the_documented_default() {
+        assert_eq!(maximum_attempts(None), 3);
+    }
+
+    #[test]
+    fn an_explicit_zero_max_attempts_stays_unlimited() {
+        assert_eq!(maximum_attempts(Some(0)), 0);
+    }
+
+    #[test]
+    fn an_explicit_max_attempts_is_sent_as_given() {
+        assert_eq!(maximum_attempts(Some(1)), 1);
+        assert_eq!(maximum_attempts(Some(5)), 5);
     }
 
     #[test]

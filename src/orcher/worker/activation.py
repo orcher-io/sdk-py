@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from orcher.types import DEFAULT_MAX_ATTEMPTS
 from orcher.workflow.context import WorkflowContext
 from orcher.workflow.info import WorkflowInfo
 from orcher.workflow.sentinels import CHILD_FAILED_SENTINEL, TASK_FAILED_SENTINEL
@@ -506,7 +507,10 @@ def _retry_policy(policy: dict[str, Any] | None) -> dict[str, Any] | None:
     if policy is None:
         return None
     return {
-        "max_attempts": int(policy.get("max_attempts") or 0),
+        # An omitted count takes the documented default; 0 means unlimited.
+        "max_attempts": int(
+            DEFAULT_MAX_ATTEMPTS if policy.get("max_attempts") is None else policy["max_attempts"]
+        ),
         "first_delay": policy.get("initial_interval"),
         "max_delay": policy.get("max_interval"),
         "delay_multiplier": float(policy.get("backoff_coefficient") or 0.0),

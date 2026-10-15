@@ -216,7 +216,11 @@ class Client:
             args: Arguments to pass to the workflow, one to one onto its
                 parameters after the context. A single dict argument is
                 spread as keyword arguments.
-            retry_policy: Optional retry policy for the workflow.
+            retry_policy: Optional retry policy for the workflow. When omitted,
+                a failed workflow is not retried. When given, a failed workflow
+                is retried as a fresh run for up to ``max_attempts`` runs, the
+                first one included; ``max_attempts=0`` retries without limit,
+                and a dict that leaves ``max_attempts`` out allows 3.
             execution_timeout: Maximum time for the entire workflow execution.
             run_timeout: Maximum time for a single run of the workflow.
             task_timeout: Maximum time for workflow tasks.

@@ -23,7 +23,7 @@ from typing import (
 )
 
 from orcher._internal.arguments import pack_arguments
-from orcher.types import RetryPolicy, WorkflowExecution
+from orcher.types import DEFAULT_MAX_ATTEMPTS, RetryPolicy, WorkflowExecution
 from orcher.workflow.child import ChildWorkflowHandle
 from orcher.workflow.info import WorkflowInfo
 from orcher.workflow.random import WorkflowRandom
@@ -86,7 +86,7 @@ def _normalize_retry_policy(rp: Any) -> dict | None:
         return _retry_policy_to_dict(rp)
     if isinstance(rp, dict):
         return {
-            "max_attempts": int(rp.get("max_attempts", 3)),
+            "max_attempts": int(rp.get("max_attempts", DEFAULT_MAX_ATTEMPTS)),
             "initial_interval": {
                 "secs": int(rp.get("initial_interval_seconds", 1)),
                 "nanos": 0,

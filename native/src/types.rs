@@ -341,7 +341,7 @@ pub struct PyRetryPolicy {
     /// Maximum retry interval in milliseconds
     #[pyo3(get, set)]
     pub max_interval_ms: u64,
-    /// Maximum number of attempts (0 = unlimited)
+    /// Maximum number of attempts, the first one included (0 = unlimited)
     #[pyo3(get, set)]
     pub max_attempts: u32,
     /// Error types that should not be retried
