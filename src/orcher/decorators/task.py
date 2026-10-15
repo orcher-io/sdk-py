@@ -42,7 +42,8 @@ def task(
         retry_policy: Optional retry policy. Prefer a ``RetryPolicy`` object,
             which uses ``timedelta`` durations. A plain ``dict`` is also
             accepted, with these optional keys:
-            - max_attempts: Maximum retry attempts (default 3)
+            - max_attempts: Maximum attempts, the first included (default 3;
+              0 retries without limit)
             - initial_interval_seconds: Initial retry interval, seconds (default 1)
             - max_interval_seconds: Maximum retry interval, seconds (default 60)
             - backoff_coefficient: Multiplier for exponential backoff (default 2.0)
