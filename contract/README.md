@@ -41,8 +41,9 @@ use a different one.
 Start the Orcher engine with durable task failures enabled
 (`ORCHER_DURABLE_TASK_FAILURE=true`), listening for gRPC on port 50051.
 
-The worker-liveness scenarios (`task-outlives-heartbeat-timeout-without-heartbeat-code`
-and `task-retried-after-its-worker-dies`) need the engine to time out a silent
+The worker-liveness scenarios (`task-outlives-heartbeat-timeout-without-heartbeat-code`,
+`task-retried-after-its-worker-dies` and
+`task-timeout-on-last-attempt-reaches-workflow`) need the engine to time out a silent
 task within seconds rather than after its default of one minute. Start the
 engine with these variables for them:
 

@@ -540,3 +540,81 @@ async def exit_if_worker_doomed(ctx: TaskContext) -> dict:
 async def crash_mid_task(ctx: WorkflowContext) -> dict:
     """Run a task that kills a doomed worker, and complete once another worker runs it."""
     return await ctx.execute_task(exit_if_worker_doomed)
+
+
+# --- A cancellation ends the tasks the workflow had queued ---------------------
+#
+# A task scheduled before the request, that no worker had started, never
+# starts. Observed in-process, keyed by the `key` the harness passes as input.
+
+QUEUED_TASK_RAN: set[str] = set()
+CLEANUP_RAN: set[str] = set()
+QUEUED_TASK_WAIT: dict[str, str] = {}
+
+
+@task(name="cancel_queued", retry=3)
+async def cancel_queued(ctx: TaskContext, key: str) -> str:
+    """The task the workflow queues before it is cancelled. Retries are
+    allowed, so only the cancellation can be what keeps it from running."""
+    QUEUED_TASK_RAN.add(key)
+    return "ran"
+
+
+@task(name="cancel_queued_cleanup", retry=1)
+async def cancel_queued_cleanup(ctx: TaskContext, key: str) -> str:
+    """The cleanup the workflow runs once told it is cancelled."""
+    CLEANUP_RAN.add(key)
+    return "cleaned"
+
+
+@workflow(name="cancel_queued_task")
+async def cancel_queued_task(ctx: WorkflowContext, key: str) -> dict:
+    """Park on a task no worker can start yet; when the wait ends, record how,
+    run cleanup, and let the cancellation end the run."""
+    PARKED_WORKFLOWS.add(key)
+    cancellation: WorkflowError | None = None
+    try:
+        await ctx.execute_task(cancel_queued, key=key)
+        wait = "completed"
+    except TaskError as e:
+        wait = f"task_failed: {e}"
+    except WorkflowError as e:
+        if not _is_cancellation(e):
+            raise
+        wait = "cancellation"
+        cancellation = e
+    QUEUED_TASK_WAIT[key] = wait
+    await ctx.execute_task(cancel_queued_cleanup, key=key)
+    if cancellation is not None:
+        raise cancellation
+    # Not told at the wait: completing lets the harness report the mismatch.
+    return {"queued_task_wait": wait}
+
+
+# --- A task timing out on its last attempt reaches its workflow ---------------
+
+
+@task(name="exit_if_worker_doomed_once", retry=1)
+async def exit_if_worker_doomed_once(ctx: TaskContext) -> dict:
+    """As ``exit_if_worker_doomed``, with a single attempt: the timeout that
+    ends it is its last."""
+    if os.environ.get("ORCHER_CONTRACT_DOOMED_WORKER"):
+        print("contract: exit_if_worker_doomed_once is taking its worker down", file=sys.stderr)
+        sys.stderr.flush()
+        os._exit(3)
+    return {"survived_worker_death": True}
+
+
+@workflow(name="task_timeout_terminal")
+async def task_timeout_terminal(ctx: WorkflowContext) -> dict:
+    """Run a task that takes its worker down on its only attempt, catch the
+    failure its timeout ends in, and report it."""
+    try:
+        await ctx.execute_task(exit_if_worker_doomed_once)
+    except TaskError as e:
+        return {
+            "caught": True,
+            "task_type": e.task_type,
+            "timed_out": "timed out" in str(e).lower(),
+        }
+    return {"caught": False, "task_type": "", "timed_out": False}
