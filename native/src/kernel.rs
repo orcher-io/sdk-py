@@ -365,6 +365,7 @@ struct RestartFreshJson {
     task_queue: String,
     input: Vec<PayloadJson>,
     execution_timeout: Option<DurationJson>,
+    retry_policy: Option<RetryPolicyJson>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -378,6 +379,7 @@ impl From<PayloadJson> for Payload {
         Payload {
             data: payload.data,
             metadata: payload.metadata,
+            ..Default::default()
         }
     }
 }
@@ -416,6 +418,7 @@ impl FailureJson {
             non_retryable: self.non_retryable,
             code: code as i32,
             details: self.details,
+            ..Default::default()
         })
     }
 }
@@ -428,6 +431,7 @@ impl RetryPolicyJson {
             max_delay: self.max_delay.map(Into::into),
             max_attempts: self.max_attempts,
             never_retry_types: self.never_retry_types,
+            ..Default::default()
         }
     }
 }
@@ -452,6 +456,7 @@ impl OutcomeJson {
             result,
             end: end as i32,
             attempts: self.attempts,
+            ..Default::default()
         })
     }
 }
@@ -471,16 +476,19 @@ impl CommandJson {
                 headers: headers(task.headers),
                 priority: task.priority,
                 cost: task.cost,
+                ..Default::default()
             }));
         }
         if let Some(timer) = self.start_timer {
             what.push(command::What::StartTimer(StartTimer {
                 duration: timer.duration.map(Into::into),
+                ..Default::default()
             }));
         }
         if let Some(cancel) = self.cancel_timer {
             what.push(command::What::CancelTimer(CancelTimer {
                 step_id: cancel.step_id,
+                ..Default::default()
             }));
         }
         if let Some(child) = self.start_child {
@@ -501,11 +509,13 @@ impl CommandJson {
                 retry_policy: child.retry_policy.map(RetryPolicyJson::into_policy),
                 headers: headers(child.headers),
                 priority: child.priority,
+                ..Default::default()
             }));
         }
         if let Some(cancel) = self.cancel_child {
             what.push(command::What::CancelChild(CancelChild {
                 step_id: cancel.step_id,
+                ..Default::default()
             }));
         }
         if let Some(event) = self.send_event {
@@ -515,32 +525,38 @@ impl CommandJson {
                 name: event.name,
                 payload: event.payload.map(Into::into),
                 headers: headers(event.headers),
+                ..Default::default()
             }));
         }
         if let Some(record) = self.record_value {
             what.push(command::What::RecordValue(RecordValue {
                 outcome: record.outcome.map(OutcomeJson::into_outcome).transpose()?,
+                ..Default::default()
             }));
         }
         if let Some(wait) = self.await_event {
             what.push(command::What::AwaitEvent(AwaitEvent {
                 name: wait.name,
                 timeout: wait.timeout.map(Into::into),
+                ..Default::default()
             }));
         }
         if let Some(complete) = self.complete_run {
             what.push(command::What::CompleteRun(CompleteRun {
                 result: complete.result.map(Into::into),
+                ..Default::default()
             }));
         }
         if let Some(fail) = self.fail_run {
             what.push(command::What::FailRun(FailRun {
                 failure: fail.failure.map(FailureJson::into_failure).transpose()?,
+                ..Default::default()
             }));
         }
         if let Some(cancelled) = self.end_cancelled {
             what.push(command::What::EndCancelled(EndCancelled {
                 details: cancelled.details,
+                ..Default::default()
             }));
         }
         if let Some(restart) = self.restart_fresh {
@@ -549,11 +565,14 @@ impl CommandJson {
                 task_queue: restart.task_queue,
                 input: payloads(restart.input),
                 execution_timeout: restart.execution_timeout.map(Into::into),
+                retry_policy: restart.retry_policy.map(RetryPolicyJson::into_policy),
+                ..Default::default()
             }));
         }
         if let Some(labels) = self.upsert_labels {
             what.push(command::What::UpsertLabels(UpsertLabels {
                 labels: labels.labels,
+                ..Default::default()
             }));
         }
         if what.len() > 1 {
@@ -564,6 +583,7 @@ impl CommandJson {
             satisfied: self.satisfied,
             step_id: self.step_id,
             what: what.pop(),
+            ..Default::default()
         })
     }
 }
@@ -595,6 +615,7 @@ pub(crate) fn result_from_json(json: &str) -> Result<RunActivationResult, String
                 .into_iter()
                 .map(CommandJson::into_command)
                 .collect::<Result<_, _>>()?,
+            ..Default::default()
         }))
     } else if let Some(failure) = answer.workflow_failed {
         Some(run_activation_result::Outcome::WorkflowFailed(
@@ -611,6 +632,7 @@ pub(crate) fn result_from_json(json: &str) -> Result<RunActivationResult, String
             ProtocolError {
                 message: error.message,
                 kind: kind as i32,
+                ..Default::default()
             },
         ))
     } else {
@@ -631,6 +653,7 @@ pub(crate) fn result_from_json(json: &str) -> Result<RunActivationResult, String
             Ok(QueryAnswer {
                 query_id: query.query_id,
                 answer,
+                ..Default::default()
             })
         })
         .collect::<Result<_, String>>()?;
@@ -654,6 +677,7 @@ pub(crate) fn result_from_json(json: &str) -> Result<RunActivationResult, String
             Ok(UpdateAnswer {
                 update_id: update.update_id,
                 answer,
+                ..Default::default()
             })
         })
         .collect::<Result<_, String>>()?;
@@ -662,6 +686,7 @@ pub(crate) fn result_from_json(json: &str) -> Result<RunActivationResult, String
         outcome,
         queries,
         updates,
+        ..Default::default()
     })
 }
 
@@ -712,6 +737,7 @@ mod tests {
         Payload {
             data: data.as_bytes().to_vec(),
             metadata: [("encoding".to_string(), b"json".to_vec())].into(),
+            ..Default::default()
         }
     }
 
@@ -725,6 +751,7 @@ mod tests {
                 workflow_type: "order".into(),
                 task_queue: "q".into(),
                 namespace: "ns".into(),
+                ..Default::default()
             }),
             resolutions: vec![
                 Resolution {
@@ -751,7 +778,9 @@ mod tests {
                             })),
                             end: End::Failed as i32,
                             attempts: 3,
+                            ..Default::default()
                         }),
+                        ..Default::default()
                     })),
                     ..Default::default()
                 },
@@ -770,6 +799,7 @@ mod tests {
                 Resolution::default(),
             ],
             queries: vec![],
+            ..Default::default()
         };
         let json = activation_json(&activation);
         assert_eq!(json["activation_id"], json!([1, 2]));
@@ -864,6 +894,35 @@ mod tests {
                 nanos: 0
             })
         );
+    }
+
+    /// A restart's retry policy reaches the kernel command; without one the
+    /// fresh run keeps the policy of the run it replaces.
+    #[test]
+    fn a_restart_carries_its_retry_policy() {
+        let restart = |json: &str| {
+            let answer = result_from_json(json).unwrap();
+            let Some(run_activation_result::Outcome::Commands(mut commands)) = answer.outcome
+            else {
+                panic!("{:?}", answer.outcome);
+            };
+            let Some(command::What::RestartFresh(restart)) = commands.commands.remove(0).what
+            else {
+                panic!("not a restart");
+            };
+            restart
+        };
+        let with_policy = restart(
+            r#"{"commands": [{"restart_fresh": {
+                "retry_policy": {"max_attempts": 4, "never_retry_types": ["Invalid"]}
+            }}]}"#,
+        );
+        let policy = with_policy.retry_policy.unwrap();
+        assert_eq!(policy.max_attempts, 4);
+        assert_eq!(policy.never_retry_types, ["Invalid"]);
+        assert_eq!(policy.first_delay, None);
+        let without = restart(r#"{"commands": [{"restart_fresh": {}}]}"#);
+        assert_eq!(without.retry_policy, None);
     }
 
     #[test]
