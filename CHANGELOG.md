@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.4.9](https://github.com/orcher-io/sdk-py/compare/v0.4.8...v0.4.9) (2026-10-15)
+
+
+### Features
+
+* build on sdk-core 0.15 and carry restart timeouts and terminated-child reasons ([#51](https://github.com/orcher-io/sdk-py/issues/51)) ([c9a329e](https://github.com/orcher-io/sdk-py/commit/c9a329e9c7cf9c2e8746d7808aafa72cb2695ac4))
+* run the worker on the shared worker host ([#47](https://github.com/orcher-io/sdk-py/issues/47)) ([7a0490b](https://github.com/orcher-io/sdk-py/commit/7a0490b9ff59587fcf52502559facb232014c88d))
+
+
+### Bug Fixes
+
+* read a workflow run's attempt as the engine numbers it ([#53](https://github.com/orcher-io/sdk-py/issues/53)) ([733fb93](https://github.com/orcher-io/sdk-py/commit/733fb934eb23301c2ca437392146fe12a968d2fb))
+* send the default max attempts when a retry policy omits it ([#55](https://github.com/orcher-io/sdk-py/issues/55)) ([e3c790f](https://github.com/orcher-io/sdk-py/commit/e3c790f493c9f1644b635db6aaa070841744adf4))
+
 ## [0.4.8](https://github.com/orcher-io/sdk-py/compare/v0.4.7...v0.4.8) (2026-10-11)
 
 
