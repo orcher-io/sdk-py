@@ -437,15 +437,7 @@ class WorkflowContext:
             self._observe(task_id)
             cached = self._cached_results[cache_key]
             # A terminal failure arrives as a sentinel: raise it.
-            if isinstance(cached, dict) and cached.get(TASK_FAILED_SENTINEL):
-                from orcher.errors import TaskError
-
-                raise TaskError.execution_failed(
-                    task_id=task_id,
-                    message=cached.get("message", "Task failed"),
-                    task_type=task_name,
-                    attempts=cached.get("attempts", 1),
-                )
+            _raise_if_task_failed(cached, task_id, task_name, "Task failed")
             return_type = self._get_task_return_type(task_fn)
             if (
                 return_type is not None
@@ -579,15 +571,7 @@ class WorkflowContext:
         cache_key = f"task:{step_id}"
         if cache_key in self._cached_results:
             cached = self._cached_results[cache_key]
-            if isinstance(cached, dict) and cached.get(TASK_FAILED_SENTINEL):
-                from orcher.errors import TaskError
-
-                raise TaskError.execution_failed(
-                    task_id=step_id,
-                    message=cached.get("message", "Step failed"),
-                    task_type=step_name,
-                    attempts=cached.get("attempts", 1),
-                )
+            _raise_if_task_failed(cached, step_id, step_name, "Step failed")
             return cached  # type: ignore[no-any-return]
 
         # The run is its own asyncio task, held until it settles: a closure
@@ -694,6 +678,10 @@ class WorkflowContext:
         if cache_key in self._cached_results:
             self._observe(task_id)
             cached = self._cached_results[cache_key]
+            # A creation that failed (no worker had a free slot in time, say)
+            # arrives as a task failure: raise it rather than open a session
+            # with no queue.
+            _raise_if_task_failed(cached, task_id, SESSION_CREATE_TASK, "Session creation failed")
             info = SessionInfo(
                 session_id=cached.get("session_id", session_id),
                 session_queue=cached["session_queue"],
@@ -1547,3 +1535,22 @@ class WorkflowContext:
             # Any failure returns the original dict, so a result that no longer
             # fits the declared type is still delivered.
             return data
+
+
+def _raise_if_task_failed(cached: Any, task_id: str, task_type: str, fallback: str) -> None:
+    """Raise the task failure a journaled result holds, if it is one.
+
+    A terminal task failure is journaled as a sentinel dict; anything else is a
+    result, and this returns.
+    """
+    if isinstance(cached, dict) and cached.get(TASK_FAILED_SENTINEL):
+        from orcher.errors import FailureCode, TaskError
+
+        raise TaskError.execution_failed(
+            task_id=task_id,
+            message=cached.get("message") or fallback,
+            task_type=task_type,
+            attempts=cached.get("attempts", 1),
+            error_type=cached.get("error_type") or "",
+            failure_code=cached.get("code") or FailureCode.UNSPECIFIED,
+        )

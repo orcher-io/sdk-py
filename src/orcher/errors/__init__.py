@@ -9,7 +9,7 @@ The hierarchy mirrors the one in the Rust core. It includes:
 
 from orcher.errors.base import ConfigurationError, OrcherError
 from orcher.errors.client import ClientError
-from orcher.errors.codes import ErrorCode, ErrorSeverity
+from orcher.errors.codes import ErrorCode, ErrorSeverity, FailureCode
 from orcher.errors.context import (
     ContextualError,
     ErrorChain,
@@ -38,6 +38,7 @@ __all__ = [
     # Error codes and severity
     "ErrorCode",
     "ErrorSeverity",
+    "FailureCode",
     # Base error types
     "OrcherError",
     "WorkflowError",

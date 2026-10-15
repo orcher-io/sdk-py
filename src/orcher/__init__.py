@@ -58,6 +58,7 @@ from orcher.errors import (
     ErrorCode,
     ErrorSeverity,
     Failure,
+    FailureCode,
     OrcherError,
     TaskError,
     WorkerError,
@@ -168,6 +169,7 @@ __all__ = [
     "ConfigurationError",
     "ErrorCode",
     "ErrorSeverity",
+    "FailureCode",
     # Worker (runtime)
     "Worker",
     "WorkerBuilder",

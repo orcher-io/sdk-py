@@ -1,10 +1,11 @@
 """Error codes and severity levels for SDK errors."""
 
-from enum import Enum
+from enum import Enum, StrEnum
 
 __all__ = [
     "ErrorCode",
     "ErrorSeverity",
+    "FailureCode",
 ]
 
 
@@ -61,3 +62,22 @@ class ErrorSeverity(Enum):
     WARNING = "WARNING"
     ERROR = "ERROR"
     CRITICAL = "CRITICAL"
+
+
+class FailureCode(StrEnum):
+    """Why a step the engine settled failed, as the engine records it.
+
+    A task failure carries one in ``TaskError.failure_code``. The values are
+    the kernel protocol's ``FailureCode`` names in lower case. The attribute is
+    a plain string, so a code added to the protocol after this release still
+    reaches the workflow's code unchanged; compare it with these members.
+    """
+
+    UNSPECIFIED = "unspecified"
+    APPLICATION = "application"
+    TIMED_OUT = "timed_out"
+    CANCELLED = "cancelled"
+    TERMINATED = "terminated"
+    NON_DETERMINISM = "non_determinism"
+    PAYLOAD_TOO_LARGE = "payload_too_large"
+    INVALID_COMMAND = "invalid_command"

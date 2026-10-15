@@ -242,6 +242,19 @@ async def charge(ctx: TaskContext, order_id: str) -> str:
 Any other exception is retried. `non_retryable` can also be set on a single
 instance before it is raised.
 
+A workflow that catches the failure reads its type and whether the task was
+cancelled from the `TaskError`:
+
+```python
+try:
+    await ctx.execute_task(charge, order_id)
+except TaskError as e:
+    if e.is_cancelled:
+        ...  # the task was cancelled
+    elif e.error_type == "CardDeclined":
+        ...  # ask for another card
+```
+
 </details>
 
 <details>

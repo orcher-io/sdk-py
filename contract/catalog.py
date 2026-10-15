@@ -125,6 +125,16 @@ async def task_non_retryable_listed(ctx: WorkflowContext) -> dict:
     return await _attempts_until_failure(ctx, decline_card)
 
 
+@workflow(name="task_failure_type")
+async def task_failure_type(ctx: WorkflowContext) -> dict:
+    """Catch a task's typed failure and report its type and whether it was cancelled."""
+    try:
+        await ctx.execute_task(decline_card)
+    except TaskError as e:
+        return {"caught": True, "error_type": e.error_type, "cancelled": e.is_cancelled}
+    return {"caught": False, "error_type": "", "cancelled": False}
+
+
 @workflow(name="task_non_retryable_marked")
 async def task_non_retryable_marked(ctx: WorkflowContext) -> dict:
     """A failure raised as non-retryable is not retried."""

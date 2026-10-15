@@ -163,7 +163,10 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
                 cached[f"task:{step_id}"] = {
                     TASK_FAILED_SENTINEL: True,
                     "message": failure.get("message") or "Task failed",
-                    "error_type": failure.get("error_type", ""),
+                    "error_type": failure.get("error_type") or "",
+                    # Why it failed: "application" for a task that raised,
+                    # "cancelled" for one that was cancelled, and so on.
+                    "code": _failure_code(failure, outcome),
                     # How many times the task ran, so a task that exhausted
                     # its retries reports them all.
                     "attempts": outcome.get("attempts"),
@@ -566,3 +569,18 @@ def _decode_json(data: list[int]) -> Any:
         return json.loads(bytes(data).decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return _UNDECODABLE
+
+
+def _failure_code(failure: dict[str, Any], outcome: dict[str, Any]) -> str:
+    """A step failure's code; with none, taken from how the step ended.
+
+    A step that ended cancelled or timed out reads as such when its failure
+    carries no code; any other is ``"unspecified"``.
+    """
+    code = failure.get("code")
+    if code and code != "unspecified":
+        return str(code)
+    end = outcome.get("end")
+    if end in ("cancelled", "timed_out"):
+        return str(end)
+    return "unspecified"
