@@ -119,6 +119,11 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
         workflow_type=run.get("workflow_type", ""),
         task_queue=run.get("task_queue", ""),
         namespace=run.get("namespace") or namespace,
+        # The engine counts a run's attempt from 1 (2 for the run of its first
+        # workflow-level retry) and the kernel hands it over as is. Engines
+        # before orcher#356 numbered the first run 0; it reads as 1, so a first
+        # run is still the first attempt there. On a current engine the floor
+        # never applies.
         attempt=max(int(started.get("attempt") or 1), 1),
         # The workflow's clock starts when the engine recorded the start; an
         # activation that records none starts it now.

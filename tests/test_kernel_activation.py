@@ -74,6 +74,17 @@ def test_the_run_and_its_start_are_loaded() -> None:
     assert loaded.context.replaying is False
 
 
+@pytest.mark.parametrize(("attempt", "reads"), [(1, 1), (2, 2), (0, 1)])
+def test_a_runs_attempt_is_the_one_the_engine_numbered(attempt: int, reads: int) -> None:
+    """A first run is attempt 1 and the run of its first retry attempt 2, as
+    the engine numbers them. An engine before orcher#356 numbers the first
+    run 0, which reads as 1."""
+    start = resolution("started", {"input": [], "attempt": attempt}, at_ms=START_MS)
+    act = activation()
+    act["resolutions"] = [start]
+    assert load_activation(act, "ns").context.info.attempt == reads
+
+
 def test_settled_steps_children_and_timers_are_cached_with_their_times() -> None:
     loaded = load_activation(
         activation(
