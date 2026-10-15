@@ -1,8 +1,12 @@
 """Tests for ORCHER execution contexts."""
 
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from orcher import WorkflowContext
 
 
 class TestWorkflowContext:
@@ -409,3 +413,46 @@ class TestChildWorkflowHandle:
         repr_str = repr(handle)
         assert "child-123" in repr_str
         assert "ChildWorkflow" in repr_str
+
+
+class TestRestartFresh:
+    """ctx.restart_fresh() issues a RestartFresh with what it was given."""
+
+    @staticmethod
+    def _context() -> "WorkflowContext":
+        from orcher import WorkflowContext, WorkflowInfo
+
+        info = WorkflowInfo(
+            workflow_id="wf",
+            run_id="run",
+            workflow_type="Wf",
+            task_queue="q",
+            namespace="ns",
+            attempt=1,
+            started_at=datetime.now(),
+        )
+        return WorkflowContext(info)
+
+    def test_a_restart_carries_its_timeout(self) -> None:
+        from orcher.errors import WorkflowSuspendedError
+
+        ctx = self._context()
+        with pytest.raises(WorkflowSuspendedError):
+            ctx.restart_fresh({"n": 1}, timeout=timedelta(hours=1, milliseconds=500))
+        (command,) = ctx._get_commands()
+        assert command["RestartFresh"]["timeout"] == {"secs": 3600, "nanos": 500_000_000}
+
+    def test_a_restart_without_a_timeout_sends_none(self) -> None:
+        from orcher.errors import WorkflowSuspendedError
+
+        ctx = self._context()
+        with pytest.raises(WorkflowSuspendedError):
+            ctx.restart_fresh({"n": 1})
+        (command,) = ctx._get_commands()
+        assert command["RestartFresh"]["timeout"] is None
+
+    def test_a_restart_timeout_must_be_a_timedelta(self) -> None:
+        ctx = self._context()
+        with pytest.raises(TypeError, match="timedelta"):
+            ctx.restart_fresh({"n": 1}, timeout=60)  # type: ignore[arg-type]
+        assert ctx._get_commands() == []

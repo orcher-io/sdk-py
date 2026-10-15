@@ -55,16 +55,15 @@ async def test_a_child_handle_sends_an_event_and_cancels_once_across_replays() -
     ("how", "reason", "message"),
     [
         ("canceled", "", "child workflow was canceled"),
-        # The kernel protocol of sdk-core 0.14 does not carry the reason a
-        # child was terminated for, so the message cannot name it.
-        ("terminated", "operator", "child workflow was terminated"),
+        ("terminated", "operator", "child workflow was terminated: operator"),
+        ("terminated", "", "child workflow was terminated"),
         ("timed_out", "", "child workflow timed out"),
     ],
 )
 async def test_a_child_that_ends_without_a_result_fails_the_wait(
     how: str, reason: str, message: str
 ) -> None:
-    @workflow(name=f"children-ended-{how}")
+    @workflow(name=f"children-ended-{how}-{reason or 'no-reason'}")
     async def parent(ctx: WorkflowContext) -> str:
         child = await ctx.start_child_workflow("worker")
         try:
