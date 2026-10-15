@@ -84,6 +84,18 @@ class LoadedActivation:
     journaled_updates: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _order(position: int, resolution: dict[str, Any]) -> int:
+    """Where a resolution comes in the order the run observes its outcomes: the
+    sequence the kernel numbered it with. Which of two outcomes came first, a
+    wait's result or a cancellation request, is decided by it, never by their
+    times, which tie within a millisecond. A resolution the kernel did not
+    number (one built by hand) keeps its place in the list, the same order."""
+    sequence = resolution.get("sequence")
+    if isinstance(sequence, int) and sequence > 0:
+        return sequence
+    return position + 1
+
+
 def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivation:
     """Load an activation's resolutions into a context for its run.
 
@@ -138,25 +150,28 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
 
     cached: dict[str, Any] = {}
     resolved_at: dict[str, int] = {}
+    resolved_order: dict[str, int] = {}
     event_times: dict[str, list[int]] = {}
+    event_orders: dict[str, list[int]] = {}
     children: list[str] = []
     journaled_updates: list[dict[str, Any]] = []
     pending_updates: list[AskedUpdate] = []
-    cancel_asked = False
-    cancel_at: int | None = None
+    cancel_order: int | None = None
 
-    def note_resolved_at(key: str, at_ms: Any) -> None:
+    def note_resolved_at(key: str, at_ms: Any, order: int) -> None:
         # The first outcome of a key is the one the run observes.
         if isinstance(at_ms, int) and key not in resolved_at:
             resolved_at[key] = at_ms
+        resolved_order.setdefault(key, order)
 
     for position, resolution in enumerate(resolutions):
         step_id = resolution.get("step_id") or ""
         at_ms = resolution.get("at_ms")
+        order = _order(position, resolution)
         if "started" in resolution:
             continue
         if "step" in resolution:
-            note_resolved_at(step_id, at_ms)
+            note_resolved_at(step_id, at_ms, order)
             outcome = resolution["step"].get("outcome") or {}
             if "failure" in outcome:
                 failure = outcome["failure"] or {}
@@ -181,7 +196,7 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
             key = f"child:{workflow_id}"
             if workflow_id and workflow_id not in children:
                 children.append(workflow_id)
-            note_resolved_at(key, at_ms)
+            note_resolved_at(key, at_ms, order)
             outcome = child.get("outcome") or {}
             end = outcome.get("end", "unspecified")
             failure = outcome.get("failure") or {}
@@ -212,7 +227,7 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
                 children.append(workflow_id)
         elif "timer" in resolution:
             if step_id:
-                note_resolved_at(f"timer:{step_id}", at_ms)
+                note_resolved_at(f"timer:{step_id}", at_ms, order)
                 # Where it fired among the outcomes: a wait with a deadline
                 # takes whichever of its event and its timer came first.
                 cached[f"timer:{step_id}"] = {"fired_at": position}
@@ -226,6 +241,7 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
             cached.setdefault(f"event_positions:{name}", []).append(position)
             if isinstance(at_ms, int):
                 event_times.setdefault(name, []).append(at_ms)
+            event_orders.setdefault(name, []).append(order)
         elif "update" in resolution:
             update = resolution["update"]
             args = update.get("args") or []
@@ -253,19 +269,24 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
                 )
         elif "cancel" in resolution:
             # The first request is the one the run is told of.
-            if not cancel_asked:
-                cancel_asked = True
-                requested = resolution["cancel"].get("requested_at_ms")
-                cancel_at = requested if isinstance(requested, int) else at_ms
+            if cancel_order is None:
+                cancel_order = order
         else:
             raise ProtocolRefusalError(
                 f"a resolution of a kind this SDK does not know: {sorted(resolution)}",
                 "unknown_resolution",
             )
 
-    ctx._record_journal_times({"resolved_at": resolved_at, "events": event_times})
-    if cancel_asked:
-        ctx._note_cancel_requested(cancel_at if isinstance(cancel_at, int) else None)
+    ctx._record_journal_times(
+        {
+            "resolved_at": resolved_at,
+            "events": event_times,
+            "resolved_order": resolved_order,
+            "event_orders": event_orders,
+        }
+    )
+    if cancel_order is not None:
+        ctx._note_cancel_requested(cancel_order)
     ctx._record_journaled_children(children)
     if cached:
         ctx._set_cached_results(cached)

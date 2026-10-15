@@ -33,9 +33,17 @@ def payload(value: Any) -> dict[str, Any]:
 
 
 def resolution(
-    kind: str, what: dict[str, Any], *, step_id: str = "", at_ms: int | None = None
+    kind: str,
+    what: dict[str, Any],
+    *,
+    step_id: str = "",
+    at_ms: int | None = None,
+    sequence: int | None = None,
 ) -> dict[str, Any]:
-    return {"step_id": step_id, "at_ms": at_ms, "replaying": False, kind: what}
+    out = {"step_id": step_id, "at_ms": at_ms, "replaying": False, kind: what}
+    if sequence is not None:
+        out["sequence"] = sequence
+    return out
 
 
 def activation(
@@ -208,8 +216,10 @@ def test_events_updates_and_a_cancel_request_are_loaded() -> None:
         {"update_id": "u1", "update_name": "set", "args": b"2", "at_ms": START_MS + 6}
     ]
     assert [(u.update_id, u.args) for u in loaded.updates] == [("u2", b"3")]
-    # The first request is the one the run is told of.
-    assert ctx._cancel_requested and ctx._cancel_requested_at == START_MS + 7
+    # The first request is the one the run is told of, at its place in the
+    # list when the kernel did not number it: fifth, after the start, the
+    # event and the two updates.
+    assert ctx._cancel_requested and ctx._cancel_requested_order == 5
 
 
 def test_a_resolution_of_an_unknown_kind_is_refused() -> None:
@@ -420,3 +430,49 @@ async def test_an_activation_naming_no_run_is_a_protocol_error() -> None:
     answer = await make_worker().run_activation({"activation_id": [5], "resolutions": []})
     assert answer["activation_id"] == [5]
     assert answer["protocol_error"]["kind"] == "undecodable"
+
+
+def failed_and_asked_to_cancel(failure: int, cancel: int) -> dict[str, Any]:
+    """A run whose task `work_1` failed and that was asked to cancel, both in
+    the same millisecond and listed in that order, numbered as given: the
+    numbers, not the list or the times, say which came first."""
+    return activation(
+        resolution(
+            "step",
+            {
+                "outcome": {
+                    "failure": {"message": "Task cancelled", "error_type": "Cancelled"},
+                    "end": "cancelled",
+                    "attempts": 1,
+                }
+            },
+            step_id="work_1",
+            at_ms=START_MS + 7,
+            sequence=failure,
+        ),
+        resolution(
+            "cancel",
+            {"reason": "", "requested_at_ms": START_MS + 7},
+            at_ms=START_MS + 7,
+            sequence=cancel,
+        ),
+    )
+
+
+def test_a_failure_in_the_requests_millisecond_is_ordered_by_sequence() -> None:
+    before = load_activation(failed_and_asked_to_cancel(2, 3), "ns").context
+    assert before._resolved_order["work_1"] == 2
+    assert before._cancel_requested_order == 3
+
+    after = load_activation(failed_and_asked_to_cancel(3, 2), "ns").context
+    assert after._resolved_order["work_1"] == 3
+    assert after._cancel_requested_order == 2
+
+
+def test_unnumbered_resolutions_keep_their_place_in_the_list() -> None:
+    activation_ = failed_and_asked_to_cancel(3, 2)
+    for r in activation_["resolutions"]:
+        r.pop("sequence", None)
+    ctx = load_activation(activation_, "ns").context
+    assert ctx._resolved_order["work_1"] == 2
+    assert ctx._cancel_requested_order == 3

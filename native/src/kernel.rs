@@ -58,6 +58,9 @@ pub(crate) fn activation_json(activation: &RunActivation) -> Value {
             out.insert("step_id".into(), json!(resolution.step_id));
             out.insert("at_ms".into(), json!(resolution.at.as_ref().map(millis)));
             out.insert("replaying".into(), json!(resolution.replaying));
+            // Where it comes in the run's order of outcomes: which of two came
+            // first is decided by it, never by their times.
+            out.insert("sequence".into(), json!(resolution.sequence));
             let (kind, what) = match &resolution.what {
                 Some(resolution::What::Started(started)) => ("started", json!({
                     "input": started.input.iter().map(payload_json).collect::<Vec<_>>(),
@@ -738,6 +741,7 @@ mod tests {
                 },
                 Resolution {
                     step_id: "charge_1".into(),
+                    sequence: 2,
                     what: Some(resolution::What::Step(StepSettled {
                         outcome: Some(Outcome {
                             result: Some(outcome::Result::Failure(Failure {
@@ -773,6 +777,7 @@ mod tests {
         let resolutions = json["resolutions"].as_array().unwrap();
         assert_eq!(resolutions[0]["at_ms"], 2005);
         assert_eq!(resolutions[0]["started"]["input"][0]["data"], json!(b"{}"));
+        assert_eq!(resolutions[1]["sequence"], 2);
         assert_eq!(resolutions[1]["step"]["outcome"]["end"], "failed");
         assert_eq!(
             resolutions[1]["step"]["outcome"]["failure"]["code"],

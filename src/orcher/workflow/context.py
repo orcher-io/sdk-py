@@ -207,15 +207,24 @@ class WorkflowContext:
         # moves the workflow's clock there.
         self._resolved_at: dict[str, int] = {}
 
-        # When each buffered event was journaled, per name, oldest first.
-        self._event_times: dict[str, list[int]] = {}
+        # Where each of those results comes in the order the run observes its
+        # outcomes (the kernel's resolution sequence), keyed the same way.
+        # Which of a result and a cancellation request came first is decided by
+        # it, never by times, which tie within a millisecond.
+        self._resolved_order: dict[str, int] = {}
 
-        # A request to cancel the workflow, if the journal holds one, and when it
-        # was journaled. The code is told once, at the first wait whose result
-        # the journal did not record before the request: the same wait on every
-        # replay, since the code's order and the journal's times are both fixed.
+        # When each buffered event was journaled, per name, oldest first, and
+        # where each comes in the run's order of outcomes.
+        self._event_times: dict[str, list[int]] = {}
+        self._event_orders: dict[str, list[int]] = {}
+
+        # A request to cancel the workflow, if the journal holds one, and where
+        # it comes in the run's order of outcomes. The code is told once, at the
+        # first wait whose result does not come before the request: the same
+        # wait on every replay, since the code's order and the history's order
+        # are both fixed.
         self._cancel_requested = False
-        self._cancel_requested_at: int | None = None
+        self._cancel_requested_order: int | None = None
         self._cancel_delivered = False
 
         # Updates the engine already answered, oldest first, each with when it
@@ -432,7 +441,11 @@ class WorkflowContext:
         # A journaled result means the task already ran: return it instead of
         # scheduling the task again.
         cache_key = f"task:{task_id}"
-        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(task_id))
+        await self._at_wait(
+            cache_key in self._cached_results,
+            self._resolved_at.get(task_id),
+            self._resolved_order.get(task_id),
+        )
         if cache_key in self._cached_results:
             self._observe(task_id)
             cached = self._cached_results[cache_key]
@@ -672,7 +685,11 @@ class WorkflowContext:
         task_id = f"{SESSION_CREATE_TASK}_{sequence}"
         self._reach(task_id)
         cache_key = f"task:{task_id}"
-        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(task_id))
+        await self._at_wait(
+            cache_key in self._cached_results,
+            self._resolved_at.get(task_id),
+            self._resolved_order.get(task_id),
+        )
 
         # On replay, the creation task's journaled result is a serialized SessionInfo.
         if cache_key in self._cached_results:
@@ -752,7 +769,11 @@ class WorkflowContext:
 
         # A fired timer is in the journal: the sleep is over.
         cache_key = f"timer:{timer_id}"
-        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(cache_key))
+        await self._at_wait(
+            cache_key in self._cached_results,
+            self._resolved_at.get(cache_key),
+            self._resolved_order.get(cache_key),
+        )
         if cache_key in self._cached_results:
             self._observe(cache_key)
             return
@@ -855,7 +876,11 @@ class WorkflowContext:
         """A child's result from the journal: returned, raised if the child
         failed or ended without one, or the workflow suspends until it ends."""
         cache_key = f"child:{workflow_id}"
-        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(cache_key))
+        await self._at_wait(
+            cache_key in self._cached_results,
+            self._resolved_at.get(cache_key),
+            self._resolved_order.get(cache_key),
+        )
         if cache_key not in self._cached_results:
             from orcher.errors import WorkflowSuspendedError
 
@@ -949,15 +974,25 @@ class WorkflowContext:
         # recorded first; if neither came before a cancellation request, the
         # request is delivered here.
         received_at: list[int | None] = []
+        received_order: list[int | None] = []
         if buffer:
             event_times = self._event_times.get(event_name)
             received_at.append(event_times[0] if event_times else None)
+            event_orders = self._event_orders.get(event_name)
+            received_order.append(event_orders[0] if event_orders else None)
         if timer_fired:
             received_at.append(self._resolved_at.get(f"timer:{timer_id}"))
+            received_order.append(self._resolved_order.get(f"timer:{timer_id}"))
         known = [at for at in received_at if at is not None]
+        known_order = [order for order in received_order if order is not None]
         await self._at_wait(
             bool(received_at),
             min(known) if known and len(known) == len(received_at) else None,
+            (
+                min(known_order)
+                if known_order and len(known_order) == len(received_order)
+                else None
+            ),
         )
         if buffer:
             event_at = positions[0] if positions else -math.inf
@@ -969,6 +1004,9 @@ class WorkflowContext:
                 times = self._event_times.get(event_name)
                 if times:
                     self._time._advance_to_ms(times.pop(0))
+                orders = self._event_orders.get(event_name)
+                if orders:
+                    orders.pop(0)
                 if isinstance(data, list):
                     data = bytes(data)
                 if data:
@@ -1146,7 +1184,11 @@ class WorkflowContext:
         self._reach(timer_id, "timer")
 
         cache_key = f"timer:{timer_id}"
-        await self._at_wait(cache_key in self._cached_results, self._resolved_at.get(cache_key))
+        await self._at_wait(
+            cache_key in self._cached_results,
+            self._resolved_at.get(cache_key),
+            self._resolved_order.get(cache_key),
+        )
         if cache_key in self._cached_results:
             self._observe(cache_key)
             return
@@ -1380,19 +1422,23 @@ class WorkflowContext:
         """
         return self._cancel_delivered
 
-    def _note_cancel_requested(self, at_ms: int | None) -> None:
-        """The journal holds a request to cancel the workflow, journaled at
-        ``at_ms`` (ms since the epoch) when known."""
+    def _note_cancel_requested(self, order: int | None) -> None:
+        """The journal holds a request to cancel the workflow, at ``order`` in
+        the order the run observes its outcomes when known. The first request
+        is the one the run is told of; a later one changes nothing."""
+        if self._cancel_requested:
+            return
         self._cancel_requested = True
-        self._cancel_requested_at = at_ms
+        self._cancel_requested_order = order
 
-    async def _at_wait(self, present: bool, at_ms: int | None) -> None:
+    async def _at_wait(self, present: bool, at_ms: int | None, order: int | None = None) -> None:
         """What the code learns at a wait before its result: the updates that
         came before that result run, then a cancellation request may be
-        delivered. ``present`` says whether the journal holds the wait's result
-        and ``at_ms`` when it was journaled, if known."""
+        delivered. ``present`` says whether the journal holds the wait's result,
+        ``at_ms`` when it was journaled and ``order`` where it comes in the
+        run's order of outcomes, if known."""
         await self._replay_updates(before_ms=at_ms if present else None, every=not present)
-        self._cancellation(present, at_ms)
+        self._cancellation(present, order)
 
     def _record_journaled_updates(
         self,
@@ -1423,17 +1469,18 @@ class WorkflowContext:
             if self._update_replayer is not None:
                 await self._update_replayer(update)
 
-    def _cancellation(self, present: bool, at_ms: int | None) -> None:
+    def _cancellation(self, present: bool, order: int | None) -> None:
         """Raise the cancellation here if this wait is where the code learns of
         the request: one has come, the code has not been told, and this wait's
-        result (``present``, journaled at ``at_ms`` if known) was not journaled
-        before it. A result journaled no later than the request is received; one
-        with no known time is too, since it exists."""
+        result (``present``, at ``order`` in the run's order of outcomes if
+        known) does not come before it. A result that comes before the request
+        is received; one with no known place is too, since it exists. The
+        order decides, never times, which tie within a millisecond."""
         if not self._cancel_requested or self._cancel_delivered:
             return
         if present:
-            requested_at = self._cancel_requested_at
-            if at_ms is None or requested_at is None or at_ms <= requested_at:
+            requested = self._cancel_requested_order
+            if order is None or requested is None or order < requested:
                 return
         self._cancel_delivered = True
         from orcher.errors import WorkflowError
@@ -1444,15 +1491,21 @@ class WorkflowContext:
         """Record when the engine journaled what this activation can hand the
         workflow (internal; the worker calls it before the workflow runs).
 
-        ``times`` is what the native layer reads from the journal:
-        ``resolved_at`` keyed as the results are, and ``events``, each event
-        name's times in journal order.
+        ``times`` is what the activation holds: ``resolved_at`` keyed as the
+        results are, and ``events``, each event name's times in journal order;
+        ``resolved_order`` and ``event_orders`` the same for where each comes
+        in the run's order of outcomes.
         """
         for key, at_ms in (times.get("resolved_at") or {}).items():
             if isinstance(at_ms, int):
                 self._resolved_at[key] = at_ms
         for name, at in (times.get("events") or {}).items():
             self._event_times[name] = [ms for ms in at if isinstance(ms, int)]
+        for key, order in (times.get("resolved_order") or {}).items():
+            if isinstance(order, int):
+                self._resolved_order[key] = order
+        for name, orders in (times.get("event_orders") or {}).items():
+            self._event_orders[name] = [o for o in orders if isinstance(o, int)]
 
     def _clear_commands(self) -> None:
         """Clear commands (internal)."""
