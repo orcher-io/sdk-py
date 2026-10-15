@@ -112,19 +112,11 @@ empty directory; the worker writes every activation it receives and every
 answer it gives there. Commit only the `*-activation.pb` files: the answers
 carry the worker's identity, which names the machine.
 
-## Known gaps of the kernel protocol (sdk-core 0.14)
+## Known gaps of the kernel protocol (sdk-core 0.15)
 
-Until the SDK moves to sdk-core 0.15:
-
-- A workflow restarted with fresh history and a timeout is refused with a
-  protocol error, which hands the activation back to the engine; the kernel
-  protocol does not carry the timeout. `ctx.restart_fresh()` takes no
-  timeout, so no workflow written against this SDK's API hits it.
-- The reason a child workflow was terminated for is lost: the parent's
-  `WorkflowError` says only that the child was terminated.
 - A failed workflow's traceback and the steps it reached do not reach the
-  engine, and its failure is reported as an ordinary workflow failure even
-  when the code no longer replays its history.
+  engine. A workflow whose code no longer replays its history is reported as
+  non-determinism, so the engine holds the run rather than failing it.
 
 ## Differences between SDKs
 

@@ -1310,6 +1310,7 @@ class WorkflowContext:
         *,
         workflow_type: str | None = None,
         task_queue: str | None = None,
+        timeout: timedelta | None = None,
     ) -> None:
         """Restart the workflow with a fresh execution history.
 
@@ -1321,8 +1322,12 @@ class WorkflowContext:
             input: Input for the new execution.
             workflow_type: Optional different workflow type.
             task_queue: Optional different task queue.
+            timeout: Optional execution timeout for the new execution, as a
+                ``timedelta``.
 
         Raises:
+            TypeError: ``timeout`` is not a ``timedelta``; a bare number's
+                unit would be ambiguous.
             WorkflowSuspendedError: Always. The native layer performs the
                 restart.
 
@@ -1335,6 +1340,10 @@ class WorkflowContext:
         # Field names and shape must match sdk-core's RestartFreshCommand:
         # workflow_type is a required string ("" means the same type), input is
         # a list of Payloads, and task_queue and timeout are optional.
+        if timeout is not None and not isinstance(timeout, timedelta):
+            raise TypeError(
+                f"restart_fresh timeout must be a timedelta, not {type(timeout).__name__}"
+            )
         input_bytes = json.dumps(input).encode("utf-8") if input is not None else b"null"
         input_payload = {
             "data": list(input_bytes),
@@ -1346,7 +1355,7 @@ class WorkflowContext:
                     "workflow_type": workflow_type or "",
                     "input": [input_payload],
                     "task_queue": task_queue,
-                    "timeout": None,
+                    "timeout": _duration_parts(timeout) if timeout is not None else None,
                 }
             }
         )

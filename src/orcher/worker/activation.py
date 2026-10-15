@@ -181,8 +181,14 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
             elif end == "cancelled":
                 cached[key] = _child_failed("child workflow was canceled")
             elif end == "terminated":
-                # The kernel does not carry the reason a child was terminated.
-                cached[key] = _child_failed("child workflow was terminated")
+                # The failure's message is the reason given for the
+                # termination, empty when none was.
+                reason = failure.get("message") or ""
+                cached[key] = _child_failed(
+                    f"child workflow was terminated: {reason}"
+                    if reason
+                    else "child workflow was terminated"
+                )
             elif end == "timed_out":
                 cached[key] = _child_failed("child workflow timed out")
             elif "value" in outcome:
@@ -469,15 +475,12 @@ def _kernel_command(command: dict[str, Any]) -> dict[str, Any]:
     if kind == "CancelWorkflowExecution":
         return {"end_cancelled": {"details": ""}}
     if kind == "RestartFresh":
-        if fields.get("timeout") is not None:
-            raise ProtocolRefusalError(
-                "the workflow restarted with a timeout, which the kernel protocol does not carry"
-            )
         return {
             "restart_fresh": {
                 "workflow_type": fields.get("workflow_type") or "",
                 "task_queue": fields.get("task_queue") or "",
                 "input": [_payload(p) for p in fields.get("input") or []],
+                "execution_timeout": fields.get("timeout"),
             }
         }
     raise ProtocolRefusalError(

@@ -107,7 +107,10 @@ def test_settled_steps_children_and_timers_are_cached_with_their_times() -> None
             ),
             resolution(
                 "child",
-                {"child_workflow_id": "gone", "outcome": {"end": "terminated"}},
+                {
+                    "child_workflow_id": "gone",
+                    "outcome": {"failure": {"message": "operator"}, "end": "terminated"},
+                },
                 step_id="gone",
             ),
             resolution("child_started", {"child_workflow_id": "child_9"}, step_id="child_9"),
@@ -129,7 +132,7 @@ def test_settled_steps_children_and_timers_are_cached_with_their_times() -> None
     assert cached["child:kid"] == "ok"
     assert cached["child:gone"] == {
         CHILD_FAILED_SENTINEL: True,
-        "message": "child workflow was terminated",
+        "message": "child workflow was terminated: operator",
     }
     assert ctx._resolved_at == {
         "charge_1": START_MS + 10,
@@ -252,7 +255,7 @@ def test_steps_reached_after_the_last_issued_one_are_still_reported() -> None:
     assert [c["satisfied"] for c in commands] == [True, True]
 
 
-def test_a_restart_with_a_timeout_is_refused_as_a_protocol_error() -> None:
+def test_a_restart_carries_its_execution_timeout() -> None:
     answer = answer_activation(
         [9],
         commands=[
@@ -267,8 +270,9 @@ def test_a_restart_with_a_timeout_is_refused_as_a_protocol_error() -> None:
         ],
         reached=[],
     )
-    assert "commands" not in answer
-    assert "timeout" in answer["protocol_error"]["message"]
+    assert "protocol_error" not in answer
+    (restart,) = answer["commands"]
+    assert restart["restart_fresh"]["execution_timeout"] == {"secs": 5, "nanos": 0}
 
 
 def test_queries_and_updates_are_answered_in_the_kernels_shape() -> None:

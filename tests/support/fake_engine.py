@@ -203,10 +203,11 @@ class FakeEngine:
                     child_ended(a, "cancelled", "Child workflow was canceled"),
                 )
             elif kind == "child_terminated":
-                # The kernel does not carry the reason a child was terminated.
+                # The kernel carries the reason given for the termination as
+                # the failure's message, empty when none was.
                 resolve(
                     a["workflow_id"], at_ms, "child",
-                    child_ended(a, "terminated", "Child workflow was terminated"),
+                    child_ended(a, "terminated", a["reason"]),
                 )
             elif kind == "child_timed_out":
                 resolve(
@@ -256,7 +257,7 @@ class FakeEngine:
     def _check_left_behind(self, result: dict[str, Any]) -> None:
         reached = result.get("reached_steps")
         if not result["successful"]:
-            # The kernel protocol of sdk-core 0.14 does not carry the steps a
+            # The kernel protocol (sdk-core 0.15) does not carry the steps a
             # failed run reached.
             reached = []
         if not isinstance(reached, list):

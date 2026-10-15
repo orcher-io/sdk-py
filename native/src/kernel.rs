@@ -361,6 +361,7 @@ struct RestartFreshJson {
     workflow_type: String,
     task_queue: String,
     input: Vec<PayloadJson>,
+    execution_timeout: Option<DurationJson>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -544,6 +545,7 @@ impl CommandJson {
                 workflow_type: restart.workflow_type,
                 task_queue: restart.task_queue,
                 input: payloads(restart.input),
+                execution_timeout: restart.execution_timeout.map(Into::into),
             }));
         }
         if let Some(labels) = self.upsert_labels {
@@ -833,6 +835,30 @@ mod tests {
             answer.updates[0].answer,
             Some(update_answer::Answer::Rejected(_))
         ));
+    }
+
+    /// A restart keeps the execution timeout the workflow asked for.
+    #[test]
+    fn a_restart_carries_its_execution_timeout() {
+        let answer = result_from_json(
+            r#"{"commands": [{"restart_fresh": {
+                "execution_timeout": {"secs": 3600, "nanos": 0}
+            }}]}"#,
+        )
+        .unwrap();
+        let Some(run_activation_result::Outcome::Commands(commands)) = answer.outcome else {
+            panic!("{:?}", answer.outcome);
+        };
+        let Some(command::What::RestartFresh(restart)) = &commands.commands[0].what else {
+            panic!("{:?}", commands.commands);
+        };
+        assert_eq!(
+            restart.execution_timeout,
+            Some(Duration {
+                seconds: 3600,
+                nanos: 0
+            })
+        );
     }
 
     #[test]
