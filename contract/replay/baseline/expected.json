@@ -112,6 +112,7 @@
             }
           ],
           "orphan_policy": "Cancel",
+          "retry_policy": null,
           "sequence": 1,
           "task_queue": "contract",
           "timeout": null,
@@ -205,6 +206,7 @@
             }
           ],
           "orphan_policy": "Cancel",
+          "retry_policy": null,
           "sequence": 1,
           "task_queue": "contract",
           "timeout": null,
@@ -231,6 +233,7 @@
             }
           ],
           "orphan_policy": "Cancel",
+          "retry_policy": null,
           "sequence": 2,
           "task_queue": "contract",
           "timeout": null,
@@ -271,6 +274,7 @@
             }
           ],
           "orphan_policy": "Cancel",
+          "retry_policy": null,
           "sequence": 2,
           "task_queue": "contract",
           "timeout": null,
@@ -1346,6 +1350,7 @@
               }
             }
           ],
+          "retry_policy": null,
           "task_queue": null,
           "timeout": null,
           "workflow_type": ""
@@ -1883,6 +1888,7 @@
             }
           ],
           "orphan_policy": "Cancel",
+          "retry_policy": null,
           "sequence": 1,
           "task_queue": "contract",
           "timeout": null,

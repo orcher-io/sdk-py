@@ -206,6 +206,7 @@ fn json_payload(data: Vec<u8>) -> Payload {
     Payload {
         data,
         metadata: [("encoding".to_string(), b"json".to_vec())].into(),
+        ..Default::default()
     }
 }
 
@@ -344,6 +345,7 @@ impl PyWorkerHost {
             host.complete_task(TaskOutcome {
                 token,
                 result: Some(task_outcome::Result::Value(json_payload(result))),
+                ..Default::default()
             })
             .await
             .map_err(|e| host_error("the task's result was not taken", e))
@@ -373,6 +375,7 @@ impl PyWorkerHost {
                     non_retryable,
                     ..Default::default()
                 })),
+                ..Default::default()
             })
             .await
             .map_err(|e| host_error("the task's failure was not taken", e))
@@ -408,6 +411,7 @@ impl PyWorkerHost {
                 operation_id,
                 execution_id,
                 result: Some(actor_result::Result::Value(json_payload(result))),
+                ..Default::default()
             })
             .await
             .map_err(|e| host_error("the actor operation's result was not taken", e))
@@ -435,6 +439,7 @@ impl PyWorkerHost {
                     error_type,
                     ..Default::default()
                 })),
+                ..Default::default()
             })
             .await
             .map_err(|e| host_error("the actor operation's failure was not taken", e))
