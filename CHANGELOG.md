@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.10](https://github.com/orcher-io/sdk-py/compare/v0.4.9...v0.4.10) (2026-10-17)
+
+
+### Features
+
+* expose a task failure's error type and whether it was cancelled ([#57](https://github.com/orcher-io/sdk-py/issues/57)) ([7be00a8](https://github.com/orcher-io/sdk-py/commit/7be00a89bc5f9e11f077a35740ecd61bbd724ec5))
+
+
+### Bug Fixes
+
+* deliver a cancellation by the kernel's order of outcomes ([#54](https://github.com/orcher-io/sdk-py/issues/54)) ([eb91a60](https://github.com/orcher-io/sdk-py/commit/eb91a609ddad9646554054b371bfdaf33fb9f490))
+
 ## [0.4.9](https://github.com/orcher-io/sdk-py/compare/v0.4.8...v0.4.9) (2026-10-15)
 
 

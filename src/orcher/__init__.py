@@ -24,7 +24,7 @@ Example:
 
 from __future__ import annotations
 
-__version__ = "0.4.9"  # x-release-please-version
+__version__ = "0.4.10"  # x-release-please-version
 
 # Actor types and client API
 from orcher.actor import ActorContext, ActorKey, OperationMode, SharedActorContext
