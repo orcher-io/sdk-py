@@ -71,6 +71,24 @@ def _duration_parts(td: timedelta) -> dict:
     return {"secs": secs, "nanos": nanos}
 
 
+def _workflow_retry_policy(rp: RetryPolicy | None) -> dict | None:
+    """A child's or a restart-fresh's retry policy, as the context's commands
+    carry it: every field as given, so ``max_attempts`` counts the first run,
+    0 retries without limit, and a policy that leaves it alone sends 3.
+    ``None`` sends no policy."""
+    if rp is None:
+        return None
+    if not isinstance(rp, RetryPolicy):
+        raise TypeError(f"retry_policy must be a RetryPolicy, not {type(rp).__name__}")
+    return {
+        "max_attempts": rp.max_attempts,
+        "initial_interval": _duration_parts(rp.initial_interval),
+        "max_interval": _duration_parts(rp.max_interval),
+        "backoff_coefficient": rp.backoff_coefficient,
+        "non_retryable_errors": list(rp.non_retryable_error_types),
+    }
+
+
 def _normalize_retry_policy(rp: Any) -> dict | None:
     """Convert a retry policy into the shape sdk-core expects.
 
@@ -805,6 +823,7 @@ class WorkflowContext:
         workflow_id: str | None = None,
         args: tuple[Any, ...] = (),
         task_queue: str | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> Any:
         """Start a child workflow and wait for its result.
 
@@ -821,6 +840,12 @@ class WorkflowContext:
                 its parameters after the context. A single dict argument is
                 spread as keyword arguments.
             task_queue: Optional task queue (defaults to parent's queue).
+            retry_policy: How the child is retried when a run of it fails,
+                with the same meaning as a workflow start's: ``max_attempts``
+                counts the first run, ``0`` retries without limit, and a
+                policy that leaves it alone allows 3. When omitted, no policy
+                is sent: a failed child is not retried and its failure
+                reaches the parent.
 
         Returns:
             The value the child workflow returned, as in the Rust and
@@ -828,6 +853,7 @@ class WorkflowContext:
             ``WorkflowError``. To hold a handle and interact with a running
             child (events, cancel), use ``start_child_workflow`` instead.
         """
+        child_retry_policy = _workflow_retry_policy(retry_policy)
         # One number from the step counter on every path. A child given no id
         # is named after its parent and that number, so the id is the same on
         # every replay; the engine echoes it back with the child's outcome.
@@ -853,7 +879,8 @@ class WorkflowContext:
 
         # Field names and shape must match sdk-core's StartChildWorkflowCommand
         # (sequence, workflow_id, workflow_type, task_queue, input, timeout,
-        # orphan_policy), or the native bridge rejects the whole command batch.
+        # orphan_policy, retry_policy), or the native bridge rejects the whole
+        # command batch.
         self._commands.append(
             {
                 "StartChildWorkflow": {
@@ -864,6 +891,7 @@ class WorkflowContext:
                     "input": [input_payload],
                     "timeout": None,
                     "orphan_policy": "Cancel",
+                    "retry_policy": child_retry_policy,
                 }
             }
         )
@@ -1220,6 +1248,7 @@ class WorkflowContext:
         workflow_id: str | None = None,
         args: tuple[Any, ...] = (),
         task_queue: str | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> ChildWorkflowHandle[Any]:
         """Start a child workflow without waiting for its result.
 
@@ -1237,6 +1266,9 @@ class WorkflowContext:
                 ``execute_child_workflow``.
             args: Arguments to pass, as for ``execute_child_workflow``.
             task_queue: Optional task queue (defaults to parent's queue).
+            retry_policy: How the child is retried, as for
+                ``execute_child_workflow``. When omitted, a failed child is
+                not retried.
 
         Returns:
             A handle for later interaction with the child.
@@ -1246,6 +1278,7 @@ class WorkflowContext:
             >>> b = await ctx.start_child_workflow("reserve", args=(order,))
             >>> charged, reserved = await a.result(), await b.result()
         """
+        child_retry_policy = _workflow_retry_policy(retry_policy)
         # One number from the step counter on every path; a child given no id
         # is named after its parent and that number (see _default_child_id).
         sequence = self._next_sequence()
@@ -1281,6 +1314,7 @@ class WorkflowContext:
                     "input": [input_payload],
                     "timeout": None,
                     "orphan_policy": "Cancel",
+                    "retry_policy": child_retry_policy,
                 }
             }
         )
@@ -1341,6 +1375,7 @@ class WorkflowContext:
         workflow_type: str | None = None,
         task_queue: str | None = None,
         timeout: timedelta | None = None,
+        retry_policy: RetryPolicy | None = None,
     ) -> None:
         """Restart the workflow with a fresh execution history.
 
@@ -1354,10 +1389,16 @@ class WorkflowContext:
             task_queue: Optional different task queue.
             timeout: Optional execution timeout for the new execution, as a
                 ``timedelta``.
+            retry_policy: Optional retry policy for the new execution, with
+                the same meaning as a workflow start's: ``max_attempts``
+                counts the first run, ``0`` retries without limit, and a
+                policy that leaves it alone allows 3. When omitted, no policy
+                is sent and the new execution keeps the current one.
 
         Raises:
             TypeError: ``timeout`` is not a ``timedelta``; a bare number's
-                unit would be ambiguous.
+                unit would be ambiguous. Or ``retry_policy`` is not a
+                ``RetryPolicy``.
             WorkflowSuspendedError: Always. The native layer performs the
                 restart.
 
@@ -1369,11 +1410,13 @@ class WorkflowContext:
         """
         # Field names and shape must match sdk-core's RestartFreshCommand:
         # workflow_type is a required string ("" means the same type), input is
-        # a list of Payloads, and task_queue and timeout are optional.
+        # a list of Payloads, and task_queue, timeout and retry_policy are
+        # optional.
         if timeout is not None and not isinstance(timeout, timedelta):
             raise TypeError(
                 f"restart_fresh timeout must be a timedelta, not {type(timeout).__name__}"
             )
+        restart_retry_policy = _workflow_retry_policy(retry_policy)
         input_bytes = json.dumps(input).encode("utf-8") if input is not None else b"null"
         input_payload = {
             "data": list(input_bytes),
@@ -1386,6 +1429,7 @@ class WorkflowContext:
                     "input": [input_payload],
                     "task_queue": task_queue,
                     "timeout": _duration_parts(timeout) if timeout is not None else None,
+                    "retry_policy": restart_retry_policy,
                 }
             }
         )
