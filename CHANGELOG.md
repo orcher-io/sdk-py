@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.11](https://github.com/orcher-io/sdk-py/compare/v0.4.10...v0.4.11) (2026-10-18)
+
+
+### Features
+
+* let a child workflow and a restart-fresh set their retry policy ([#61](https://github.com/orcher-io/sdk-py/issues/61)) ([1de93f2](https://github.com/orcher-io/sdk-py/commit/1de93f2bd5eea9e336fbd22b47b1aa7de78efa75)), closes [#59](https://github.com/orcher-io/sdk-py/issues/59)
+
 ## [0.4.10](https://github.com/orcher-io/sdk-py/compare/v0.4.9...v0.4.10) (2026-10-17)
 
 
