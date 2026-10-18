@@ -460,6 +460,7 @@ def _kernel_command(command: dict[str, Any]) -> dict[str, Any]:
                 "input": [_payload(p) for p in fields.get("input") or []],
                 "execution_timeout": fields.get("timeout"),
                 "orphan_policy": str(fields.get("orphan_policy") or "cancel").lower(),
+                "retry_policy": _retry_policy(fields.get("retry_policy")),
             },
         }
     if kind == "CancelChildWorkflow":
@@ -511,6 +512,7 @@ def _kernel_command(command: dict[str, Any]) -> dict[str, Any]:
                 "task_queue": fields.get("task_queue") or "",
                 "input": [_payload(p) for p in fields.get("input") or []],
                 "execution_timeout": fields.get("timeout"),
+                "retry_policy": _retry_policy(fields.get("retry_policy")),
             }
         }
     raise ProtocolRefusalError(

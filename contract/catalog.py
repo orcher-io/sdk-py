@@ -13,7 +13,15 @@ import sys
 from datetime import timedelta
 from typing import Any
 
-from orcher import TaskContext, TaskError, WorkflowContext, WorkflowError, task, workflow
+from orcher import (
+    RetryPolicy,
+    TaskContext,
+    TaskError,
+    WorkflowContext,
+    WorkflowError,
+    task,
+    workflow,
+)
 
 # The Python SDK spreads a workflow's input object into keyword arguments, so a
 # `{"message": ...}` input binds the `message` parameter. The contract asserts
@@ -208,6 +216,29 @@ async def parent_catches_child_failure(ctx: WorkflowContext) -> dict:
     except WorkflowError:
         return {"child_failed": True}
     return {"child_failed": False}
+
+
+@workflow(name="fails_first_run")
+async def fails_first_run(ctx: WorkflowContext) -> dict:
+    """A child workflow that fails on its first run and succeeds on any later
+    one, reporting the attempt it ran as."""
+    if ctx.info.attempt == 1:
+        raise WorkflowError.execution_failed(
+            workflow_id="fails_first_run", message="intentional failure of the first run"
+        )
+    return {"attempt": ctx.info.attempt}
+
+
+@workflow(name="parent_retries_child")
+async def parent_retries_child(ctx: WorkflowContext) -> dict:
+    """Start a child workflow with a retry policy of two attempts. The child's
+    first run fails and the engine retries it; the parent receives the second
+    run's success."""
+    out = await ctx.execute_child_workflow(
+        "fails_first_run",
+        retry_policy=RetryPolicy(max_attempts=2, initial_interval=timedelta(seconds=1)),
+    )
+    return {"child_succeeded": True, "child_attempt": out["attempt"]}
 
 
 @workflow(name="restart_once")
