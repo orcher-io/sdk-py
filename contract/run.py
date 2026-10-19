@@ -46,6 +46,28 @@ def json_matches(expected: Any, actual: Any) -> bool:
         return len(expected) == len(actual) and all(
             json_matches(e, a) for e, a in zip(expected, actual, strict=False)
         )
+    return json_equal(expected, actual)
+
+
+def json_equal(expected: Any, actual: Any) -> bool:
+    """Exact match: equal JSON with no extra fields, for ``expect.result_exact``.
+
+    Python's ``==`` takes ``0`` for ``False``; JSON does not, so a boolean only
+    matches a boolean here. Numbers compare by value, as JSON numbers do."""
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return type(expected) is type(actual) and expected == actual
+    if isinstance(expected, (int, float)) and isinstance(actual, (int, float)):
+        return expected == actual
+    if type(expected) is not type(actual):
+        return False
+    if isinstance(expected, dict):
+        return expected.keys() == actual.keys() and all(
+            json_equal(v, actual[k]) for k, v in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(expected) == len(actual) and all(
+            json_equal(e, a) for e, a in zip(expected, actual, strict=False)
+        )
     return expected == actual
 
 
@@ -171,9 +193,16 @@ async def run_scenario(client: Client, args: argparse.Namespace, sc: dict) -> tu
             f"took too long: {elapsed_ms:.0f}ms > {max_elapsed}ms (waited far longer than asked)"
         )
 
-    if json_matches(expect.get("result", {}), result):
+    if expect.get("result_exact"):
+        matched = json_equal(expect.get("result"), result)
+    else:
+        matched = json_matches(expect.get("result", {}), result)
+    if matched:
         return True, ""
-    return False, (f"result mismatch\n    expected: {expect.get('result')}\n    actual:   {result}")
+    return False, (
+        f"result mismatch\n    expected: {json.dumps(expect.get('result'))}"
+        f"\n    actual:   {json.dumps(result)}"
+    )
 
 
 async def run_reset_scenario(
@@ -361,6 +390,57 @@ async def run_cancel_scenario(
             )
         return True, ""
     return False, f"unknown expected status '{status}' for a cancel scenario"
+
+
+async def run_non_determinism_held_scenario(
+    client: Client, args: argparse.Namespace, sc: dict
+) -> tuple[bool, str]:
+    """Start a workflow whose replay is not deterministic, and check the run is
+    held rather than carried on.
+
+    Once the worker has replayed the workflow (activated it a second time), the
+    run is watched for ``hold_ms`` more: it must still be running, and what the
+    worker observed must match ``expect.observed``. The run is terminated after,
+    pass or fail: held, it would otherwise stay open for good.
+    """
+    from orcher.types import WorkflowStatus
+
+    expect = sc["expect"]
+    key = f"conf-{uuid.uuid4()}"
+    scenario_input = sc.get("input", {})
+    payload = {**(scenario_input if isinstance(scenario_input, dict) else {}), "key": key}
+    handle = await client.start_workflow(
+        sc["workflow"], task_queue=args.task_queue, args=(payload,)
+    )
+    try:
+        deadline = time.monotonic() + args.result_timeout_secs
+        while catalog.ACTIVATIONS.get(key, 0) < 2 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(sc.get("hold_ms", 5000) / 1000)
+
+        if expect.get("status") != "running":
+            return False, f"unknown expected status '{expect.get('status')}' for a held scenario"
+        current = await handle.status()
+        if current != WorkflowStatus.RUNNING:
+            ended = ""
+            if current == WorkflowStatus.COMPLETED:
+                try:
+                    ended = f" with {json.dumps(await handle.result(timeout=5))}"
+                except Exception as e:
+                    ended = f" ({e})"
+            return False, f"expected the run held running, it is {current}{ended}"
+        observed = {
+            "replayed": catalog.ACTIVATIONS.get(key, 0) >= 2,
+            "child_runs": catalog.CHILD_RUNS.get(key, 0),
+        }
+        if json_matches(expect.get("observed", {}), observed):
+            return True, ""
+        return False, (
+            f"observed mismatch\n    expected: {expect.get('observed')}\n    actual:   {observed}"
+        )
+    finally:
+        with contextlib.suppress(Exception):  # best effort
+            await handle.terminate("contract: held run checked")
 
 
 def _start_local_worker(
@@ -723,6 +803,9 @@ async def main() -> None:
             label = sc["workflow"]
         elif kind == "cancel_queued_task":
             ok, msg = await run_cancel_queued_task_scenario(client, args, sc)
+            label = sc["workflow"]
+        elif kind == "non_determinism_held":
+            ok, msg = await run_non_determinism_held_scenario(client, args, sc)
             label = sc["workflow"]
         elif kind == "engine_restart":
             ok, msg = await run_engine_restart_scenario(client, args, sc)

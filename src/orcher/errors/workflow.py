@@ -6,6 +6,7 @@ from orcher.errors.base import OrcherError
 from orcher.errors.codes import ErrorCode, ErrorSeverity
 
 __all__ = [
+    "SagaCompensationError",
     "WorkflowError",
     "WorkflowSuspendedError",
 ]
@@ -104,6 +105,46 @@ class WorkflowError(OrcherError):
             workflow_id=workflow_id,
             severity=ErrorSeverity.CRITICAL,
         )
+
+
+class SagaCompensationError(WorkflowError):
+    """A saga's compensations ran, and at least one of them failed.
+
+    Every compensation still runs when one fails; this reports the ones that
+    failed once all have run. Raised by :meth:`Saga.compensate`, and by a
+    failed saga step whose compensating failed, which then carries the step's
+    own failure as ``step_failure`` (and as ``__cause__``).
+
+    Attributes:
+        failed: The names of the compensations that failed, in the order they
+            ran.
+        reason: The first failed compensation's error, as text.
+        step_failure: The failure of the saga step that started the
+            compensating, or ``None`` when the workflow compensated the saga
+            itself.
+    """
+
+    def __init__(
+        self,
+        failed: list[str],
+        reason: str,
+        *,
+        step_failure: BaseException | None = None,
+    ) -> None:
+        self.failed = list(failed)
+        self.reason = reason
+        self.step_failure = step_failure
+        first = failed[0] if failed else "unknown"
+        if len(failed) > 1:
+            message = (
+                f"Saga compensation failed: {len(failed)} compensations failed, "
+                f"the first '{first}': {reason}"
+            )
+        else:
+            message = f"Saga compensation failed: compensation '{first}' failed: {reason}"
+        if step_failure is not None:
+            message += f"; the compensating followed a failed step: {step_failure}"
+        super().__init__(ErrorCode.WORKFLOW_INVALID_STATE, message)
 
 
 class WorkflowSuspendedError(BaseException):

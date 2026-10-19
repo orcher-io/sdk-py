@@ -32,7 +32,7 @@ from orcher.errors.failure import (
 )
 from orcher.errors.service import WorkerError
 from orcher.errors.task import TaskError
-from orcher.errors.workflow import WorkflowError, WorkflowSuspendedError
+from orcher.errors.workflow import SagaCompensationError, WorkflowError, WorkflowSuspendedError
 
 __all__ = [
     # Error codes and severity
@@ -42,6 +42,7 @@ __all__ = [
     # Base error types
     "OrcherError",
     "WorkflowError",
+    "SagaCompensationError",
     "TaskError",
     "ClientError",
     "WorkerError",

@@ -60,6 +60,7 @@ from orcher.errors import (
     Failure,
     FailureCode,
     OrcherError,
+    SagaCompensationError,
     TaskError,
     WorkerError,
     WorkflowError,
@@ -163,6 +164,7 @@ __all__ = [
     # Errors
     "OrcherError",
     "WorkflowError",
+    "SagaCompensationError",
     "TaskError",
     "ClientError",
     "WorkerError",
