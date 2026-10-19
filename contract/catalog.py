@@ -241,6 +241,43 @@ async def parent_retries_child(ctx: WorkflowContext) -> dict:
     return {"child_succeeded": True, "child_attempt": out["attempt"]}
 
 
+class OutOfStock(Exception):  # noqa: N818 - named as the other SDKs name it
+    """A workflow failure raised as non-retryable, as task code raises one."""
+
+    non_retryable = True
+
+
+@workflow(name="non_retryable_first_run")
+async def non_retryable_first_run(ctx: WorkflowContext) -> dict:
+    """A child workflow that raises a non-retryable error on its first run and
+    succeeds on any later one, so a retry would show as a success."""
+    if ctx.info.attempt == 1:
+        raise OutOfStock("out of stock, for good")
+    return {"attempt": ctx.info.attempt}
+
+
+@workflow(name="parent_non_retryable_child")
+async def parent_non_retryable_child(ctx: WorkflowContext) -> dict:
+    """Start two child workflows, each with a retry policy of two attempts and
+    each failing its first run: one raising a non-retryable error, which is not
+    retried and fails, and one raising a plain error, which is retried and
+    succeeds on its second run."""
+
+    def policy() -> RetryPolicy:
+        return RetryPolicy(max_attempts=2, initial_interval=timedelta(seconds=1))
+
+    try:
+        await ctx.execute_child_workflow("non_retryable_first_run", retry_policy=policy())
+        non_retryable_child_failed = False
+    except WorkflowError:
+        non_retryable_child_failed = True
+    plain = await ctx.execute_child_workflow("fails_first_run", retry_policy=policy())
+    return {
+        "non_retryable_child_failed": non_retryable_child_failed,
+        "plain_child_attempt": plain["attempt"],
+    }
+
+
 @workflow(name="restart_once")
 async def restart_once(ctx: WorkflowContext, count: Any = 0) -> dict:
     """Restart fresh once, then complete.

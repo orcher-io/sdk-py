@@ -124,7 +124,11 @@ impl ConfigJson {
             .with_sdk(
                 self.sdk_name.unwrap_or_default(),
                 self.sdk_version.unwrap_or_default(),
-            );
+            )
+            // A workflow failure is marked non-retryable only when the
+            // workflow code raised it so (`workflow_failure` in
+            // `orcher.worker.activation`).
+            .with_protocol_version(orcher_sdk_core::worker_protocol::WORKFLOW_FAILURE_RETRYABILITY);
         if let Some(identity) = self.identity {
             config = config.with_identity(identity);
         }
@@ -637,6 +641,19 @@ mod tests {
         // A blank release is no release, and a blank key no key.
         assert!(config.version_id.is_none());
         assert!(config.api_key.is_none());
+    }
+
+    /// The worker reports that its workflow failures carry the mark the
+    /// workflow code raised.
+    #[test]
+    fn the_worker_reports_meaningful_workflow_failure_marks() {
+        let config =
+            config(r#"{ "server_url": "http://x:1", "task_queue": "q", "namespace": "n" }"#)
+                .unwrap();
+        assert_eq!(
+            config.protocol_version,
+            orcher_sdk_core::worker_protocol::WORKFLOW_FAILURE_RETRYABILITY
+        );
     }
 
     #[test]

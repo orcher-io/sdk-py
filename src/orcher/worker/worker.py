@@ -931,6 +931,8 @@ class Worker:
                 failure=workflow_failure(
                     str(run.failure),
                     non_determinism=_workflow_error_type(run.failure) == "NonDeterminism",
+                    # Raised as non-retryable the way task code raises it.
+                    non_retryable=bool(getattr(run.failure, "non_retryable", False)),
                 ),
                 query_responses=run.query_responses,
                 update_results=run.update_results,

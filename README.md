@@ -242,6 +242,11 @@ async def charge(ctx: TaskContext, order_id: str) -> str:
 Any other exception is retried. `non_retryable` can also be set on a single
 instance before it is raised.
 
+A workflow is marked the same way: an exception whose `non_retryable`
+attribute is true, raised from workflow code, fails the workflow without a
+retry, whatever its retry policy allows. Any other exception a workflow raises
+is retried as its policy says.
+
 A workflow that catches the failure reads its type and whether the task was
 cancelled from the `TaskError`:
 
