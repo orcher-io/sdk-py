@@ -14,7 +14,8 @@ the Rust, Python and TypeScript SDKs, so the same scenarios drive every worker.
 - `scenarios.json` — the shared contract. Each scenario names a catalog
   workflow, an `input`, and the `expect`ed terminal `status` and `result`.
   Matching is structural: a scenario asserts only the fields it lists, so
-  SDK-specific extra fields are ignored.
+  SDK-specific extra fields are ignored. A scenario with `result_exact` set
+  asserts the whole result instead, a boolean never matching a number.
 - `catalog.py` — the workflows and tasks this worker serves. Each workflow
   returns a JSON result describing the durable behavior it observed.
 - `run.py` — the driver. It starts the worker, runs every scenario against the

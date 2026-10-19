@@ -664,3 +664,211 @@ async def task_timeout_terminal(ctx: WorkflowContext) -> dict:
 async def report_attempt(ctx: WorkflowContext) -> dict:
     """Return the attempt this run reads. A first run is attempt 1."""
     return {"attempt": ctx.info.attempt}
+
+
+# --- A saga's failed compensation reaches the workflow -------------------------
+
+# The compensations that ran, by workflow, in the order they ran. Kept by the
+# compensation tasks themselves, which run once each: a task is not run again
+# on replay.
+_SAGA_RAN: dict[str, list[str]] = {}
+
+
+@task(name="saga_reserve", retry=1)
+async def saga_reserve(ctx: TaskContext, key: str) -> str:
+    return "reserved"
+
+
+@task(name="saga_charge", retry=1)
+async def saga_charge(ctx: TaskContext, key: str) -> str:
+    return "charged"
+
+
+@task(name="saga_ship", retry=1)
+async def saga_ship(ctx: TaskContext, key: str) -> str:
+    """The step that fails, so the saga compensates."""
+    raise RuntimeError("the carrier refused the parcel")
+
+
+@task(name="saga_release", retry=1)
+async def saga_release(ctx: TaskContext, key: str) -> str:
+    """Undo `saga_reserve`, and succeed."""
+    _SAGA_RAN.setdefault(key, []).append("saga_release")
+    return "released"
+
+
+@task(name="saga_refund", retry=1)
+async def saga_refund(ctx: TaskContext, key: str) -> str:
+    """Undo `saga_charge`, and fail."""
+    _SAGA_RAN.setdefault(key, []).append("saga_refund")
+    raise RuntimeError("the refund was declined")
+
+
+@task(name="saga_compensations_ran", retry=1)
+async def saga_compensations_ran(ctx: TaskContext, key: str) -> list[str]:
+    """Report the compensations that ran for a workflow."""
+    return list(_SAGA_RAN.get(key, []))
+
+
+async def _saga_two_steps(ctx: WorkflowContext, saga: Any, key: str) -> None:
+    """Run the two steps both saga workflows start with."""
+    await saga.add_step(
+        action=lambda: ctx.execute_task(saga_reserve, key=key),
+        compensation=lambda: ctx.execute_task(saga_release, key=key),
+        name="saga_release",
+    )
+    await saga.add_step(
+        action=lambda: ctx.execute_task(saga_charge, key=key),
+        compensation=lambda: ctx.execute_task(saga_refund, key=key),
+        name="saga_refund",
+    )
+
+
+@workflow(name="saga_step_failure")
+async def saga_step_failure(ctx: WorkflowContext) -> dict:
+    """Complete two steps with compensations, then run a step that fails, and
+    report the failure the saga raised and the compensations that ran."""
+    from orcher import Saga, SagaCompensationError
+
+    key = ctx.info.workflow_id
+    saga = Saga()
+    await _saga_two_steps(ctx, saga, key)
+    compensation_failed, failed_compensations, step_failure_kept = False, 0, False
+    try:
+        await saga.add_step(action=lambda: ctx.execute_task(saga_ship, key=key))
+    except SagaCompensationError as e:
+        compensation_failed = True
+        failed_compensations = len(e.failed)
+        step_failure_kept = "the carrier refused the parcel" in str(e.step_failure)
+    except Exception as e:
+        step_failure_kept = "the carrier refused the parcel" in str(e)
+    ran = await ctx.execute_task(saga_compensations_ran, key=key)
+    return {
+        "compensation_failed": compensation_failed,
+        "failed_compensations": failed_compensations,
+        "step_failure_kept": step_failure_kept,
+        "compensations_ran": ran,
+    }
+
+
+@workflow(name="saga_compensate_failure")
+async def saga_compensate_failure(ctx: WorkflowContext) -> dict:
+    """Complete two steps with compensations, then compensate the saga itself,
+    and report what compensating raised and the compensations that ran."""
+    from orcher import Saga, SagaCompensationError
+
+    key = ctx.info.workflow_id
+    saga = Saga()
+    await _saga_two_steps(ctx, saga, key)
+    compensation_failed, failed_compensations = False, 0
+    try:
+        await saga.compensate()
+    except SagaCompensationError as e:
+        compensation_failed = True
+        failed_compensations = len(e.failed)
+    ran = await ctx.execute_task(saga_compensations_ran, key=key)
+    return {
+        "compensation_failed": compensation_failed,
+        "failed_compensations": failed_compensations,
+        "compensations_ran": ran,
+    }
+
+
+# --- A child workflow named differently on replay is held ----------------------
+
+# Runs of `counted_child`, by key.
+CHILD_RUNS: dict[str, int] = {}
+
+
+@workflow(name="counted_child")
+async def counted_child(ctx: WorkflowContext, key: str) -> dict:
+    """A child workflow that counts its runs."""
+    CHILD_RUNS[key] = CHILD_RUNS.get(key, 0) + 1
+    return {"ran": True}
+
+
+@workflow(name="child_id_changes_on_replay")
+async def child_id_changes_on_replay(ctx: WorkflowContext, key: str) -> dict:
+    """Name the child after how many times this worker process has run this
+    workflow, which differs on every replay: deliberately not deterministic."""
+    n = _record_activation(key)
+    child = await ctx.execute_child_workflow(
+        "counted_child", workflow_id=f"{key}-child-{n}", args=({"key": key},)
+    )
+    return {"child": child}
+
+
+# --- Falsy values, list inputs and several arguments arrive exactly ------------
+
+_FALSY = {
+    "zero": 0,
+    "false": False,
+    "empty_string": "",
+    "null": None,
+    "empty_list": [],
+    "empty_object": {},
+}
+
+
+def _falsy(kind: str) -> Any:
+    if kind not in _FALSY:
+        raise ValueError(f"no falsy value is named {kind!r}")
+    value = _FALSY[kind]
+    # A fresh list or object each time, so no caller shares one.
+    return type(value)() if isinstance(value, (list, dict)) else value
+
+
+@task(name="falsy_value")
+async def falsy_value(ctx: TaskContext, kind: str) -> Any:
+    """Return the falsy value `kind` names."""
+    return _falsy(kind)
+
+
+@workflow(name="falsy_task_results")
+async def falsy_task_results(ctx: WorkflowContext) -> dict:
+    """Ask a task for each falsy value and return what came back, in order."""
+    values = [await ctx.execute_task(falsy_value, kind=kind) for kind in _FALSY]
+    return {"values": values}
+
+
+@workflow(name="falsy_result")
+async def falsy_result(ctx: WorkflowContext, kind: str) -> Any:
+    """Return the falsy value `kind` names as the whole result."""
+    return _falsy(kind)
+
+
+@task(name="list_task")
+async def list_task(ctx: TaskContext, items: list) -> list:
+    """Take a list and return it."""
+    return items
+
+
+@workflow(name="list_input")
+async def list_input(ctx: WorkflowContext, items: list) -> dict:
+    """Take a list as the one argument, pass it to a task that takes a list,
+    and report what each received."""
+    task_received = await ctx.execute_task(list_task, items=items)
+    return {"workflow_received": items, "task_received": task_received}
+
+
+@task(name="several_arguments_task")
+async def several_arguments_task(
+    ctx: TaskContext, name: str, count: int, tags: list, gift: bool
+) -> dict:
+    """Take several arguments and report them by name."""
+    return {"name": name, "count": count, "tags": tags, "gift": gift}
+
+
+@workflow(name="several_arguments")
+async def several_arguments(
+    ctx: WorkflowContext, name: str, count: int, tags: list, gift: bool
+) -> dict:
+    """Take several arguments, pass them on to a task that takes several, and
+    report what each received."""
+    task_received = await ctx.execute_task(
+        several_arguments_task, name=name, count=count, tags=tags, gift=gift
+    )
+    return {
+        "workflow_received": {"name": name, "count": count, "tags": tags, "gift": gift},
+        "task_received": task_received,
+    }

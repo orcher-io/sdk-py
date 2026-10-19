@@ -160,8 +160,8 @@ def _package_version() -> str:
 def _task_request(assignment: dict[str, Any]) -> dict[str, Any]:
     """A task as the worker host hands it over, as the task runner reads it.
 
-    The input is the JSON encoding of the task's keyword arguments; empty or
-    invalid input becomes no arguments.
+    The input is the JSON encoding of the task's arguments, packed as
+    unpack_arguments reads them; empty or invalid input becomes no arguments.
     """
     raw = bytes(assignment.get("input") or [])
     task_input: Any = {}
@@ -1357,14 +1357,19 @@ class Worker:
         start_time = datetime.now()
 
         async def run_task(data: Any) -> Any:
+            # The input becomes call arguments as a workflow's does (see
+            # unpack_arguments): an object is spread as keyword arguments, and
+            # any other value, a list included, is the one argument. Spreading
+            # only objects failed every task given a list or a scalar.
+            task_args, task_kwargs = unpack_arguments(data)
             if asyncio.iscoroutinefunction(handler):
-                return await handler(ctx, **data)
+                return await handler(ctx, *task_args, **task_kwargs)
             # Sync handlers run in the executor so blocking or CPU-bound
             # work does not stall the event loop.
             loop = asyncio.get_running_loop()
             return await loop.run_in_executor(
                 self._task_executor,
-                lambda: handler(ctx, **data),
+                lambda: handler(ctx, *task_args, **task_kwargs),
             )
 
         try:

@@ -39,6 +39,9 @@ Example::
         except Exception:
             await saga.compensate()
             raise
+
+If a compensation fails, the others still run and
+:class:`~orcher.errors.SagaCompensationError` is raised once they have.
 """
 
 from __future__ import annotations
@@ -47,6 +50,8 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+
+from orcher.errors.workflow import SagaCompensationError
 
 __all__ = ["Saga", "SagaBuilder", "SagaStep"]
 
@@ -87,7 +92,10 @@ class Saga:
 
         Returns the action's result. If the action raises a genuine error, all
         previously registered compensations run in reverse order and the
-        original error is re-raised.
+        original error is re-raised. If a compensation fails too, all of them
+        still run and :class:`~orcher.errors.SagaCompensationError` is raised
+        instead, carrying the action's error as ``step_failure``: an undo left
+        half done must not read as a clean one.
 
         Durable suspension (``WorkflowSuspendedError``) is control flow, not a
         failure: it subclasses ``BaseException`` and so passes through the
@@ -98,8 +106,13 @@ class Saga:
         step_name = name or f"step_{self._steps_executed + 1}"
         try:
             result = await action()
-        except Exception:
-            await self.compensate()
+        except Exception as step_failure:
+            try:
+                await self.compensate()
+            except SagaCompensationError as failed:
+                raise SagaCompensationError(
+                    failed.failed, failed.reason, step_failure=step_failure
+                ) from step_failure
             raise
         self._steps_executed += 1
         if compensation is not None:
@@ -129,26 +142,38 @@ class Saga:
     async def compensate(self) -> int:
         """Run all registered compensations in reverse order (LIFO).
 
-        Best-effort: if a compensation raises a real error it is logged and the
-        remaining compensations still run. Idempotent: once the saga has
-        completed (committed or compensated) this is a no-op, so it is safe to
-        call from a ``finally``/``except`` even if a step already triggered it.
+        A compensation that raises does not stop the others: every one runs,
+        and then :class:`~orcher.errors.SagaCompensationError` is raised,
+        naming the ones that failed and the first failure. Idempotent: once the
+        saga has completed (committed or compensated) this is a no-op, so it is
+        safe to call from a ``finally``/``except`` even if a step already
+        triggered it.
 
-        Returns the number of compensations that ran successfully. Durable
-        suspension propagates so the executor can schedule the compensation task
-        and replay.
+        Returns the number of compensations that ran, when none failed.
+        Durable suspension propagates so the executor can schedule the
+        compensation task and replay.
+
+        Raises:
+            SagaCompensationError: If a compensation failed.
         """
         if self._completed:
             return 0
         self._completed = True
 
         count = 0
+        failed: list[str] = []
+        first_failure: Exception | None = None
         for step in reversed(self._compensations):
             try:
                 await step.compensation()
                 count += 1
-            except Exception:
+            except Exception as e:
                 _LOG.warning("Saga compensation failed for %r", step.name, exc_info=True)
+                failed.append(step.name)
+                if first_failure is None:
+                    first_failure = e
+        if first_failure is not None:
+            raise SagaCompensationError(failed, str(first_failure)) from first_failure
         return count
 
     def commit(self) -> None:
