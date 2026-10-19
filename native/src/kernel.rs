@@ -185,6 +185,7 @@ struct ResultJson {
     protocol_error: Option<ProtocolErrorJson>,
     queries: Vec<QueryAnswerJson>,
     updates: Vec<UpdateAnswerJson>,
+    calls_before_failure: Option<Vec<CommandJson>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -609,6 +610,23 @@ pub(crate) fn result_from_json(json: &str) -> Result<RunActivationResult, String
                 .to_string(),
         );
     }
+    if answer.calls_before_failure.is_some() && answer.workflow_failed.is_none() {
+        return Err(
+            "calls_before_failure goes with a workflow failure, not without one".to_string(),
+        );
+    }
+    let calls_before_failure = answer
+        .calls_before_failure
+        .map(|calls| {
+            Ok::<_, String>(Commands {
+                commands: calls
+                    .into_iter()
+                    .map(CommandJson::into_command)
+                    .collect::<Result<_, _>>()?,
+                ..Default::default()
+            })
+        })
+        .transpose()?;
     let outcome = if let Some(commands) = answer.commands {
         Some(run_activation_result::Outcome::Commands(Commands {
             commands: commands
@@ -686,6 +704,7 @@ pub(crate) fn result_from_json(json: &str) -> Result<RunActivationResult, String
         outcome,
         queries,
         updates,
+        calls_before_failure,
         ..Default::default()
     })
 }
@@ -932,10 +951,38 @@ mod tests {
             r#"{"commands": [{"run_task": {}, "start_timer": {}}]}"#,
             r#"{"commands": [{"start_child": {"orphan_policy": "sometimes"}}]}"#,
             r#"{"workflow_failed": {"code": "bad"}}"#,
+            r#"{"commands": [], "calls_before_failure": []}"#,
+            r#"{"calls_before_failure": []}"#,
             r#"{"surprise": 1}"#,
         ] {
             assert!(result_from_json(json).is_err(), "{json}");
         }
+    }
+
+    /// A failure carries the calls made before it; one made before any
+    /// call carries an empty list, and one that does not say carries none.
+    #[test]
+    fn a_failure_is_read_with_the_calls_made_before_it() {
+        let answer = result_from_json(
+            r#"{"workflow_failed": {"message": "nope"},
+                "calls_before_failure": [{"satisfied": true, "step_id": "a_1", "run_task": {}}]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            answer.outcome,
+            Some(run_activation_result::Outcome::WorkflowFailed(_))
+        ));
+        let calls = answer.calls_before_failure.unwrap().commands;
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].satisfied);
+        assert_eq!(calls[0].step_id, "a_1");
+        assert!(matches!(calls[0].what, Some(command::What::RunTask(_))));
+
+        let none_made =
+            result_from_json(r#"{"workflow_failed": {}, "calls_before_failure": []}"#).unwrap();
+        assert_eq!(none_made.calls_before_failure, Some(Commands::default()));
+        let unsaid = result_from_json(r#"{"workflow_failed": {}}"#).unwrap();
+        assert_eq!(unsaid.calls_before_failure, None);
     }
 
     #[test]

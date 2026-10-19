@@ -455,6 +455,84 @@ async def test_a_workflow_failure_is_non_retryable_only_when_raised_so() -> None
     assert result["error"]["retryable"] is False
 
 
+async def test_a_failure_carries_the_calls_made_before_it() -> None:
+    async def fails_after_a_step(ctx: WorkflowContext, n: int) -> None:
+        await ctx.execute_task(step, n=n)
+        await ctx.execute("note", lambda: 1)
+        raise RuntimeError("nope")
+
+    registry = GlobalRegistry.get_instance()
+    if registry.get_workflow("kernel-fails-after") is None:
+        workflow(name="kernel-fails-after")(fails_after_a_step)
+    worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
+    worker._workflow_handlers["kernel-fails-after"] = registry.get_workflow("kernel-fails-after")
+
+    first = await worker.run_activation(activation(workflow_type="kernel-fails-after"))
+    (task_cmd,) = first["commands"]
+    step_id = task_cmd["step_id"]
+
+    settled = activation(
+        resolution(
+            "step",
+            {"outcome": {"value": payload(4), "end": "completed", "attempts": 1}},
+            step_id=step_id,
+            at_ms=START_MS + 1,
+        ),
+        workflow_type="kernel-fails-after",
+    )
+    answer = await worker.run_activation(settled)
+    assert answer["workflow_failed"]["message"] == "nope"
+    # The closure's value is a new call, never sent; the task is answered
+    # from history.
+    kinds = [
+        (
+            c.get("satisfied", False),
+            c.get("step_id"),
+            next(k for k in c if k not in ("seq", "satisfied", "step_id")),
+        )
+        for c in answer["calls_before_failure"]
+    ]
+    assert [k for k in kinds if k[2] == "run_task"] == [(True, step_id, "run_task")]
+    assert [k[:1] + k[2:] for k in kinds if k[2] == "record_value"] == [(False, "record_value")]
+    # The kernel checks the step reached against history and sends nothing.
+    result = json.loads(native()._kernel_execution_result("run-1", json.dumps(answer)))
+    assert result["successful"] is False
+    assert result["commands"] == []
+    assert result["reached_steps"] == [step_id]
+
+
+async def test_a_failure_before_any_call_says_it_made_none() -> None:
+    async def fails(ctx: WorkflowContext, n: int) -> None:
+        raise RuntimeError("nope")
+
+    registry = GlobalRegistry.get_instance()
+    if registry.get_workflow("kernel-fails") is None:
+        workflow(name="kernel-fails")(fails)
+    worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
+    worker._workflow_handlers["kernel-fails"] = registry.get_workflow("kernel-fails")
+    answer = await worker.run_activation(activation(workflow_type="kernel-fails"))
+    assert answer["calls_before_failure"] == []
+    result = json.loads(native()._kernel_execution_result("run-1", json.dumps(answer)))
+    assert result["reached_steps"] == []
+
+
+async def test_a_workflow_that_never_ran_fails_unchecked() -> None:
+    answer = await make_worker().run_activation(activation(workflow_type="not-registered"))
+    assert "workflow_failed" in answer
+    assert "calls_before_failure" not in answer
+
+
+def test_a_failure_with_calls_the_protocol_cannot_carry_goes_unchecked() -> None:
+    answer = answer_activation(
+        [9],
+        failure={"message": "nope"},
+        commands=[{"NoSuchCommand": {}}],
+        reached=[],
+    )
+    assert answer["workflow_failed"] == {"message": "nope"}
+    assert "calls_before_failure" not in answer
+
+
 async def test_an_activation_naming_no_run_is_a_protocol_error() -> None:
     answer = await make_worker().run_activation({"activation_id": [5], "resolutions": []})
     assert answer["activation_id"] == [5]
