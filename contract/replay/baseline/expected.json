@@ -676,6 +676,7 @@
       "retryable": true
     },
     "query_responses": [],
+    "reached_steps": [],
     "restart_fresh": null,
     "run_id": "7ec27b63-1c4e-4f05-9bd6-26f4ce28dd37",
     "successful": false,
@@ -1960,6 +1961,7 @@
       "retryable": true
     },
     "query_responses": [],
+    "reached_steps": [],
     "restart_fresh": null,
     "run_id": "ff56e753-7f40-40cb-b5c5-1aa9ed5c6871",
     "successful": false,

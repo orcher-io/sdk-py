@@ -192,7 +192,8 @@ def _task_request(assignment: dict[str, Any]) -> dict[str, Any]:
 class _WorkflowRun:
     """What running a workflow's code once produced."""
 
-    # The commands it issued, as the workflow context hands them over.
+    # The commands it issued, as the workflow context hands them over; when
+    # it failed, those it issued before failing, which are never sent.
     commands: list[dict[str, Any]]
     # Every step it reached, as its kind and id, in order.
     reached: list[tuple[str, str]]
@@ -934,6 +935,8 @@ class Worker:
                     # Raised as non-retryable the way task code raises it.
                     non_retryable=bool(getattr(run.failure, "non_retryable", False)),
                 ),
+                commands=run.commands,
+                reached=run.reached,
                 query_responses=run.query_responses,
                 update_results=run.update_results,
             )
@@ -1089,9 +1092,12 @@ class Worker:
                 )
             logger.exception(f"Workflow execution failed: {e}")
             details = traceback.format_exc()
-            # The activation fails and its commands are dropped; closures it
-            # left running still finish, rather than being abandoned mid-way.
+            # The activation fails and none of its commands is sent; they go
+            # with the failure, for the kernel to check against history.
+            # Closures it left running still finish, rather than being
+            # abandoned mid-way.
             await ctx._closures_settled()
+            commands = ctx._take_commands()
             reached = ctx._take_reached()
 
             duration_ms = (datetime.now() - start_time).total_seconds() * 1000
@@ -1104,7 +1110,7 @@ class Worker:
             # Queries and updates are answered even when the workflow fails.
             await ctx._replay_updates(every=True)
             return _WorkflowRun(
-                commands=[],
+                commands=commands,
                 reached=reached,
                 query_responses=self._answer_queries(queries, ctx),
                 update_results=await self._answer_updates(updates, ctx),

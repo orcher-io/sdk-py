@@ -24,6 +24,7 @@ This module is internal.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -328,8 +329,10 @@ def answer_activation(
 
     ``commands`` and ``reached`` are as the workflow context hands them over:
     the commands issued, and every step reached, each as its kind and id.
-    ``query_responses`` and ``update_results`` are as the worker's handlers
-    produce them.
+    With ``failure``, they are the calls the code made before it failed,
+    which the kernel checks against history and never sends; ``reached`` left
+    out (no code ran) leaves the failure unchecked. ``query_responses`` and
+    ``update_results`` are as the worker's handlers produce them.
     """
     answered: dict[str, Any] = {
         "activation_id": list(activation_id),
@@ -338,6 +341,11 @@ def answer_activation(
     }
     if failure is not None:
         answered["workflow_failed"] = failure
+        if reached is not None:
+            # A call the protocol cannot carry leaves the failure unchecked,
+            # rather than its calls reported wrong.
+            with contextlib.suppress(ProtocolRefusalError):
+                answered["calls_before_failure"] = kernel_commands(commands or [], reached)
         return answered
     try:
         answered["commands"] = kernel_commands(commands or [], reached or [])
