@@ -354,11 +354,19 @@ def protocol_error(activation_id: list[int], message: str, kind: str = "") -> di
     }
 
 
-def workflow_failure(message: str, *, non_determinism: bool = False) -> dict[str, Any]:
-    """The run's failure: the workflow's code raised. Never retried, as before."""
+def workflow_failure(
+    message: str, *, non_determinism: bool = False, non_retryable: bool = False
+) -> dict[str, Any]:
+    """The run's failure: the workflow's code raised.
+
+    ``non_retryable`` when the code raised it as non-retryable, the way task
+    code does (a truthy ``non_retryable`` attribute on the exception): the
+    workflow is then not retried, whatever its retry policy allows. Any other
+    failure is retried as the policy says.
+    """
     return {
         "message": message,
-        "non_retryable": True,
+        "non_retryable": non_retryable,
         "code": "non_determinism" if non_determinism else "application",
     }
 

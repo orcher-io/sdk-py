@@ -421,9 +421,38 @@ async def test_a_failing_workflow_answers_its_failure() -> None:
     answer = await worker.run_activation(activation(workflow_type="kernel-fails"))
     assert answer["workflow_failed"] == {
         "message": "nope",
-        "non_retryable": True,
+        "non_retryable": False,
         "code": "application",
     }
+
+
+class OutOfStock(Exception):  # noqa: N818 - named as the other SDKs name it
+    """A failure raised as non-retryable, as task code raises one."""
+
+    non_retryable = True
+
+
+async def test_a_workflow_failure_is_non_retryable_only_when_raised_so() -> None:
+    async def gives_up(ctx: WorkflowContext, n: int) -> None:
+        raise OutOfStock("out of stock")
+
+    async def marks_one(ctx: WorkflowContext, n: int) -> None:
+        error = RuntimeError("this one only")
+        error.non_retryable = True  # type: ignore[attr-defined]
+        raise error
+
+    registry = GlobalRegistry.get_instance()
+    worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
+    for name, code in (("kernel-gives-up", gives_up), ("kernel-marks-one", marks_one)):
+        if registry.get_workflow(name) is None:
+            workflow(name=name)(code)
+        worker._workflow_handlers[name] = registry.get_workflow(name)
+        answer = await worker.run_activation(activation(workflow_type=name))
+        assert answer["workflow_failed"]["non_retryable"] is True, name
+    # The kernel carries the mark on, as the run's failure.
+    result = json.loads(native()._kernel_execution_result("run-1", json.dumps(answer)))
+    assert result["successful"] is False
+    assert result["error"]["retryable"] is False
 
 
 async def test_an_activation_naming_no_run_is_a_protocol_error() -> None:
