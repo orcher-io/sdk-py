@@ -24,6 +24,8 @@ import pytest
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
 
+from .messages import message
+
 pytest.importorskip("orcher._native")
 
 START_MS = 1_700_000_000_000
@@ -130,7 +132,7 @@ class FakeEngine:
     def activation(self) -> dict[str, Any]:
         """The activation, as the worker host hands it to the worker: the
         kernel protocol's ``RunActivation``, the journal resolved into the
-        outcomes the run observes, in the JSON the native module writes."""
+        outcomes the run observes, as ``support.messages`` describes it."""
         resolutions: list[dict[str, Any]] = [
             {
                 "step_id": "",
@@ -199,19 +201,25 @@ class FakeEngine:
                 )
             elif kind == "child_canceled":
                 resolve(
-                    a["workflow_id"], at_ms, "child",
+                    a["workflow_id"],
+                    at_ms,
+                    "child",
                     child_ended(a, "cancelled", "Child workflow was canceled"),
                 )
             elif kind == "child_terminated":
                 # The kernel carries the reason given for the termination as
                 # the failure's message, empty when none was.
                 resolve(
-                    a["workflow_id"], at_ms, "child",
+                    a["workflow_id"],
+                    at_ms,
+                    "child",
                     child_ended(a, "terminated", a["reason"]),
                 )
             elif kind == "child_timed_out":
                 resolve(
-                    a["workflow_id"], at_ms, "child",
+                    a["workflow_id"],
+                    at_ms,
+                    "child",
                     child_ended(a, "timed_out", "Child workflow timed out"),
                 )
         return {
@@ -236,8 +244,8 @@ class FakeEngine:
         recorded that the code did not reach, while it issues new work or
         ends the workflow.
         """
-        answer = await self.worker.run_activation(self.activation())
-        result = self._with_core(answer)
+        answer = await self.worker.run_activation(message(self.activation()))
+        result = self._with_core(answer.SerializeToString())
         self._check_left_behind(result)
         activation = Activation(result=result, commands=list(result["commands"]))
         if not result["successful"]:
@@ -247,12 +255,13 @@ class FakeEngine:
         self.activations.append(activation)
         return activation
 
-    def _with_core(self, answer: dict[str, Any]) -> dict[str, Any]:
-        """The answer as the kernel turns it into what the workflow driver
-        checks and sends. Raises ValueError for anything the kernel refuses."""
+    def _with_core(self, answer: bytes) -> dict[str, Any]:
+        """The encoded answer as the kernel turns it into what the workflow
+        driver checks and sends. Raises ValueError for anything the kernel
+        refuses."""
         from orcher import _native
 
-        return dict(json.loads(_native._kernel_execution_result(self.run_id, json.dumps(answer))))
+        return dict(json.loads(_native._kernel_execution_result(self.run_id, answer)))
 
     def _check_left_behind(self, result: dict[str, Any]) -> None:
         reached = result.get("reached_steps")
@@ -296,7 +305,7 @@ class FakeEngine:
         self.issued.setdefault(step_id, (kind, work_type))
 
     def _apply(self, command: dict[str, Any], activation: Activation) -> None:
-        (kind, body), = command.items()
+        ((kind, body),) = command.items()
         if kind == "ScheduleTask":
             self._issue(kind, body["task_id"], body["task_type"], activation)
         elif kind == "StartTimer":

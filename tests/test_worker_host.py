@@ -17,11 +17,13 @@ from unittest import mock
 import pytest
 
 from orcher import TaskContext, WorkflowContext, task, workflow
+from orcher._proto import kernel_pb2
 from orcher.decorators import GlobalRegistry
 from orcher.worker import worker as worker_module
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker, WorkerState, _task_request
 from tests.support.kernel import activation
+from tests.support.messages import answer_of, message, task_message
 
 
 @task(name="host-double")
@@ -37,25 +39,25 @@ class FakeHost:
     """The worker host, as the worker's pull loops use it."""
 
     def __init__(self) -> None:
-        self.activations: asyncio.Queue[str | None] = asyncio.Queue()
-        self.tasks: asyncio.Queue[str | None] = asyncio.Queue()
-        self.operations: asyncio.Queue[str | None] = asyncio.Queue()
+        self.activations: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self.tasks: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self.operations: asyncio.Queue[bytes | None] = asyncio.Queue()
         self.answers: list[dict[str, Any]] = []
         self.results: list[tuple[bytes, Any]] = []
         self.answered = asyncio.Event()
         self.stopped = False
 
-    async def next_activation(self) -> str | None:
+    async def next_activation(self) -> bytes | None:
         return await self.activations.get()
 
-    async def next_task(self) -> str | None:
+    async def next_task(self) -> bytes | None:
         return await self.tasks.get()
 
-    async def next_actor_operation(self) -> str | None:
+    async def next_actor_operation(self) -> bytes | None:
         return await self.operations.get()
 
-    async def complete_activation(self, result_json: str) -> None:
-        self.answers.append(json.loads(result_json))
+    async def complete_activation(self, result: bytes) -> None:
+        self.answers.append(answer_of(kernel_pb2.RunActivationResult.FromString(result)))
         self.answered.set()
 
     async def complete_task(self, token: bytes, result: bytes) -> None:
@@ -173,7 +175,7 @@ async def test_activations_and_tasks_are_pulled_run_and_answered() -> None:
     host = FakeHost()
     running, _ = await started(worker, host)
 
-    host.activations.put_nowait(json.dumps(activation("host-waits")))
+    host.activations.put_nowait(message(activation("host-waits")).SerializeToString())
     await answered(host)
     (answer,) = host.answers
     (command,) = answer["commands"]
@@ -181,7 +183,7 @@ async def test_activations_and_tasks_are_pulled_run_and_answered() -> None:
     assert command["run_task"]["task_type"] == "host-double"
 
     host.tasks.put_nowait(
-        json.dumps(
+        task_message(
             {
                 "token": list(b"tok"),
                 "task_id": "host-double_1",
@@ -195,7 +197,7 @@ async def test_activations_and_tasks_are_pulled_run_and_answered() -> None:
                 "attempt_timeout_ms": 30_000,
                 "heartbeat_timeout_ms": None,
             }
-        )
+        ).SerializeToString()
     )
     await answered(host)
     # The task sees the attempt timeout the engine gave it.
@@ -221,7 +223,7 @@ async def test_a_full_worker_pulls_no_more_until_it_has_room() -> None:
     worker._execute_task = blocked  # type: ignore[method-assign]
     running, _ = await started(worker, host)
     for n in range(2):
-        host.tasks.put_nowait(json.dumps({"token": [n], "task_id": f"t{n}"}))
+        host.tasks.put_nowait(task_message({"token": [n], "task_id": f"t{n}"}).SerializeToString())
     await asyncio.sleep(0.1)
     # The second task is left with the host while the first one runs.
     assert pulled == ["t0"]
@@ -238,19 +240,21 @@ async def test_a_full_worker_pulls_no_more_until_it_has_room() -> None:
 
 def test_a_task_crosses_with_its_limits_and_input() -> None:
     request = _task_request(
-        {
-            "token": [1, 2],
-            "task_id": "t_1",
-            "task_type": "t",
-            "workflow_id": "wf",
-            "run_id": "run",
-            "task_queue": "q",
-            "namespace": "ns",
-            "input": list(b'{"a": 1}'),
-            "attempt": 2,
-            "attempt_timeout_ms": 1_500,
-            "heartbeat_timeout_ms": 500,
-        }
+        task_message(
+            {
+                "token": [1, 2],
+                "task_id": "t_1",
+                "task_type": "t",
+                "workflow_id": "wf",
+                "run_id": "run",
+                "task_queue": "q",
+                "namespace": "ns",
+                "input": list(b'{"a": 1}'),
+                "attempt": 2,
+                "attempt_timeout_ms": 1_500,
+                "heartbeat_timeout_ms": 500,
+            }
+        )
     )
     assert request["task_token"] == b"\x01\x02"
     assert request["input"] == {"a": 1}
@@ -258,8 +262,8 @@ def test_a_task_crosses_with_its_limits_and_input() -> None:
     assert request["start_to_close_timeout_ms"] == 1_500
     assert request["heartbeat_timeout_ms"] == 500
     # No input, or input that is not JSON, is no arguments.
-    assert _task_request({"input": []})["input"] == {}
-    assert _task_request({"input": list(b"{nope")})["input"] == {}
+    assert _task_request(task_message({"input": []}))["input"] == {}
+    assert _task_request(task_message({"input": list(b"{nope")}))["input"] == {}
 
 
 async def test_shutdown_with_a_timeout_says_the_timeout_is_ignored() -> None:

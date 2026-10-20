@@ -13,6 +13,7 @@ import pytest
 
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
+from tests.support.messages import task_message
 
 
 class CardDeclined(Exception):  # noqa: N818 - named as the other SDKs name it
@@ -40,7 +41,7 @@ async def _report(error: Exception) -> tuple[Any, ...]:
         raise error
 
     worker._execute_task = raise_it  # type: ignore[method-assign]
-    await worker._handle_task({"task_id": "t", "token": list(b"tok")})
+    await worker._handle_task(task_message({"task_id": "t", "token": list(b"tok")}))
     assert len(host.failures) == 1
     return host.failures[0]
 

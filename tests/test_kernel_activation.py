@@ -24,6 +24,8 @@ from orcher.worker.activation import (
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
 from orcher.workflow.sentinels import CHILD_FAILED_SENTINEL, TASK_FAILED_SENTINEL
+from tests.support.messages import answer_of, answered, as_dict, failure_message
+from tests.support.messages import message as to_message
 
 START_MS = 1_700_000_000_000
 
@@ -71,13 +73,13 @@ def activation(
 
 
 def test_the_run_and_its_start_are_loaded() -> None:
-    loaded = load_activation(activation(), "fallback")
+    loaded = load_activation(to_message(activation()), "fallback")
     info = loaded.context.info
     assert (info.workflow_id, info.run_id, info.workflow_type) == ("wf-1", "run-1", "wf")
     assert (info.task_queue, info.namespace, info.attempt) == ("q", "ns", 2)
     assert int(info.started_at.timestamp() * 1000) == START_MS
     assert loaded.input == {"n": 1}
-    assert loaded.activation_id == [1, 2, 3]
+    assert loaded.activation_id == bytes([1, 2, 3])
     # Nothing settled yet: not replaying.
     assert loaded.context.replaying is False
 
@@ -90,53 +92,55 @@ def test_a_runs_attempt_is_the_one_the_engine_numbered(attempt: int, reads: int)
     start = resolution("started", {"input": [], "attempt": attempt}, at_ms=START_MS)
     act = activation()
     act["resolutions"] = [start]
-    assert load_activation(act, "ns").context.info.attempt == reads
+    assert load_activation(to_message(act), "ns").context.info.attempt == reads
 
 
 def test_settled_steps_children_and_timers_are_cached_with_their_times() -> None:
     loaded = load_activation(
-        activation(
-            resolution(
-                "step",
-                {"outcome": {"value": payload(7), "end": "completed", "attempts": 1}},
-                step_id="charge_1",
-                at_ms=START_MS + 10,
-            ),
-            resolution(
-                "step",
-                {
-                    "outcome": {
-                        "failure": {
-                            "message": "declined",
-                            "error_type": "CardDeclined",
-                            "code": "application",
-                        },
-                        "end": "failed",
-                        "attempts": 3,
-                    }
-                },
-                step_id="charge_2",
-                at_ms=START_MS + 20,
-            ),
-            resolution("timer", {}, step_id="timer_3", at_ms=START_MS + 30),
-            resolution(
-                "child",
-                {
-                    "child_workflow_id": "kid",
-                    "outcome": {"value": payload("ok"), "end": "completed"},
-                },
-                step_id="kid",
-                at_ms=START_MS + 40,
-            ),
-            resolution(
-                "child",
-                {
-                    "child_workflow_id": "gone",
-                    "outcome": {"failure": {"message": "operator"}, "end": "terminated"},
-                },
-                step_id="gone",
-            ),
-            resolution("child_started", {"child_workflow_id": "child_9"}, step_id="child_9"),
+        to_message(
+            activation(
+                resolution(
+                    "step",
+                    {"outcome": {"value": payload(7), "end": "completed", "attempts": 1}},
+                    step_id="charge_1",
+                    at_ms=START_MS + 10,
+                ),
+                resolution(
+                    "step",
+                    {
+                        "outcome": {
+                            "failure": {
+                                "message": "declined",
+                                "error_type": "CardDeclined",
+                                "code": "application",
+                            },
+                            "end": "failed",
+                            "attempts": 3,
+                        }
+                    },
+                    step_id="charge_2",
+                    at_ms=START_MS + 20,
+                ),
+                resolution("timer", {}, step_id="timer_3", at_ms=START_MS + 30),
+                resolution(
+                    "child",
+                    {
+                        "child_workflow_id": "kid",
+                        "outcome": {"value": payload("ok"), "end": "completed"},
+                    },
+                    step_id="kid",
+                    at_ms=START_MS + 40,
+                ),
+                resolution(
+                    "child",
+                    {
+                        "child_workflow_id": "gone",
+                        "outcome": {"failure": {"message": "operator"}, "end": "terminated"},
+                    },
+                    step_id="gone",
+                ),
+                resolution("child_started", {"child_workflow_id": "child_9"}, step_id="child_9"),
+            )
         ),
         "ns",
     )
@@ -178,7 +182,10 @@ def test_settled_steps_children_and_timers_are_cached_with_their_times() -> None
 )
 def test_a_child_that_ended_without_a_result_failed(outcome: dict, message: str) -> None:
     loaded = load_activation(
-        activation(resolution("child", {"child_workflow_id": "kid", "outcome": outcome})), "ns"
+        to_message(
+            activation(resolution("child", {"child_workflow_id": "kid", "outcome": outcome}))
+        ),
+        "ns",
     )
     assert loaded.context._cached_results["child:kid"] == {
         CHILD_FAILED_SENTINEL: True,
@@ -188,28 +195,30 @@ def test_a_child_that_ended_without_a_result_failed(outcome: dict, message: str)
 
 def test_events_updates_and_a_cancel_request_are_loaded() -> None:
     loaded = load_activation(
-        activation(
-            resolution("event", {"name": "go", "payload": payload(1)}, at_ms=START_MS + 5),
-            resolution(
-                "update",
-                {"update_id": "u1", "name": "set", "args": [payload(2)]},
-                at_ms=START_MS + 6,
-            ),
-            # The same update again is run again once.
-            resolution(
-                "update",
-                {"update_id": "u1", "name": "set", "args": [payload(2)]},
-                at_ms=START_MS + 6,
-            ),
-            resolution("cancel", {"reason": "", "requested_at_ms": START_MS + 7}),
-            resolution("cancel", {"reason": "", "requested_at_ms": START_MS + 9}),
-            # Not yet in history: waiting for this activation's answer.
-            resolution("update", {"update_id": "u2", "name": "set", "args": [payload(3)]}),
+        to_message(
+            activation(
+                resolution("event", {"name": "go", "payload": payload(1)}, at_ms=START_MS + 5),
+                resolution(
+                    "update",
+                    {"update_id": "u1", "name": "set", "args": [payload(2)]},
+                    at_ms=START_MS + 6,
+                ),
+                # The same update again is run again once.
+                resolution(
+                    "update",
+                    {"update_id": "u1", "name": "set", "args": [payload(2)]},
+                    at_ms=START_MS + 6,
+                ),
+                resolution("cancel", {"reason": "", "requested_at_ms": START_MS + 7}),
+                resolution("cancel", {"reason": "", "requested_at_ms": START_MS + 9}),
+                # Not yet in history: waiting for this activation's answer.
+                resolution("update", {"update_id": "u2", "name": "set", "args": [payload(3)]}),
+            )
         ),
         "ns",
     )
     ctx = loaded.context
-    assert ctx._cached_results["event_buffer:go"] == [payload(1)["data"]]
+    assert ctx._cached_results["event_buffer:go"] == [bytes(payload(1)["data"])]
     assert ctx._cached_results["event_positions:go"] == [1]
     assert ctx._event_times == {"go": [START_MS + 5]}
     assert loaded.journaled_updates == [
@@ -224,7 +233,7 @@ def test_events_updates_and_a_cancel_request_are_loaded() -> None:
 
 def test_a_resolution_of_an_unknown_kind_is_refused() -> None:
     with pytest.raises(ProtocolRefusalError) as refused:
-        load_activation(activation(resolution("unknown", {})), "ns")
+        load_activation(to_message(activation(resolution("unknown", {}))), "ns")
     assert refused.value.kind == "unknown_resolution"
 
 
@@ -250,10 +259,10 @@ def test_steps_answered_from_history_are_satisfied_in_their_place() -> None:
             }
         },
     ]
-    commands = kernel_commands(issued, reached)
+    commands = [as_dict(c) for c in kernel_commands(issued, reached)]
     fields = ("seq", "satisfied", "step_id")
     kinds = [
-        (c.get("satisfied", False), c.get("step_id"), next(k for k in c if k not in fields))
+        (c.get("satisfied", False), c.get("step_id", ""), next(k for k in c if k not in fields))
         for c in commands
     ]
     assert kinds == [
@@ -277,24 +286,26 @@ def test_steps_answered_from_history_are_satisfied_in_their_place() -> None:
 
 
 def test_steps_reached_after_the_last_issued_one_are_still_reported() -> None:
-    commands = kernel_commands([], [("task", "a_1"), ("timer", "timer_2")])
+    commands = [as_dict(c) for c in kernel_commands([], [("task", "a_1"), ("timer", "timer_2")])]
     assert [c["satisfied"] for c in commands] == [True, True]
 
 
 def test_a_restart_carries_its_execution_timeout() -> None:
-    answer = answer_activation(
-        [9],
-        commands=[
-            {
-                "RestartFresh": {
-                    "workflow_type": "",
-                    "input": [],
-                    "task_queue": None,
-                    "timeout": {"secs": 5, "nanos": 0},
+    answer = answer_of(
+        answer_activation(
+            bytes([9]),
+            commands=[
+                {
+                    "RestartFresh": {
+                        "workflow_type": "",
+                        "input": [],
+                        "task_queue": None,
+                        "timeout": {"secs": 5, "nanos": 0},
+                    }
                 }
-            }
-        ],
-        reached=[],
+            ],
+            reached=[],
+        )
     )
     assert "protocol_error" not in answer
     (restart,) = answer["commands"]
@@ -302,22 +313,27 @@ def test_a_restart_carries_its_execution_timeout() -> None:
 
 
 def test_queries_and_updates_are_answered_in_the_kernels_shape() -> None:
-    answer = answer_activation(
-        [1],
-        commands=[],
-        reached=[],
-        query_responses=[
-            {"query_id": "q1", "result": {"Success": {"output": {"data": [49], "metadata": {}}}}},
-            {"query_id": "q2", "result": {"Failed": {"message": "no", "details": None}}},
-        ],
-        update_results=[
-            {
-                "update_id": "u1",
-                "result": {"Completed": {"output": {"data": [50], "metadata": {}}}},
-            },
-            {"update_id": "u2", "result": {"Rejected": {"message": "closed"}}},
-            {"update_id": "u3", "result": {"Failed": {"message": "broke", "details": None}}},
-        ],
+    answer = answer_of(
+        answer_activation(
+            bytes([1]),
+            commands=[],
+            reached=[],
+            query_responses=[
+                {
+                    "query_id": "q1",
+                    "result": {"Success": {"output": {"data": [49], "metadata": {}}}},
+                },
+                {"query_id": "q2", "result": {"Failed": {"message": "no", "details": None}}},
+            ],
+            update_results=[
+                {
+                    "update_id": "u1",
+                    "result": {"Completed": {"output": {"data": [50], "metadata": {}}}},
+                },
+                {"update_id": "u2", "result": {"Rejected": {"message": "closed"}}},
+                {"update_id": "u3", "result": {"Failed": {"message": "broke", "details": None}}},
+            ],
+        )
     )
     assert answer["queries"] == [
         {"query_id": "q1", "value": {"data": [49], "metadata": {}}},
@@ -372,7 +388,7 @@ async def test_a_workflow_runs_from_a_kernel_activation_end_to_end() -> None:
     first["resolutions"].append(
         resolution("update", {"update_id": "u", "name": "set_where", "args": [payload(["here"])]})
     )
-    answer = await worker.run_activation(first)
+    answer = await answered(worker, first)
     assert answer["activation_id"] == [1, 2, 3]
     (task_cmd,) = answer["commands"]
     assert task_cmd["step_id"] == "kernel-activation-step_1"
@@ -392,10 +408,8 @@ async def test_a_workflow_runs_from_a_kernel_activation_end_to_end() -> None:
             at_ms=START_MS + 1,
         )
     )
-    answer = await worker.run_activation(second)
-    result = json.loads(
-        native()._kernel_execution_result("run-1", json.dumps(answer))
-    )
+    answer = await answered(worker, second)
+    result = json.loads(native()._kernel_execution_result("run-1", answer.encoded()))
     assert result["successful"] is True
     # A send is journaled as a step of its own, recorded with the closure.
     assert [list(c)[0] for c in result["commands"]] == [
@@ -418,12 +432,9 @@ async def test_a_failing_workflow_answers_its_failure() -> None:
         workflow(name="kernel-fails")(fails)
     worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
     worker._workflow_handlers["kernel-fails"] = registry.get_workflow("kernel-fails")
-    answer = await worker.run_activation(activation(workflow_type="kernel-fails"))
-    assert answer["workflow_failed"] == {
-        "message": "nope",
-        "non_retryable": False,
-        "code": "application",
-    }
+    answer = await answered(worker, activation(workflow_type="kernel-fails"))
+    # A failure that may be retried leaves `non_retryable` at its default.
+    assert answer["workflow_failed"] == {"message": "nope", "code": "application"}
 
 
 class OutOfStock(Exception):  # noqa: N818 - named as the other SDKs name it
@@ -447,10 +458,10 @@ async def test_a_workflow_failure_is_non_retryable_only_when_raised_so() -> None
         if registry.get_workflow(name) is None:
             workflow(name=name)(code)
         worker._workflow_handlers[name] = registry.get_workflow(name)
-        answer = await worker.run_activation(activation(workflow_type=name))
+        answer = await answered(worker, activation(workflow_type=name))
         assert answer["workflow_failed"]["non_retryable"] is True, name
     # The kernel carries the mark on, as the run's failure.
-    result = json.loads(native()._kernel_execution_result("run-1", json.dumps(answer)))
+    result = json.loads(native()._kernel_execution_result("run-1", answer.encoded()))
     assert result["successful"] is False
     assert result["error"]["retryable"] is False
 
@@ -467,7 +478,7 @@ async def test_a_failure_carries_the_calls_made_before_it() -> None:
     worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
     worker._workflow_handlers["kernel-fails-after"] = registry.get_workflow("kernel-fails-after")
 
-    first = await worker.run_activation(activation(workflow_type="kernel-fails-after"))
+    first = await answered(worker, activation(workflow_type="kernel-fails-after"))
     (task_cmd,) = first["commands"]
     step_id = task_cmd["step_id"]
 
@@ -480,7 +491,7 @@ async def test_a_failure_carries_the_calls_made_before_it() -> None:
         ),
         workflow_type="kernel-fails-after",
     )
-    answer = await worker.run_activation(settled)
+    answer = await answered(worker, settled)
     assert answer["workflow_failed"]["message"] == "nope"
     # The closure's value is a new call, never sent; the task is answered
     # from history.
@@ -495,7 +506,7 @@ async def test_a_failure_carries_the_calls_made_before_it() -> None:
     assert [k for k in kinds if k[2] == "run_task"] == [(True, step_id, "run_task")]
     assert [k[:1] + k[2:] for k in kinds if k[2] == "record_value"] == [(False, "record_value")]
     # The kernel checks the step reached against history and sends nothing.
-    result = json.loads(native()._kernel_execution_result("run-1", json.dumps(answer)))
+    result = json.loads(native()._kernel_execution_result("run-1", answer.encoded()))
     assert result["successful"] is False
     assert result["commands"] == []
     assert result["reached_steps"] == [step_id]
@@ -510,31 +521,33 @@ async def test_a_failure_before_any_call_says_it_made_none() -> None:
         workflow(name="kernel-fails")(fails)
     worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
     worker._workflow_handlers["kernel-fails"] = registry.get_workflow("kernel-fails")
-    answer = await worker.run_activation(activation(workflow_type="kernel-fails"))
+    answer = await answered(worker, activation(workflow_type="kernel-fails"))
     assert answer["calls_before_failure"] == []
-    result = json.loads(native()._kernel_execution_result("run-1", json.dumps(answer)))
+    result = json.loads(native()._kernel_execution_result("run-1", answer.encoded()))
     assert result["reached_steps"] == []
 
 
 async def test_a_workflow_that_never_ran_fails_unchecked() -> None:
-    answer = await make_worker().run_activation(activation(workflow_type="not-registered"))
+    answer = await answered(make_worker(), activation(workflow_type="not-registered"))
     assert "workflow_failed" in answer
     assert "calls_before_failure" not in answer
 
 
 def test_a_failure_with_calls_the_protocol_cannot_carry_goes_unchecked() -> None:
-    answer = answer_activation(
-        [9],
-        failure={"message": "nope"},
-        commands=[{"NoSuchCommand": {}}],
-        reached=[],
+    answer = answer_of(
+        answer_activation(
+            bytes([9]),
+            failure=failure_message({"message": "nope"}),
+            commands=[{"NoSuchCommand": {}}],
+            reached=[],
+        )
     )
     assert answer["workflow_failed"] == {"message": "nope"}
     assert "calls_before_failure" not in answer
 
 
 async def test_an_activation_naming_no_run_is_a_protocol_error() -> None:
-    answer = await make_worker().run_activation({"activation_id": [5], "resolutions": []})
+    answer = await answered(make_worker(), {"activation_id": [5], "resolutions": []})
     assert answer["activation_id"] == [5]
     assert answer["protocol_error"]["kind"] == "undecodable"
 
@@ -567,11 +580,11 @@ def failed_and_asked_to_cancel(failure: int, cancel: int) -> dict[str, Any]:
 
 
 def test_a_failure_in_the_requests_millisecond_is_ordered_by_sequence() -> None:
-    before = load_activation(failed_and_asked_to_cancel(2, 3), "ns").context
+    before = load_activation(to_message(failed_and_asked_to_cancel(2, 3)), "ns").context
     assert before._resolved_order["work_1"] == 2
     assert before._cancel_requested_order == 3
 
-    after = load_activation(failed_and_asked_to_cancel(3, 2), "ns").context
+    after = load_activation(to_message(failed_and_asked_to_cancel(3, 2)), "ns").context
     assert after._resolved_order["work_1"] == 3
     assert after._cancel_requested_order == 2
 
@@ -580,6 +593,6 @@ def test_unnumbered_resolutions_keep_their_place_in_the_list() -> None:
     activation_ = failed_and_asked_to_cancel(3, 2)
     for r in activation_["resolutions"]:
         r.pop("sequence", None)
-    ctx = load_activation(activation_, "ns").context
+    ctx = load_activation(to_message(activation_), "ns").context
     assert ctx._resolved_order["work_1"] == 2
     assert ctx._cancel_requested_order == 3

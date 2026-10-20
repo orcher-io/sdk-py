@@ -18,6 +18,7 @@ from orcher.worker.activation import load_activation
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
 from tests.support.kernel import activation, payload, query, resolution, run, update
+from tests.support.messages import message
 
 FALSY = [0, False, "", [], {}, 0.0, None]
 
@@ -79,7 +80,8 @@ def test_a_child_result_is_read_back_as_returned(value: Any) -> None:
         "outcome": {"value": payload(value), "end": "completed"},
     }
     loaded = load_activation(
-        activation("any", None, resolution("child", child, step_id="child_1")), "default"
+        message(activation("any", None, resolution("child", child, step_id="child_1"))),
+        "default",
     )
     cached = loaded.context._cached_results
     assert cached["child:child_1"] == value

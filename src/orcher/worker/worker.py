@@ -49,6 +49,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING, Any
 
 from orcher._internal.arguments import unpack_arguments
+from orcher._proto import host_pb2, kernel_pb2
 from orcher.actor.types import ActorMetadata
 from orcher.core.native import get_native_module, is_native_available
 from orcher.decorators.registry import (
@@ -157,34 +158,59 @@ def _package_version() -> str:
     return __version__
 
 
-def _task_request(assignment: dict[str, Any]) -> dict[str, Any]:
+def _duration_ms(message: Any, name: str) -> int | None:
+    """A duration field in milliseconds; None when it is not set."""
+    if not message.HasField(name):
+        return None
+    duration = getattr(message, name)
+    return int(duration.seconds) * 1000 + int(duration.nanos) // 1_000_000
+
+
+def _task_request(assignment: host_pb2.TaskAssignment) -> dict[str, Any]:
     """A task as the worker host hands it over, as the task runner reads it.
 
     The input is the JSON encoding of the task's arguments, packed as
     unpack_arguments reads them; empty or invalid input becomes no arguments.
     """
-    raw = bytes(assignment.get("input") or [])
+    raw = assignment.input[0].data if assignment.input else b""
     task_input: Any = {}
     if raw:
         try:
             task_input = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.error(f"Failed to deserialize task input: {e}")
+    run = assignment.run
     return {
-        "task_id": assignment.get("task_id", ""),
-        "task_type": assignment.get("task_type", ""),
-        "task_token": bytes(assignment.get("token") or []),
-        "workflow_id": assignment.get("workflow_id", ""),
-        "execution_id": assignment.get("run_id", ""),
-        "task_queue": assignment.get("task_queue", ""),
-        "namespace": assignment.get("namespace", "default"),
+        "task_id": assignment.task_id,
+        "task_type": assignment.task_type,
+        "task_token": assignment.token,
+        "workflow_id": run.workflow_id,
+        "execution_id": run.run_id,
+        "task_queue": run.task_queue,
+        "namespace": run.namespace or "default",
         "input": task_input,
-        "attempt": assignment.get("attempt"),
+        "attempt": int(assignment.attempt),
         # The limits this attempt runs under, so a handler can pace its
         # heartbeats against the interval it is judged by. Milliseconds, or
         # None when the engine set no limit.
-        "heartbeat_timeout_ms": assignment.get("heartbeat_timeout_ms"),
-        "start_to_close_timeout_ms": assignment.get("attempt_timeout_ms"),
+        "heartbeat_timeout_ms": _duration_ms(assignment, "heartbeat_timeout"),
+        "start_to_close_timeout_ms": _duration_ms(assignment, "attempt_timeout"),
+    }
+
+
+def _actor_request(operation: host_pb2.ActorOperation) -> dict[str, Any]:
+    """An actor operation as the worker host hands it over, as the actor
+    runner reads it."""
+    return {
+        "operation_id": operation.operation_id,
+        "execution_id": operation.execution_id,
+        "actor_name": operation.actor_name,
+        "key": operation.key,
+        "operation": operation.operation,
+        # The operation's argument as its JSON encoding; None for none.
+        "payload": operation.payload.data if operation.HasField("payload") else None,
+        "mode": "shared" if operation.mode == host_pb2.ACTOR_MODE_SHARED else "exclusive",
+        "metadata": dict(operation.metadata),
     }
 
 
@@ -755,6 +781,7 @@ class Worker:
                     "workflow activation",
                     asyncio.Semaphore(config.max_concurrent_workflow_executions),
                     host.next_activation,
+                    kernel_pb2.RunActivation.FromString,
                     self._handle_activation,
                 ),
                 name="pull-activations",
@@ -764,6 +791,7 @@ class Worker:
                     "task",
                     asyncio.Semaphore(config.max_concurrent_task_executions),
                     host.next_task,
+                    host_pb2.TaskAssignment.FromString,
                     self._handle_task,
                 ),
                 name="pull-tasks",
@@ -773,6 +801,7 @@ class Worker:
                     "actor operation",
                     asyncio.Semaphore(config.max_concurrent_actor_operations),
                     host.next_actor_operation,
+                    host_pb2.ActorOperation.FromString,
                     self._handle_actor_operation,
                 ),
                 name="pull-actor-operations",
@@ -804,8 +833,9 @@ class Worker:
         self,
         kind: str,
         room: asyncio.Semaphore,
-        pull: Callable[[], Awaitable[str | None]],
-        handle: Callable[[dict[str, Any]], Awaitable[None]],
+        pull: Callable[[], Awaitable[bytes | None]],
+        decode: Callable[[bytes], Any],
+        handle: Callable[[Any], Awaitable[None]],
     ) -> None:
         """Take room, pull the next piece of work, run it, hand back its
         outcome; until the host has stopped and handed over everything."""
@@ -825,7 +855,15 @@ class Worker:
                 room.release()
                 logger.debug(f"No more {kind}s: the worker host has stopped")
                 return
-            running = asyncio.create_task(self._run_in_room(room, handle(json.loads(work))))
+            try:
+                decoded = decode(work)
+            except Exception as e:
+                room.release()
+                # Nothing to answer it with; the host hands it back once its
+                # claim lapses.
+                logger.error(f"A {kind} that does not decode: {e}")
+                continue
+            running = asyncio.create_task(self._run_in_room(room, handle(decoded)))
             self._running.add(running)
             running.add_done_callback(self._running.discard)
 
@@ -844,13 +882,13 @@ class Worker:
         if self._running:
             await asyncio.gather(*list(self._running), return_exceptions=True)
 
-    async def _handle_activation(self, activation: dict[str, Any]) -> None:
+    async def _handle_activation(self, activation: kernel_pb2.RunActivation) -> None:
         """Run a workflow activation and hand back its answer."""
-        run_id = (activation.get("run") or {}).get("run_id", "")
+        run_id = activation.run.run_id
         try:
             self._stats.workflows_in_progress += 1
             answer = await self.run_activation(activation)
-            await self._get_host().complete_activation(json.dumps(answer))
+            await self._get_host().complete_activation(answer.SerializeToString())
             self._stats.workflows_executed += 1
             logger.debug(f"Answered workflow activation: {run_id}")
         except asyncio.CancelledError:
@@ -862,7 +900,7 @@ class Worker:
         finally:
             self._stats.workflows_in_progress -= 1
 
-    async def _handle_task(self, assignment: dict[str, Any]) -> None:
+    async def _handle_task(self, assignment: host_pb2.TaskAssignment) -> None:
         """
         Run a task and report its result or failure.
 
@@ -906,20 +944,21 @@ class Worker:
         finally:
             self._stats.tasks_in_progress -= 1
 
-    async def run_activation(self, activation: dict[str, Any]) -> dict[str, Any]:
+    async def run_activation(
+        self, activation: kernel_pb2.RunActivation
+    ) -> kernel_pb2.RunActivationResult:
         """Run a workflow activation as the kernel protocol carries it.
 
-        ``activation`` is a ``RunActivation`` in the JSON shape the native
-        module hands over: the run's history already resolved into the
-        outcomes its code observes. The workflow's code runs once against them
-        and the answer is a ``RunActivationResult`` in the same JSON shape:
-        every durable call the code made, in issue order, those answered from
+        ``activation`` is a ``RunActivation``: the run's history already
+        resolved into the outcomes its code observes. The workflow's code runs
+        once against them and the answer is a ``RunActivationResult``: every
+        durable call the code made, in issue order, those answered from
         history marked satisfied, with the activation's queries and updates
         answered. A workflow that raised answers its failure; an activation
         this SDK cannot process answers a protocol error, which hands it back
         to the engine.
         """
-        activation_id = list(activation.get("activation_id") or [])
+        activation_id = activation.activation_id
         try:
             loaded = load_activation(activation, self._config.namespace)
         except ProtocolRefusalError as refusal:
@@ -1419,12 +1458,13 @@ class Worker:
         finally:
             cancellation_watch.cancel()
 
-    async def _handle_actor_operation(self, request: dict[str, Any]) -> None:
+    async def _handle_actor_operation(self, operation: host_pb2.ActorOperation) -> None:
         """Run an actor operation and report its result or failure.
 
         Args:
-            request: The actor operation, as the worker host hands it over
+            operation: The actor operation, as the worker host hands it over
         """
+        request = _actor_request(operation)
         operation_id = request.get("operation_id", "")
         execution_id = request.get("execution_id", "")
 
@@ -1491,9 +1531,8 @@ class Worker:
                 f"Available: {actor_meta.operation_names()}"
             )
 
-        # The operation's argument as its JSON encoding, the bytes as a list
-        # of integers; none is no arguments.
-        payload_bytes = bytes(request.get("payload") or [])
+        # The operation's argument as its JSON encoding; none is no arguments.
+        payload_bytes = bytes(request.get("payload") or b"")
         operation_input: Any = json.loads(payload_bytes) if payload_bytes else {}
 
         actor_key = ActorKey(actor_name=actor_name, key=key)

@@ -1,7 +1,7 @@
 """Workflow activations in the kernel protocol's shape, for tests.
 
-``activation`` builds a ``RunActivation`` as the native module hands it to the
-worker (its JSON); ``run`` answers it with ``Worker.run_activation`` and turns
+``activation`` describes a ``RunActivation`` as ``support.messages`` reads it;
+``run`` answers it with ``Worker.run_activation`` and turns
 the answer into what the workflow driver sends, as the worker host does.
 """
 
@@ -13,6 +13,8 @@ from typing import Any
 import pytest
 
 from orcher.worker.worker import Worker
+
+from .messages import message
 
 START_MS = 1_700_000_000_000
 
@@ -72,7 +74,9 @@ def query(query_id: str, name: str, args: Any = None) -> dict[str, Any]:
 async def run(worker: Worker, act: dict[str, Any]) -> dict[str, Any]:
     """Run an activation; what the workflow driver sends for its answer."""
     native = pytest.importorskip("orcher._native")
-    answer = await worker.run_activation(act)
+    answer = await worker.run_activation(message(act))
     return dict(
-        json.loads(native._kernel_execution_result(act["run"]["run_id"], json.dumps(answer)))
+        json.loads(
+            native._kernel_execution_result(act["run"]["run_id"], answer.SerializeToString())
+        )
     )

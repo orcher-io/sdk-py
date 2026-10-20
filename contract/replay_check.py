@@ -40,6 +40,7 @@ from typing import Any
 import catalog
 
 from orcher import _native
+from orcher._proto import kernel_pb2
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
 
@@ -61,13 +62,13 @@ def recorded_activations(corpus: Path) -> list[tuple[str, bytes]]:
 
 
 async def answer(worker: Worker, recorded: bytes) -> dict[str, Any]:
-    activation = json.loads(_native._kernel_resolve(recorded, NAMESPACE))
+    activation = kernel_pb2.RunActivation.FromString(_native._kernel_resolve(recorded, NAMESPACE))
     # Some catalog workflows count their activations in the process; each
     # activation is answered as if it were the run's first in this process.
     catalog.ACTIVATIONS.clear()
     reply = await worker.run_activation(activation)
-    run_id = activation["run"]["run_id"]
-    return json.loads(_native._kernel_execution_result(run_id, json.dumps(reply)))
+    run_id = activation.run.run_id
+    return json.loads(_native._kernel_execution_result(run_id, reply.SerializeToString()))
 
 
 async def main() -> int:
