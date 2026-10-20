@@ -12,11 +12,11 @@ use orcher_sdk_core::poller::channel::ChannelManager;
 use orcher_sdk_core::proto::orcher::v1::{
     actor_service_client::ActorServiceClient, ExecutionStatus, InvokeOperationRequest,
 };
+use orcher_sdk_core::transport::instrument::WireChannel;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::PyResult;
 use tokio::sync::Mutex;
 use tonic::service::interceptor::InterceptedService;
-use tonic::transport::Channel;
 
 /// How long an invocation waits for its result when the caller does not say.
 const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 30_000;
@@ -70,7 +70,7 @@ impl ActorChannels {
 }
 
 /// An actor service client that sends the credentials.
-type ActorClient = ActorServiceClient<InterceptedService<Channel, Credentials>>;
+type ActorClient = ActorServiceClient<InterceptedService<WireChannel, Credentials>>;
 
 /// A client on the shared channel.
 ///

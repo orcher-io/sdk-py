@@ -847,9 +847,35 @@ async def main() -> None:
             print(f"  FAIL  {sc['id']} ({label}): {msg}")
             failed += 1
 
+    # The worker measured its own calls to the engine and the work it ran.
+    problem = wire_metrics_problem(worker)
+    if problem:
+        print(f"  FAIL  wire metrics: {problem}")
+        failed += 1
+    else:
+        print("  PASS  wire metrics")
+
     worker_task.cancel()
     print(f"\n{passed} passed, {failed} failed, {skipped} skipped, {len(scenarios)} total")
     sys.exit(1 if failed else 0)
+
+
+def wire_metrics_problem(worker: Worker) -> str | None:
+    """What is missing from the measurements of a worker that ran the suite."""
+    wire = worker.wire_metrics()
+    if wire is None:
+        return "no measurements: the worker never started"
+    for method in (
+        "/orcher.v1.ExecutionService/PollWorkflowExecution",
+        "/orcher.v1.ExecutionService/PollTaskExecution",
+        "/orcher.v1.ExecutionService/CompleteWorkflowExecution",
+        "/orcher.v1.ExecutionService/CompleteTaskExecution",
+    ):
+        if wire["methods"].get(method, {}).get("calls", 0) == 0:
+            return f"no calls of {method}"
+    if wire["work"]["activations"] == 0 or wire["work"]["tasks"] == 0:
+        return f"no work counted: {wire['work']}"
+    return None
 
 
 if __name__ == "__main__":

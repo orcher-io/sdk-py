@@ -353,6 +353,7 @@ class Worker:
 
         # The worker host (native); None until the worker starts.
         self._host: Any | None = None
+        self._final_wire_metrics: dict[str, Any] | None = None
 
         # The work pulled from the host and still running.
         self._running: set[asyncio.Task[None]] = set()
@@ -523,6 +524,19 @@ class Worker:
             started_at=self._start_time,
             stopped_at=self._stop_time,
         )
+
+    def wire_metrics(self) -> dict[str, Any] | None:
+        """Return what the worker measured of its calls to the engine and its work.
+
+        ``methods`` maps each gRPC method to its ``calls``, ``status_errors``
+        by code, ``transport_errors``, ``retries``, ``latency_buckets`` and
+        ``latency_total_us``; ``work`` counts the activations, workflow
+        reports, tasks and task reports the worker handled. ``None`` before
+        the worker has started; after it stops, its final measurements.
+        """
+        if self._host is not None:
+            return json.loads(self._host.wire_metrics())
+        return self._final_wire_metrics
 
     def get_identity(self) -> WorkerIdentity:
         """Return the worker's identity and declared release."""
@@ -1581,6 +1595,7 @@ class Worker:
                 await self._host.shutdown()
             except Exception:
                 logger.warning("Failed to stop the worker host cleanly", exc_info=True)
+            self._final_wire_metrics = json.loads(self._host.wire_metrics())
         self._cancel_running()
 
         self._host = None
