@@ -73,6 +73,9 @@ class FakeHost:
         await asyncio.Event().wait()
         return False
 
+    def wire_metrics(self) -> str:
+        return '{"methods": {}, "work": {}}'
+
     async def shutdown(self) -> None:
         # Pulls end once the host has stopped.
         self.stopped = True

@@ -259,6 +259,16 @@ impl PyWorkerHost {
         self.host.config().identity.clone()
     }
 
+    /// `wire_metrics() -> str`
+    ///
+    /// The worker's measurements so far, as JSON: per gRPC method its calls,
+    /// status errors by code, transport errors, retries and latency, and the
+    /// activations and tasks it ran.
+    fn wire_metrics(&self) -> PyResult<String> {
+        serde_json::to_string(&self.host.wire_metrics())
+            .map_err(|e| PyRuntimeError::new_err(format!("the measurements did not encode: {e}")))
+    }
+
     /// `next_activation() -> Awaitable[str | None]`
     ///
     /// The next workflow activation, as `RunActivation` JSON; `None` once the
