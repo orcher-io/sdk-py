@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.12](https://github.com/orcher-io/sdk-py/compare/v0.4.11...v0.4.12) (2026-10-20)
+
+
+### Bug Fixes
+
+* mark a workflow failure non-retryable only when its code raised it so ([#65](https://github.com/orcher-io/sdk-py/issues/65)) ([72e521f](https://github.com/orcher-io/sdk-py/commit/72e521fcb14fb1fe5b7084f5a549fd2bd06abff7))
+* send the calls a failing workflow made before it failed ([#67](https://github.com/orcher-io/sdk-py/issues/67)) ([0509ae8](https://github.com/orcher-io/sdk-py/commit/0509ae8f8c7cb8aa62e5a0ac262c0654583187f6))
+
 ## [0.4.11](https://github.com/orcher-io/sdk-py/compare/v0.4.10...v0.4.11) (2026-10-18)
 
 
