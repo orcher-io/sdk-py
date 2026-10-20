@@ -145,15 +145,15 @@ class TestOmittedMaxAttempts:
     def test_kernel_task_policy_without_count_takes_the_default(self) -> None:
         from orcher.worker.activation import _retry_policy
 
-        assert _retry_policy({"initial_interval": {"secs": 1, "nanos": 0}})["max_attempts"] == 3
-        assert _retry_policy({"max_attempts": None})["max_attempts"] == 3
+        assert _retry_policy({"initial_interval": {"secs": 1, "nanos": 0}}).max_attempts == 3
+        assert _retry_policy({"max_attempts": None}).max_attempts == 3
 
     def test_kernel_task_policy_keeps_zero_as_unlimited(self) -> None:
         from orcher.worker.activation import _retry_policy
 
-        assert _retry_policy({"max_attempts": 0})["max_attempts"] == 0
+        assert _retry_policy({"max_attempts": 0}).max_attempts == 0
 
     def test_kernel_task_policy_keeps_an_explicit_count(self) -> None:
         from orcher.worker.activation import _retry_policy
 
-        assert _retry_policy({"max_attempts": 5})["max_attempts"] == 5
+        assert _retry_policy({"max_attempts": 5}).max_attempts == 5

@@ -17,17 +17,16 @@
 //! A pull resolves `None` once the host has stopped and handed over
 //! everything it took; it never wakes up empty-handed before then.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
-use orcher_sdk_core::proto::host::v1::{
-    actor_result, task_outcome, ActorMode, ActorOperation, ActorResult, TaskAssignment, TaskOutcome,
-};
+use orcher_sdk_core::proto::host::v1::{actor_result, task_outcome, ActorResult, TaskOutcome};
 use orcher_sdk_core::proto::kernel::v1::{Failure, Payload};
+use orcher_sdk_core::proto::prost::Message;
 use orcher_sdk_host::{ActorHandler, Host, HostConfig, Registrations, StateScope};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::kernel;
 
@@ -167,45 +166,6 @@ impl RegistrationsJson {
     }
 }
 
-/// A task as Python reads it, as JSON.
-fn task_json(task: &TaskAssignment) -> serde_json::Value {
-    let run = task.run.clone().unwrap_or_default();
-    let millis = |d: &orcher_sdk_core::proto::prost_types::Duration| {
-        d.seconds
-            .saturating_mul(1000)
-            .saturating_add(i64::from(d.nanos) / 1_000_000)
-    };
-    json!({
-        "token": task.token,
-        "task_id": task.task_id,
-        "task_type": task.task_type,
-        "workflow_id": run.workflow_id,
-        "run_id": run.run_id,
-        "task_queue": run.task_queue,
-        "namespace": run.namespace,
-        // The task's arguments as their JSON encoding, one payload.
-        "input": task.input.first().map(|payload| &payload.data),
-        "attempt": task.attempt,
-        // The limits the attempt runs under; null when the engine set none.
-        "attempt_timeout_ms": task.attempt_timeout.as_ref().map(millis),
-        "heartbeat_timeout_ms": task.heartbeat_timeout.as_ref().map(millis),
-    })
-}
-
-/// An actor operation as Python reads it, as JSON.
-fn actor_operation_json(operation: &ActorOperation) -> serde_json::Value {
-    json!({
-        "operation_id": operation.operation_id,
-        "execution_id": operation.execution_id,
-        "actor_name": operation.actor_name,
-        "key": operation.key,
-        "operation": operation.operation,
-        "payload": operation.payload.as_ref().map(|payload| &payload.data),
-        "mode": if operation.mode == ActorMode::Shared as i32 { "shared" } else { "exclusive" },
-        "metadata": operation.metadata,
-    })
-}
-
 fn json_payload(data: Vec<u8>) -> Payload {
     Payload {
         data,
@@ -269,32 +229,32 @@ impl PyWorkerHost {
             .map_err(|e| PyRuntimeError::new_err(format!("the measurements did not encode: {e}")))
     }
 
-    /// `next_activation() -> Awaitable[str | None]`
+    /// `next_activation() -> Awaitable[bytes | None]`
     ///
-    /// The next workflow activation, as `RunActivation` JSON; `None` once the
-    /// worker has stopped and handed over every activation it took.
+    /// The next workflow activation, an encoded `RunActivation`; `None` once
+    /// the worker has stopped and handed over every activation it took.
     fn next_activation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let host = self.host.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(host
                 .next_activation()
                 .await
-                .map(|activation| kernel::activation_json(&activation).to_string()))
+                .map(|activation| Cow::<'static, [u8]>::Owned(activation.encode_to_vec())))
         })
     }
 
-    /// `complete_activation(result_json: str) -> Awaitable[None]`
+    /// `complete_activation(result: bytes) -> Awaitable[None]`
     ///
-    /// Answers an activation with its `RunActivationResult` JSON. Raises
-    /// `ValueError` for JSON that is not one, and `RuntimeError` for an
+    /// Answers an activation with its encoded `RunActivationResult`. Raises
+    /// `ValueError` for bytes that are not one, and `RuntimeError` for an
     /// answer the host does not take (the activation was already answered,
     /// or the worker stopped).
     fn complete_activation<'py>(
         &self,
         py: Python<'py>,
-        result_json: String,
+        result: &[u8],
     ) -> PyResult<Bound<'py, PyAny>> {
-        let answer = kernel::result_from_json(&result_json).map_err(PyValueError::new_err)?;
+        let answer = kernel::decode_result(result)?;
         let host = self.host.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             host.complete_activation(answer)
@@ -303,9 +263,10 @@ impl PyWorkerHost {
         })
     }
 
-    /// `next_task() -> Awaitable[str | None]`
+    /// `next_task() -> Awaitable[bytes | None]`
     ///
-    /// The next task, as JSON; `None` once the worker has stopped and handed
+    /// The next task, an encoded `TaskAssignment`; `None` once the worker has
+    /// stopped and handed
     /// over every task it took. The built-in session tasks are run by the
     /// host and never handed over.
     fn next_task<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -314,7 +275,7 @@ impl PyWorkerHost {
             Ok(host
                 .next_task()
                 .await
-                .map(|task| task_json(&task).to_string()))
+                .map(|task| Cow::<'static, [u8]>::Owned(task.encode_to_vec())))
         })
     }
 
@@ -396,16 +357,17 @@ impl PyWorkerHost {
         })
     }
 
-    /// `next_actor_operation() -> Awaitable[str | None]`
+    /// `next_actor_operation() -> Awaitable[bytes | None]`
     ///
-    /// The next actor operation, as JSON; `None` once the worker has stopped.
+    /// The next actor operation, an encoded `orcher.host.v1.ActorOperation`;
+    /// `None` once the worker has stopped.
     fn next_actor_operation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let host = self.host.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(host
                 .next_actor_operation()
                 .await
-                .map(|operation| actor_operation_json(&operation).to_string()))
+                .map(|operation| Cow::<'static, [u8]>::Owned(operation.encode_to_vec())))
         })
     }
 
@@ -711,35 +673,5 @@ mod tests {
                 ActorHandler::shared("Cart", "total")
             ]
         );
-    }
-
-    #[test]
-    fn a_task_crosses_with_its_limits() {
-        let task = TaskAssignment {
-            token: vec![1],
-            task_id: "charge_1".into(),
-            task_type: "charge".into(),
-            run: Some(orcher_sdk_core::proto::kernel::v1::RunRef {
-                workflow_id: "wf".into(),
-                run_id: "run".into(),
-                task_queue: "q".into(),
-                namespace: "ns".into(),
-                ..Default::default()
-            }),
-            input: vec![json_payload(b"{\"n\":1}".to_vec())],
-            attempt: 2,
-            attempt_timeout: Some(orcher_sdk_core::proto::prost_types::Duration {
-                seconds: 30,
-                nanos: 500_000_000,
-            }),
-            ..Default::default()
-        };
-        let json = task_json(&task);
-        assert_eq!(json["token"], json!([1]));
-        assert_eq!(json["input"], json!(b"{\"n\":1}"));
-        assert_eq!(json["attempt"], 2);
-        assert_eq!(json["attempt_timeout_ms"], 30_500);
-        assert_eq!(json["heartbeat_timeout_ms"], serde_json::Value::Null);
-        assert_eq!(json["namespace"], "ns");
     }
 }

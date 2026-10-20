@@ -19,6 +19,7 @@ from orcher import RetryPolicy, WorkflowContext, workflow
 from orcher.decorators import GlobalRegistry
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
+from tests.support.messages import answered
 
 _names = itertools.count()
 
@@ -70,7 +71,7 @@ async def _issued(
     workflow(name=name)(flow)
     worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
     worker._workflow_handlers[name] = GlobalRegistry.get_instance().get_workflow(name)
-    answer = await worker.run_activation(_activation(name))
+    answer = await answered(worker, _activation(name))
     assert "protocol_error" not in answer, answer
     return answer
 
@@ -104,7 +105,7 @@ async def test_a_child_and_restart_fresh_retry_policy_reach_the_kernel_command()
 
     # The kernel takes both as the commands' retry policy.
     native = pytest.importorskip("orcher._native")
-    result = json.loads(native._kernel_execution_result("run-1", json.dumps(answer)))
+    result = json.loads(native._kernel_execution_result("run-1", answer.encoded()))
     kinds = [next(iter(c)) for c in result["commands"]]
     assert kinds == ["StartChildWorkflow", "RestartFresh"]
     for command, kind in zip(result["commands"], kinds, strict=True):
@@ -131,7 +132,8 @@ async def test_a_policy_left_at_its_count_sends_three_and_zero_sends_zero() -> N
     assert [p["max_attempts"] for _, p in _policies(answer)] == [3, 3]
 
     answer = await _issued(start=RetryPolicy(max_attempts=0), restart=RetryPolicy(max_attempts=0))
-    assert [p["max_attempts"] for _, p in _policies(answer)] == [0, 0]
+    # Zero is the protocol's default, so it is sent as an unset count.
+    assert [p.get("max_attempts", 0) for _, p in _policies(answer)] == [0, 0]
 
 
 async def test_without_a_retry_policy_none_is_sent() -> None:
@@ -139,7 +141,7 @@ async def test_without_a_retry_policy_none_is_sent() -> None:
     assert _policies(answer) == [("start_child", None), ("restart_fresh", None)]
 
     native = pytest.importorskip("orcher._native")
-    result = json.loads(native._kernel_execution_result("run-1", json.dumps(answer)))
+    result = json.loads(native._kernel_execution_result("run-1", answer.encoded()))
     for command in result["commands"]:
         ((kind, fields),) = command.items()
         assert fields.get("retry_policy") is None, kind
@@ -158,5 +160,5 @@ async def test_a_retry_policy_that_is_not_a_retry_policy_is_refused() -> None:
     workflow(name=name)(flow)
     worker = Worker(WorkerConfig(server_url="http://localhost:50051", task_queue="q"))
     worker._workflow_handlers[name] = GlobalRegistry.get_instance().get_workflow(name)
-    await worker.run_activation(_activation(name))
+    await answered(worker, _activation(name))
     assert ctx_calls == ["retry_policy must be a RetryPolicy, not dict"]

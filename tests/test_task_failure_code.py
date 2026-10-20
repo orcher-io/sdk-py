@@ -17,6 +17,7 @@ import pytest
 from orcher import FailureCode, TaskContext, TaskError, task
 from orcher.errors import ErrorCode
 from orcher.worker.activation import load_activation
+from tests.support.messages import message
 
 START_MS = 1_700_000_000_000
 
@@ -48,7 +49,7 @@ def _activation(step_id: str, outcome: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _task_error(outcome: dict[str, Any]) -> TaskError:
-    ctx = load_activation(_activation("failure-code-charge_1", outcome), "ns").context
+    ctx = load_activation(message(_activation("failure-code-charge_1", outcome)), "ns").context
     with pytest.raises(TaskError) as raised:
         await ctx.execute_task(charge)
     return raised.value
@@ -110,13 +111,20 @@ async def test_a_task_that_raised_carries_its_error_type() -> None:
     assert error.attempts == 3
 
 
-async def test_a_code_newer_than_the_sdk_comes_through_as_it_is() -> None:
+async def test_a_code_is_read_by_the_name_the_protocol_gives_it() -> None:
     error = await _task_error(
-        {"failure": {"message": "x", "code": "rate_limited"}, "end": "failed", "attempts": 1}
+        {"failure": {"message": "x", "code": "invalid_command"}, "end": "failed", "attempts": 1}
     )
-    assert error.failure_code == "rate_limited"
+    assert error.failure_code == "invalid_command"
     assert error.error_type == ""
     assert error.is_cancelled is False
+
+
+async def test_a_code_this_release_does_not_name_reads_as_unspecified() -> None:
+    error = await _task_error(
+        {"failure": {"message": "x", "code": 99}, "end": "failed", "attempts": 1}
+    )
+    assert error.failure_code == FailureCode.UNSPECIFIED
 
 
 async def test_a_failure_with_no_code_or_type_reads_as_unspecified() -> None:
@@ -131,7 +139,7 @@ async def test_a_failed_closure_carries_its_type_and_code() -> None:
         "end": "cancelled",
         "attempts": 1,
     }
-    ctx = load_activation(_activation("fetch_1", outcome), "ns").context
+    ctx = load_activation(message(_activation("fetch_1", outcome)), "ns").context
     with pytest.raises(TaskError) as raised:
         await ctx.execute("fetch", lambda: 1)
     assert raised.value.is_cancelled is True
@@ -176,7 +184,7 @@ async def test_a_failed_session_creation_raises_instead_of_opening_a_session() -
         "end": "failed",
         "attempts": 1,
     }
-    ctx = load_activation(_activation(f"{SESSION_CREATE_TASK}_1", outcome), "ns").context
+    ctx = load_activation(message(_activation(f"{SESSION_CREATE_TASK}_1", outcome)), "ns").context
     with pytest.raises(TaskError) as raised:
         await ctx.create_session()
     assert raised.value.task_type == SESSION_CREATE_TASK

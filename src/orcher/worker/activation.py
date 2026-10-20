@@ -9,10 +9,8 @@ what the code did into a ``RunActivationResult``: every durable call the code
 made, in issue order, those answered from history marked satisfied, with the
 queries and updates answered.
 
-Both messages cross the native boundary as JSON, in the shapes the native
-module's ``kernel`` module documents: bytes as lists of integers, times as
-``*_ms``, durations as ``{"secs", "nanos"}``, a ``oneof`` as the one key
-present.
+Both cross the native boundary encoded, and are read and written here with
+the messages generated from the protocol (``orcher._proto``).
 
 Step ids are the ones this SDK has always made: a task's
 ``{name}_{sequence}``, a timer's ``timer_{sequence}``, a child's workflow id,
@@ -31,6 +29,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from google.protobuf import duration_pb2
+
+from orcher._proto import kernel_pb2 as kernel
 from orcher.types import DEFAULT_MAX_ATTEMPTS
 from orcher.workflow.context import WorkflowContext
 from orcher.workflow.info import WorkflowInfo
@@ -73,7 +74,7 @@ class AskedUpdate:
 class LoadedActivation:
     """What a ``RunActivation`` holds for the workflow's code, loaded."""
 
-    activation_id: list[int]
+    activation_id: bytes
     context: WorkflowContext
     workflow_type: str
     # The run's input, as the value the client started it with.
@@ -85,19 +86,27 @@ class LoadedActivation:
     journaled_updates: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _order(position: int, resolution: dict[str, Any]) -> int:
+def _order(position: int, resolution: kernel.Resolution) -> int:
     """Where a resolution comes in the order the run observes its outcomes: the
     sequence the kernel numbered it with. Which of two outcomes came first, a
     wait's result or a cancellation request, is decided by it, never by their
     times, which tie within a millisecond. A resolution the kernel did not
     number (one built by hand) keeps its place in the list, the same order."""
-    sequence = resolution.get("sequence")
-    if isinstance(sequence, int) and sequence > 0:
-        return sequence
+    if resolution.sequence > 0:
+        return int(resolution.sequence)
     return position + 1
 
 
-def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivation:
+def _millis(timestamp: Any) -> int:
+    return int(timestamp.seconds) * 1000 + int(timestamp.nanos) // 1_000_000
+
+
+def _at_ms(resolution: kernel.Resolution) -> int | None:
+    """When the resolution was recorded; None for one not yet in history."""
+    return _millis(resolution.at) if resolution.HasField("at") else None
+
+
+def load_activation(activation: kernel.RunActivation, namespace: str) -> LoadedActivation:
     """Load an activation's resolutions into a context for its run.
 
     ``namespace`` is the one the worker serves, for an activation that does not
@@ -107,43 +116,44 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
         ProtocolRefusalError: The activation names no run, or holds a resolution of
             a kind this SDK does not know.
     """
-    run = activation.get("run") or {}
-    if not run.get("run_id"):
+    run = activation.run
+    if not run.run_id:
         raise ProtocolRefusalError("the activation names no run", "undecodable")
-    resolutions: list[dict[str, Any]] = activation.get("resolutions") or []
+    resolutions = list(activation.resolutions)
 
-    started_resolution = next((r for r in resolutions if "started" in r), None)
-    started: dict[str, Any] = (started_resolution or {}).get("started") or {}
-    started_at_ms = started.get("started_at_ms")
-    if started_at_ms is None and started_resolution is not None:
-        started_at_ms = started_resolution.get("at_ms")
-    inputs = started.get("input") or []
+    started_resolution = next((r for r in resolutions if r.HasField("started")), None)
+    started = started_resolution.started if started_resolution is not None else None
+    started_at_ms: int | None = None
+    if started is not None and started.HasField("started_at"):
+        started_at_ms = _millis(started.started_at)
+    elif started_resolution is not None:
+        started_at_ms = _at_ms(started_resolution)
     workflow_input: Any = {}
-    if inputs:
-        decoded = _decode_json(inputs[0].get("data") or [])
+    if started is not None and started.input:
+        decoded = _decode_json(started.input[0].data)
         if decoded is not _UNDECODABLE:
             workflow_input = decoded
 
     # A run reading back what it already did replays: a step, child or timer
     # the history settled.
-    replaying = any("step" in r or "child" in r or "timer" in r for r in resolutions)
+    replaying = any(r.WhichOneof("what") in ("step", "child", "timer") for r in resolutions)
     info = WorkflowInfo(
-        workflow_id=run.get("workflow_id") or run["run_id"],
-        run_id=run["run_id"],
-        workflow_type=run.get("workflow_type", ""),
-        task_queue=run.get("task_queue", ""),
-        namespace=run.get("namespace") or namespace,
+        workflow_id=run.workflow_id or run.run_id,
+        run_id=run.run_id,
+        workflow_type=run.workflow_type,
+        task_queue=run.task_queue,
+        namespace=run.namespace or namespace,
         # The engine counts a run's attempt from 1 (2 for the run of its first
         # workflow-level retry) and the kernel hands it over as is. Engines
         # before orcher#356 numbered the first run 0; it reads as 1, so a first
         # run is still the first attempt there. On a current engine the floor
         # never applies.
-        attempt=max(int(started.get("attempt") or 1), 1),
+        attempt=max(int(started.attempt) if started is not None else 1, 1),
         # The workflow's clock starts when the engine recorded the start; an
         # activation that records none starts it now.
         started_at=(
             datetime.fromtimestamp(started_at_ms / 1000, tz=UTC)
-            if isinstance(started_at_ms, int)
+            if started_at_ms is not None
             else datetime.now(UTC)
         ),
     )
@@ -159,102 +169,101 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
     pending_updates: list[AskedUpdate] = []
     cancel_order: int | None = None
 
-    def note_resolved_at(key: str, at_ms: Any, order: int) -> None:
+    def note_resolved_at(key: str, at_ms: int | None, order: int) -> None:
         # The first outcome of a key is the one the run observes.
-        if isinstance(at_ms, int) and key not in resolved_at:
+        if at_ms is not None and key not in resolved_at:
             resolved_at[key] = at_ms
         resolved_order.setdefault(key, order)
 
     for position, resolution in enumerate(resolutions):
-        step_id = resolution.get("step_id") or ""
-        at_ms = resolution.get("at_ms")
+        step_id = resolution.step_id
+        at_ms = _at_ms(resolution)
         order = _order(position, resolution)
-        if "started" in resolution:
+        what = resolution.WhichOneof("what")
+        if what == "started":
             continue
-        if "step" in resolution:
+        if what == "step":
             note_resolved_at(step_id, at_ms, order)
-            outcome = resolution["step"].get("outcome") or {}
-            if "failure" in outcome:
-                failure = outcome["failure"] or {}
+            outcome = resolution.step.outcome
+            result = outcome.WhichOneof("result")
+            if result == "failure":
+                failure = outcome.failure
                 cached[f"task:{step_id}"] = {
                     TASK_FAILED_SENTINEL: True,
-                    "message": failure.get("message") or "Task failed",
-                    "error_type": failure.get("error_type") or "",
+                    "message": failure.message or "Task failed",
+                    "error_type": failure.error_type,
                     # Why it failed: "application" for a task that raised,
                     # "cancelled" for one that was cancelled, and so on.
                     "code": _failure_code(failure, outcome),
                     # How many times the task ran, so a task that exhausted
                     # its retries reports them all.
-                    "attempts": outcome.get("attempts"),
+                    "attempts": int(outcome.attempts),
                 }
-            elif "value" in outcome:
-                value = _decode_step_result((outcome["value"] or {}).get("data") or [])
+            elif result == "value":
+                value = _decode_step_result(outcome.value.data)
                 if value is not _UNDECODABLE:
                     cached[f"task:{step_id}"] = value
-        elif "child" in resolution:
-            child = resolution["child"]
-            workflow_id = child.get("child_workflow_id") or step_id
+        elif what == "child":
+            child = resolution.child
+            workflow_id = child.child_workflow_id or step_id
             key = f"child:{workflow_id}"
             if workflow_id and workflow_id not in children:
                 children.append(workflow_id)
             note_resolved_at(key, at_ms, order)
-            outcome = child.get("outcome") or {}
-            end = outcome.get("end", "unspecified")
-            failure = outcome.get("failure") or {}
-            if end == "failed":
-                cached[key] = _child_failed(failure.get("message") or "Child workflow failed")
-            elif end == "cancelled":
+            outcome = child.outcome
+            end = outcome.end
+            message = outcome.failure.message if outcome.WhichOneof("result") == "failure" else ""
+            if end == kernel.END_FAILED:
+                cached[key] = _child_failed(message or "Child workflow failed")
+            elif end == kernel.END_CANCELLED:
                 cached[key] = _child_failed("child workflow was canceled")
-            elif end == "terminated":
+            elif end == kernel.END_TERMINATED:
                 # The failure's message is the reason given for the
                 # termination, empty when none was.
-                reason = failure.get("message") or ""
                 cached[key] = _child_failed(
-                    f"child workflow was terminated: {reason}"
-                    if reason
+                    f"child workflow was terminated: {message}"
+                    if message
                     else "child workflow was terminated"
                 )
-            elif end == "timed_out":
+            elif end == kernel.END_TIMED_OUT:
                 cached[key] = _child_failed("child workflow timed out")
-            elif "value" in outcome:
-                value = _decode_step_result((outcome["value"] or {}).get("data") or [])
+            elif outcome.WhichOneof("result") == "value":
+                value = _decode_step_result(outcome.value.data)
                 if value is not _UNDECODABLE:
                     cached[key] = value
-        elif "child_started" in resolution:
+        elif what == "child_started":
             # A child history records as started keeps the id it was started
             # under, which a child given no id is named after again.
-            workflow_id = resolution["child_started"].get("child_workflow_id") or step_id
+            workflow_id = resolution.child_started.child_workflow_id or step_id
             if workflow_id and workflow_id not in children:
                 children.append(workflow_id)
-        elif "timer" in resolution:
+        elif what == "timer":
             if step_id:
                 note_resolved_at(f"timer:{step_id}", at_ms, order)
                 # Where it fired among the outcomes: a wait with a deadline
                 # takes whichever of its event and its timer came first.
                 cached[f"timer:{step_id}"] = {"fired_at": position}
-        elif "event" in resolution:
-            event = resolution["event"]
-            name = event.get("name") or ""
+        elif what == "event":
+            event = resolution.event
+            name = event.name
             if not name:
                 continue
-            data = (event.get("payload") or {}).get("data") or []
-            cached.setdefault(f"event_buffer:{name}", []).append(data)
+            cached.setdefault(f"event_buffer:{name}", []).append(event.payload.data)
             cached.setdefault(f"event_positions:{name}", []).append(position)
-            if isinstance(at_ms, int):
+            if at_ms is not None:
                 event_times.setdefault(name, []).append(at_ms)
             event_orders.setdefault(name, []).append(order)
-        elif "update" in resolution:
-            update = resolution["update"]
-            args = update.get("args") or []
-            raw = bytes((args[0] or {}).get("data") or []) if args else b""
-            if isinstance(at_ms, int):
+        elif what == "update":
+            update = resolution.update
+            raw = update.args[0].data if update.args else b""
+            if at_ms is not None:
                 # Recorded in history: the engine answered it already. It runs
                 # again where it came, so the state it set is there.
-                if not any(u["update_id"] == update.get("update_id") for u in journaled_updates):
+                if not any(u["update_id"] == update.update_id for u in journaled_updates):
                     journaled_updates.append(
                         {
-                            "update_id": update.get("update_id", ""),
-                            "update_name": update.get("name", ""),
+                            "update_id": update.update_id,
+                            "update_name": update.name,
                             "args": raw,
                             "at_ms": at_ms,
                         }
@@ -262,19 +271,15 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
             else:
                 # Not yet in history: waiting for this activation's answer.
                 pending_updates.append(
-                    AskedUpdate(
-                        update_id=update.get("update_id", ""),
-                        update_type=update.get("name", ""),
-                        args=raw,
-                    )
+                    AskedUpdate(update_id=update.update_id, update_type=update.name, args=raw)
                 )
-        elif "cancel" in resolution:
+        elif what == "cancel":
             # The first request is the one the run is told of.
             if cancel_order is None:
                 cancel_order = order
         else:
             raise ProtocolRefusalError(
-                f"a resolution of a kind this SDK does not know: {sorted(resolution)}",
+                f"a resolution of a kind this SDK does not know: {what}",
                 "unknown_resolution",
             )
 
@@ -292,21 +297,19 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
     if cached:
         ctx._set_cached_results(cached)
 
-    queries = []
-    for query in activation.get("queries") or []:
-        args = query.get("args") or []
-        queries.append(
-            AskedQuery(
-                query_id=query.get("query_id", ""),
-                query_type=query.get("name", ""),
-                args=bytes((args[0] or {}).get("data") or []) if args else None,
-            )
+    queries = [
+        AskedQuery(
+            query_id=query.query_id,
+            query_type=query.name,
+            args=query.args[0].data if query.args else None,
         )
+        for query in activation.queries
+    ]
 
     return LoadedActivation(
-        activation_id=list(activation.get("activation_id") or []),
+        activation_id=activation.activation_id,
         context=ctx,
-        workflow_type=run.get("workflow_type", ""),
+        workflow_type=run.workflow_type,
         input=workflow_input,
         queries=queries,
         updates=pending_updates,
@@ -315,14 +318,14 @@ def load_activation(activation: dict[str, Any], namespace: str) -> LoadedActivat
 
 
 def answer_activation(
-    activation_id: list[int],
+    activation_id: bytes,
     *,
     commands: list[dict[str, Any]] | None = None,
     reached: list[tuple[str, str]] | None = None,
-    failure: dict[str, Any] | None = None,
+    failure: kernel.Failure | None = None,
     query_responses: list[dict[str, Any]] | None = None,
     update_results: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
+) -> kernel.RunActivationResult:
     """The answer to an activation: what the workflow's code produced, as the
     kernel protocol's commands (or ``failure``, the run's failure), with the
     queries and updates answered.
@@ -334,37 +337,55 @@ def answer_activation(
     out (no code ran) leaves the failure unchecked. ``query_responses`` and
     ``update_results`` are as the worker's handlers produce them.
     """
-    answered: dict[str, Any] = {
-        "activation_id": list(activation_id),
-        "queries": [_query_answer(r) for r in query_responses or []],
-        "updates": [_update_answer(r) for r in update_results or []],
-    }
+    answered = kernel.RunActivationResult(
+        activation_id=activation_id,
+        queries=[_query_answer(r) for r in query_responses or []],
+        updates=[_update_answer(r) for r in update_results or []],
+    )
     if failure is not None:
-        answered["workflow_failed"] = failure
+        answered.workflow_failed.CopyFrom(failure)
         if reached is not None:
             # A call the protocol cannot carry leaves the failure unchecked,
             # rather than its calls reported wrong.
             with contextlib.suppress(ProtocolRefusalError):
-                answered["calls_before_failure"] = kernel_commands(commands or [], reached)
+                calls = kernel_commands(commands or [], reached)
+                # Set even when empty: no calls is a checked answer, unlike
+                # none given.
+                answered.calls_before_failure.SetInParent()
+                answered.calls_before_failure.commands.extend(calls)
         return answered
     try:
-        answered["commands"] = kernel_commands(commands or [], reached or [])
+        issued = kernel_commands(commands or [], reached or [])
     except ProtocolRefusalError as refusal:
         return protocol_error(activation_id, str(refusal), refusal.kind)
+    answered.commands.SetInParent()
+    answered.commands.commands.extend(issued)
     return answered
 
 
-def protocol_error(activation_id: list[int], message: str, kind: str = "") -> dict[str, Any]:
+_PROTOCOL_ERROR_KINDS = {
+    "unknown_resolution": kernel.PROTOCOL_ERROR_KIND_UNKNOWN_RESOLUTION,
+    "undecodable": kernel.PROTOCOL_ERROR_KIND_UNDECODABLE,
+    "unsupported_version": kernel.PROTOCOL_ERROR_KIND_UNSUPPORTED_VERSION,
+}
+
+
+def protocol_error(
+    activation_id: bytes, message: str, kind: str = ""
+) -> kernel.RunActivationResult:
     """An activation the SDK could not process, answered as such."""
-    return {
-        "activation_id": list(activation_id),
-        "protocol_error": {"message": message, "kind": kind},
-    }
+    return kernel.RunActivationResult(
+        activation_id=activation_id,
+        protocol_error=kernel.ProtocolError(
+            message=message,
+            kind=_PROTOCOL_ERROR_KINDS.get(kind, kernel.PROTOCOL_ERROR_KIND_UNSPECIFIED),
+        ),
+    )
 
 
 def workflow_failure(
     message: str, *, non_determinism: bool = False, non_retryable: bool = False
-) -> dict[str, Any]:
+) -> kernel.Failure:
     """The run's failure: the workflow's code raised.
 
     ``non_retryable`` when the code raised it as non-retryable, the way task
@@ -372,16 +393,20 @@ def workflow_failure(
     workflow is then not retried, whatever its retry policy allows. Any other
     failure is retried as the policy says.
     """
-    return {
-        "message": message,
-        "non_retryable": non_retryable,
-        "code": "non_determinism" if non_determinism else "application",
-    }
+    return kernel.Failure(
+        message=message,
+        non_retryable=non_retryable,
+        code=(
+            kernel.FAILURE_CODE_NON_DETERMINISM
+            if non_determinism
+            else kernel.FAILURE_CODE_APPLICATION
+        ),
+    )
 
 
 def kernel_commands(
     issued: list[dict[str, Any]], reached: list[tuple[str, str]]
-) -> list[dict[str, Any]]:
+) -> list[kernel.Command]:
     """Every durable call, in issue order: the new commands as issued, with the
     steps answered from history (reached, but not issued) marked satisfied in
     their place among them.
@@ -390,7 +415,7 @@ def kernel_commands(
         ProtocolRefusalError: A command the kernel protocol cannot carry.
     """
     issued_steps = {step for command in issued if (step := _step_of(command)) is not None}
-    out: list[dict[str, Any]] = []
+    out: list[kernel.Command] = []
     remaining = list(reached)
 
     def satisfied_up_to(until: tuple[str, str] | None) -> None:
@@ -425,163 +450,185 @@ def _step_of(command: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
-def _satisfied(step: tuple[str, str]) -> dict[str, Any]:
+def _satisfied(step: tuple[str, str]) -> kernel.Command:
     """A call answered from history: its kind and id, no payloads."""
     kind, step_id = step
     if kind == "timer":
-        return {"seq": 0, "satisfied": True, "step_id": step_id, "start_timer": {}}
+        return kernel.Command(satisfied=True, step_id=step_id, start_timer=kernel.StartTimer())
     if kind == "child":
-        return {
-            "seq": 0,
-            "satisfied": True,
-            "step_id": "",
-            "start_child": {"workflow_id": step_id},
-        }
-    return {"seq": 0, "satisfied": True, "step_id": step_id, "run_task": {}}
+        return kernel.Command(satisfied=True, start_child=kernel.StartChild(workflow_id=step_id))
+    return kernel.Command(satisfied=True, step_id=step_id, run_task=kernel.RunTask())
 
 
-def _kernel_command(command: dict[str, Any]) -> dict[str, Any]:
+_ORPHAN_POLICIES = {
+    "terminate": kernel.ORPHAN_POLICY_TERMINATE,
+    "cancel": kernel.ORPHAN_POLICY_CANCEL,
+    "abandon": kernel.ORPHAN_POLICY_ABANDON,
+}
+
+
+def _kernel_command(command: dict[str, Any]) -> kernel.Command:
     """A new command, as the kernel protocol carries it. The values, and the
     defaults the context filled in, are the ones the worker sent before."""
     if len(command) != 1:
         raise ProtocolRefusalError(f"a command of no single kind: {sorted(command)}")
     ((kind, fields),) = command.items()
     if kind == "ScheduleTask":
-        return {
-            "seq": int(fields.get("sequence") or 0),
-            "step_id": fields.get("task_id", ""),
-            "run_task": {
-                "task_type": fields.get("task_type", ""),
-                "task_queue": fields.get("task_queue") or "",
-                "input": [_payload(p) for p in fields.get("input") or []],
-                "attempt_timeout": fields.get("timeout"),
-                "heartbeat_timeout": fields.get("heartbeat_timeout"),
-                "queue_timeout": fields.get("queue_timeout"),
-                "retry_policy": _retry_policy(fields.get("retry_policy")),
-            },
-        }
+        return kernel.Command(
+            seq=int(fields.get("sequence") or 0),
+            step_id=fields.get("task_id", ""),
+            run_task=kernel.RunTask(
+                task_type=fields.get("task_type", ""),
+                task_queue=fields.get("task_queue") or "",
+                input=[_payload(p) for p in fields.get("input") or []],
+                attempt_timeout=_duration(fields.get("timeout")),
+                heartbeat_timeout=_duration(fields.get("heartbeat_timeout")),
+                queue_timeout=_duration(fields.get("queue_timeout")),
+                retry_policy=_retry_policy(fields.get("retry_policy")),
+            ),
+        )
     if kind == "StartTimer":
-        return {
-            "seq": int(fields.get("sequence") or 0),
-            "step_id": fields.get("timer_id", ""),
-            "start_timer": {"duration": fields.get("duration")},
-        }
+        return kernel.Command(
+            seq=int(fields.get("sequence") or 0),
+            step_id=fields.get("timer_id", ""),
+            start_timer=kernel.StartTimer(duration=_duration(fields.get("duration"))),
+        )
     if kind == "StartChildWorkflow":
-        return {
-            "seq": int(fields.get("sequence") or 0),
-            "start_child": {
-                "workflow_id": fields.get("workflow_id", ""),
-                "workflow_type": fields.get("workflow_type", ""),
-                "task_queue": fields.get("task_queue") or "",
-                "input": [_payload(p) for p in fields.get("input") or []],
-                "execution_timeout": fields.get("timeout"),
-                "orphan_policy": str(fields.get("orphan_policy") or "cancel").lower(),
-                "retry_policy": _retry_policy(fields.get("retry_policy")),
-            },
-        }
+        orphan_policy = str(fields.get("orphan_policy") or "cancel").lower()
+        if orphan_policy not in _ORPHAN_POLICIES:
+            raise ProtocolRefusalError(f"unknown orphan policy '{orphan_policy}'")
+        return kernel.Command(
+            seq=int(fields.get("sequence") or 0),
+            start_child=kernel.StartChild(
+                workflow_id=fields.get("workflow_id", ""),
+                workflow_type=fields.get("workflow_type", ""),
+                task_queue=fields.get("task_queue") or "",
+                input=[_payload(p) for p in fields.get("input") or []],
+                execution_timeout=_duration(fields.get("timeout")),
+                orphan_policy=_ORPHAN_POLICIES[orphan_policy],
+                retry_policy=_retry_policy(fields.get("retry_policy")),
+            ),
+        )
     if kind == "CancelChildWorkflow":
-        return {"cancel_child": {"step_id": fields.get("workflow_id", "")}}
+        return kernel.Command(
+            cancel_child=kernel.CancelChild(step_id=fields.get("workflow_id", ""))
+        )
     if kind == "SendEvent":
-        return {
-            "send_event": {
-                "workflow_id": fields.get("workflow_id", ""),
+        return kernel.Command(
+            send_event=kernel.SendEvent(
+                workflow_id=fields.get("workflow_id", ""),
                 # Any run of the target receives it.
-                "run_id": fields.get("run_id") or "",
-                "name": fields.get("event_name", ""),
-                "payload": _payload(fields.get("payload") or {}),
-            }
-        }
+                run_id=fields.get("run_id") or "",
+                name=fields.get("event_name", ""),
+                payload=_payload(fields.get("payload") or {}),
+            )
+        )
     if kind == "RecordStepResult":
         if fields.get("failure"):
             raise ProtocolRefusalError("a recorded value that failed is never recorded by this SDK")
-        return {
-            "step_id": fields.get("step_name", ""),
-            "record_value": {
-                "outcome": {
-                    "value": {"data": list(fields.get("result") or [])},
-                    "end": "completed",
-                    "attempts": int(fields.get("execution_attempt") or 1),
-                }
-            },
-        }
+        return kernel.Command(
+            step_id=fields.get("step_name", ""),
+            record_value=kernel.RecordValue(
+                outcome=kernel.Outcome(
+                    value=kernel.Payload(data=bytes(fields.get("result") or [])),
+                    end=kernel.END_COMPLETED,
+                    attempts=int(fields.get("execution_attempt") or 1),
+                )
+            ),
+        )
     if kind == "WaitForEvent":
         timeout_ms = fields.get("timeout_ms")
-        return {
-            "step_id": fields.get("step_id", ""),
-            "await_event": {
-                "name": fields.get("event_name", ""),
-                "timeout": (
-                    {"secs": timeout_ms // 1000, "nanos": (timeout_ms % 1000) * 1_000_000}
+        return kernel.Command(
+            step_id=fields.get("step_id", ""),
+            await_event=kernel.AwaitEvent(
+                name=fields.get("event_name", ""),
+                timeout=(
+                    duration_pb2.Duration(
+                        seconds=timeout_ms // 1000, nanos=(timeout_ms % 1000) * 1_000_000
+                    )
                     if isinstance(timeout_ms, int)
                     else None
                 ),
-            },
-        }
+            ),
+        )
     if kind == "CompleteWorkflow":
-        return {"complete_run": {"result": _payload(fields.get("result") or {})}}
+        return kernel.Command(
+            complete_run=kernel.CompleteRun(result=_payload(fields.get("result") or {}))
+        )
     if kind == "CancelWorkflowExecution":
-        return {"end_cancelled": {"details": ""}}
+        return kernel.Command(end_cancelled=kernel.EndCancelled())
     if kind == "RestartFresh":
-        return {
-            "restart_fresh": {
-                "workflow_type": fields.get("workflow_type") or "",
-                "task_queue": fields.get("task_queue") or "",
-                "input": [_payload(p) for p in fields.get("input") or []],
-                "execution_timeout": fields.get("timeout"),
-                "retry_policy": _retry_policy(fields.get("retry_policy")),
-            }
-        }
+        return kernel.Command(
+            restart_fresh=kernel.RestartFresh(
+                workflow_type=fields.get("workflow_type") or "",
+                task_queue=fields.get("task_queue") or "",
+                input=[_payload(p) for p in fields.get("input") or []],
+                execution_timeout=_duration(fields.get("timeout")),
+                retry_policy=_retry_policy(fields.get("retry_policy")),
+            )
+        )
     raise ProtocolRefusalError(
         f"the workflow issued a command the kernel protocol does not carry: {kind}"
     )
 
 
-def _payload(payload: dict[str, Any]) -> dict[str, Any]:
+def _payload(payload: dict[str, Any]) -> kernel.Payload:
     """A payload as the context holds it (bytes as lists of integers)."""
-    return {
-        "data": list(payload.get("data") or []),
-        "metadata": {k: list(v) for k, v in (payload.get("metadata") or {}).items()},
-    }
+    return kernel.Payload(
+        data=bytes(payload.get("data") or []),
+        metadata={k: bytes(v) for k, v in (payload.get("metadata") or {}).items()},
+    )
 
 
-def _retry_policy(policy: dict[str, Any] | None) -> dict[str, Any] | None:
+def _duration(duration: dict[str, Any] | None) -> duration_pb2.Duration | None:
+    """A duration as the context holds it, ``{"secs", "nanos"}``; None for none."""
+    if duration is None:
+        return None
+    return duration_pb2.Duration(
+        seconds=int(duration.get("secs") or 0), nanos=int(duration.get("nanos") or 0)
+    )
+
+
+def _retry_policy(policy: dict[str, Any] | None) -> kernel.RetryPolicy | None:
     """A retry policy as the context normalizes it, in the kernel's names."""
     if policy is None:
         return None
-    return {
+    return kernel.RetryPolicy(
         # An omitted count takes the documented default; 0 means unlimited.
-        "max_attempts": int(
+        max_attempts=int(
             DEFAULT_MAX_ATTEMPTS if policy.get("max_attempts") is None else policy["max_attempts"]
         ),
-        "first_delay": policy.get("initial_interval"),
-        "max_delay": policy.get("max_interval"),
-        "delay_multiplier": float(policy.get("backoff_coefficient") or 0.0),
-        "never_retry_types": list(policy.get("non_retryable_errors") or []),
-    }
+        first_delay=_duration(policy.get("initial_interval")),
+        max_delay=_duration(policy.get("max_interval")),
+        delay_multiplier=float(policy.get("backoff_coefficient") or 0.0),
+        never_retry_types=list(policy.get("non_retryable_errors") or []),
+    )
 
 
-def _query_answer(response: dict[str, Any]) -> dict[str, Any]:
+def _query_answer(response: dict[str, Any]) -> kernel.QueryAnswer:
     result = response.get("result") or {}
     if "Success" in result:
-        return {
-            "query_id": response.get("query_id", ""),
-            "value": _payload(result["Success"].get("output") or {}),
-        }
-    return {
-        "query_id": response.get("query_id", ""),
-        "failure": {"message": (result.get("Failed") or {}).get("message", "")},
-    }
+        return kernel.QueryAnswer(
+            query_id=response.get("query_id", ""),
+            value=_payload(result["Success"].get("output") or {}),
+        )
+    return kernel.QueryAnswer(
+        query_id=response.get("query_id", ""),
+        failure=kernel.Failure(message=(result.get("Failed") or {}).get("message", "")),
+    )
 
 
-def _update_answer(response: dict[str, Any]) -> dict[str, Any]:
+def _update_answer(response: dict[str, Any]) -> kernel.UpdateAnswer:
     result = response.get("result") or {}
-    answer: dict[str, Any] = {"update_id": response.get("update_id", "")}
+    answer = kernel.UpdateAnswer(update_id=response.get("update_id", ""))
     if "Completed" in result:
-        answer["value"] = _payload(result["Completed"].get("output") or {})
+        answer.value.CopyFrom(_payload(result["Completed"].get("output") or {}))
     elif "Rejected" in result:
-        answer["rejected"] = {"message": result["Rejected"].get("message", "")}
+        answer.rejected.CopyFrom(kernel.Failure(message=result["Rejected"].get("message", "")))
     else:
-        answer["failed"] = {"message": (result.get("Failed") or {}).get("message", "")}
+        answer.failed.CopyFrom(
+            kernel.Failure(message=(result.get("Failed") or {}).get("message", ""))
+        )
     return answer
 
 
@@ -596,30 +643,33 @@ class _Undecodable:
 _UNDECODABLE: Any = _Undecodable()
 
 
-def _decode_step_result(data: list[int]) -> Any:
+def _decode_step_result(data: bytes) -> Any:
     """A recorded result: empty is None; bytes that are not JSON are not a result."""
     if not data:
         return None
     return _decode_json(data)
 
 
-def _decode_json(data: list[int]) -> Any:
+def _decode_json(data: bytes) -> Any:
     try:
-        return json.loads(bytes(data).decode("utf-8"))
+        return json.loads(data.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return _UNDECODABLE
 
 
-def _failure_code(failure: dict[str, Any], outcome: dict[str, Any]) -> str:
+def _failure_code(failure: kernel.Failure, outcome: kernel.Outcome) -> str:
     """A step failure's code; with none, taken from how the step ended.
 
     A step that ended cancelled or timed out reads as such when its failure
     carries no code; any other is ``"unspecified"``.
     """
-    code = failure.get("code")
-    if code and code != "unspecified":
-        return str(code)
-    end = outcome.get("end")
-    if end in ("cancelled", "timed_out"):
-        return str(end)
+    if failure.code:
+        # The protocol's name for it, in lower case without the prefix, so a
+        # code the protocol adds reads as the protocol names it.
+        with contextlib.suppress(ValueError):
+            return kernel.FailureCode.Name(failure.code).removeprefix("FAILURE_CODE_").lower()
+    if outcome.end == kernel.END_CANCELLED:
+        return "cancelled"
+    if outcome.end == kernel.END_TIMED_OUT:
+        return "timed_out"
     return "unspecified"

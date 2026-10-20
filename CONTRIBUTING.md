@@ -24,8 +24,12 @@ Rerun `maturin develop` after changing anything under `native/`.
 The native module binds the Rust SDK core (`orcher-sdk-core`) and the worker
 host shared with the other SDKs (`orcher-sdk-host`, in the `sdk-core`
 repository). The worker pulls workflow activations, tasks and actor
-operations from the host; workflow activations cross as the kernel
-protocol's messages (`src/orcher/worker/activation.py`).
+operations from the host. All three cross encoded, as the kernel and host
+protocols' messages, read and written with the Python messages generated
+from the same `.proto` files the native module builds against
+(`src/orcher/_proto`, committed). After moving to a new `orcher-proto`,
+regenerate them with `python scripts/generate_proto.py` (needs `protoc` and
+cargo).
 
 To build against local checkouts of `sdk-core` (core and host) and `protos`
 instead of the crates.io releases in `Cargo.toml`, copy
