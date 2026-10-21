@@ -865,13 +865,23 @@ def wire_metrics_problem(worker: Worker) -> str | None:
     wire = worker.wire_metrics()
     if wire is None:
         return "no measurements: the worker never started"
-    for method in (
+
+    def calls(method: str) -> int:
+        return int(wire["methods"].get(method, {}).get("calls", 0))
+
+    # An engine that hands out several items per poll is polled with the
+    # batch calls; an older one, one item at a time.
+    for one in (
         "/orcher.v1.ExecutionService/PollWorkflowExecution",
         "/orcher.v1.ExecutionService/PollTaskExecution",
+    ):
+        if calls(one) + calls(one + "s") == 0:
+            return f"no calls of {one} or {one}s"
+    for method in (
         "/orcher.v1.ExecutionService/CompleteWorkflowExecution",
         "/orcher.v1.ExecutionService/CompleteTaskExecution",
     ):
-        if wire["methods"].get(method, {}).get("calls", 0) == 0:
+        if calls(method) == 0:
             return f"no calls of {method}"
     if wire["work"]["activations"] == 0 or wire["work"]["tasks"] == 0:
         return f"no work counted: {wire['work']}"
