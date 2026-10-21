@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.13](https://github.com/orcher-io/sdk-py/compare/v0.4.12...v0.4.13) (2026-10-21)
+
+
+### Features
+
+* carry work and answers to Python as protocol messages ([#71](https://github.com/orcher-io/sdk-py/issues/71)) ([17374d5](https://github.com/orcher-io/sdk-py/commit/17374d55bf03934dfdd43c5b0c1c649ee00e4fb6))
+* expose the worker's measurements of the engine wire and its work ([#69](https://github.com/orcher-io/sdk-py/issues/69)) ([25d4a41](https://github.com/orcher-io/sdk-py/commit/25d4a41e5488c85cd63bc73b126b3cf9f8ce9c29))
+* move to sdk-core 0.19 ([#72](https://github.com/orcher-io/sdk-py/issues/72)) ([cbcf234](https://github.com/orcher-io/sdk-py/commit/cbcf234544a170af339a059de080cf4f36c73ace))
+
 ## [0.4.12](https://github.com/orcher-io/sdk-py/compare/v0.4.11...v0.4.12) (2026-10-20)
 
 
