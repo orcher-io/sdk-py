@@ -6,7 +6,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use orcher_sdk_core::codec::{EncryptionPayloadCodec, GzipPayloadCodec, PayloadCodec};
+use orcher_sdk_core::payload::codec::{EncryptionPayloadCodec, GzipPayloadCodec, PayloadCodec};
 
 use crate::types::PyPayload;
 

@@ -1,4 +1,4 @@
-//! The worker, as a binding over the shared worker host (`orcher-sdk-host`).
+//! The worker, as a binding over sdk-core's worker host.
 //!
 //! The host runs one worker's plumbing: core's workflow, task and actor
 //! drivers built from one configuration, the worker's registration and
@@ -7,7 +7,7 @@
 //!
 //! - `next_activation` / `complete_activation`: a workflow activation as the
 //!   kernel protocol's `RunActivation`, answered with a `RunActivationResult`,
-//!   both as JSON (see [`crate::kernel`]).
+//!   both encoded, as the host's encoded view takes and gives them.
 //! - `next_task` / `complete_task` / `fail_task`: a task, with `heartbeat`
 //!   and `task_cancelled` while it runs.
 //! - `next_actor_operation` / `complete_actor_operation` /
@@ -22,13 +22,10 @@ use std::time::Duration;
 
 use orcher_sdk_core::proto::host::v1::{actor_result, task_outcome, ActorResult, TaskOutcome};
 use orcher_sdk_core::proto::kernel::v1::{Failure, Payload};
-use orcher_sdk_core::proto::prost::Message;
-use orcher_sdk_host::{ActorHandler, Host, HostConfig, Registrations, StateScope};
+use orcher_sdk_core::{ActorHandler, EncodedHost, Host, HostConfig, Registrations, StateScope};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use serde::Deserialize;
-
-use crate::kernel;
 
 /// The worker's configuration, as `WorkerHost.start` reads it from JSON.
 /// Every option left out keeps the host's default.
@@ -82,9 +79,10 @@ fn checked_api_key(api_key: Option<String>) -> Result<Option<String>, String> {
     let Some(key) = api_key.filter(|k| !k.trim().is_empty()) else {
         return Ok(None);
     };
-    if format!("Bearer {key}")
-        .parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
-        .is_err()
+    // A header value is visible ASCII, spaces and tabs.
+    if !key
+        .bytes()
+        .all(|b| b == b'\t' || (0x20..=0x7e).contains(&b))
     {
         return Err(
             "api_key contains characters that cannot be sent in the authorization header"
@@ -182,6 +180,9 @@ fn host_error(what: &str, error: impl std::fmt::Display) -> PyErr {
 #[pyclass(name = "WorkerHost", frozen)]
 pub struct PyWorkerHost {
     host: Host,
+    /// The same host, taking and giving its messages encoded, as Python
+    /// reads and writes them.
+    encoded: EncodedHost,
 }
 
 #[pymethods]
@@ -209,7 +210,8 @@ impl PyWorkerHost {
             let host = Host::start(config, registrations.into_registrations())
                 .await
                 .map_err(|e| host_error("the worker could not start", e))?;
-            Ok(PyWorkerHost { host })
+            let encoded = host.encoded();
+            Ok(PyWorkerHost { host, encoded })
         })
     }
 
@@ -234,12 +236,12 @@ impl PyWorkerHost {
     /// The next workflow activation, an encoded `RunActivation`; `None` once
     /// the worker has stopped and handed over every activation it took.
     fn next_activation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let host = self.host.clone();
+        let host = self.encoded.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(host
                 .next_activation()
                 .await
-                .map(|activation| Cow::<'static, [u8]>::Owned(activation.encode_to_vec())))
+                .map(Cow::<'static, [u8]>::Owned))
         })
     }
 
@@ -254,12 +256,15 @@ impl PyWorkerHost {
         py: Python<'py>,
         result: &[u8],
     ) -> PyResult<Bound<'py, PyAny>> {
-        let answer = kernel::decode_result(result)?;
-        let host = self.host.clone();
+        let answer = result.to_vec();
+        let host = self.encoded.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            host.complete_activation(answer)
+            host.complete_activation(&answer)
                 .await
-                .map_err(|e| host_error("the activation's answer was not taken", e))
+                .map_err(|e| match e {
+                    orcher_sdk_core::Error::Protocol(_) => PyValueError::new_err(e.to_string()),
+                    e => host_error("the activation's answer was not taken", e),
+                })
         })
     }
 
@@ -270,12 +275,9 @@ impl PyWorkerHost {
     /// over every task it took. The built-in session tasks are run by the
     /// host and never handed over.
     fn next_task<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let host = self.host.clone();
+        let host = self.encoded.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            Ok(host
-                .next_task()
-                .await
-                .map(|task| Cow::<'static, [u8]>::Owned(task.encode_to_vec())))
+            Ok(host.next_task().await.map(Cow::<'static, [u8]>::Owned))
         })
     }
 
@@ -362,12 +364,12 @@ impl PyWorkerHost {
     /// The next actor operation, an encoded `orcher.host.v1.ActorOperation`;
     /// `None` once the worker has stopped.
     fn next_actor_operation<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let host = self.host.clone();
+        let host = self.encoded.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(host
                 .next_actor_operation()
                 .await
-                .map(|operation| Cow::<'static, [u8]>::Owned(operation.encode_to_vec())))
+                .map(Cow::<'static, [u8]>::Owned))
         })
     }
 
@@ -524,7 +526,7 @@ impl PyWorkerHost {
         let config = self.host.config();
         format!(
             "WorkerHost(server_url='{}', namespace='{}', task_queue='{}', identity='{}')",
-            config.server_url, config.namespace, config.task_queue, config.identity
+            config.connection.url, config.connection.namespace, config.task_queue, config.identity
         )
     }
 }
@@ -563,14 +565,14 @@ mod tests {
             }"#,
         )
         .unwrap();
-        assert_eq!(config.server_url, "http://localhost:50051");
+        assert_eq!(config.connection.url, "http://localhost:50051");
         assert_eq!(config.task_queue, "orders");
-        assert_eq!(config.namespace, "shop");
+        assert_eq!(config.connection.namespace, "shop");
         assert_eq!(config.identity, "worker-1");
-        assert_eq!(config.api_key.as_deref(), Some("key"));
-        assert_eq!(config.organization_id.as_deref(), Some("org"));
+        assert_eq!(config.connection.api_key.as_deref(), Some("key"));
+        assert_eq!(config.connection.organization_id.as_deref(), Some("org"));
         assert_eq!(config.version_id.as_deref(), Some("v7"));
-        assert!(config.tls.is_none());
+        assert!(config.connection.tls.is_none());
         assert_eq!(
             (
                 config.max_concurrent_workflows,
@@ -612,7 +614,7 @@ mod tests {
         assert!(config.identity.starts_with("orcher-worker-"));
         // A blank release is no release, and a blank key no key.
         assert!(config.version_id.is_none());
-        assert!(config.api_key.is_none());
+        assert!(config.connection.api_key.is_none());
     }
 
     /// The worker reports that its workflow failures carry the mark the
@@ -632,6 +634,7 @@ mod tests {
     fn https_means_tls_on_the_system_trust_store() {
         let tls = config(r#"{ "server_url": "https://x:1", "task_queue": "q", "namespace": "n" }"#)
             .unwrap()
+            .connection
             .tls
             .expect("tls");
         assert!(tls.ca_cert.is_none() && tls.client_cert.is_none());

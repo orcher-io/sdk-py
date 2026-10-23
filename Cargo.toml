@@ -20,18 +20,11 @@ path = "native/src/lib.rs"
 pyo3 = { version = "0.23", features = ["abi3-py311"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 
-# ORCHER SDK Core, from crates.io, with the protocol types it re-exports
-# (orcher_sdk_core::proto), so the build has one orcher-proto. To build
-# against local checkouts instead, see .cargo/config.example.toml.
-orcher-sdk-core = "0.19"
-# The worker host: one worker's drivers, lifecycle and registration, shared
-# with the Rust and TypeScript SDKs. This crate binds it for Python.
-orcher-sdk-host = "0.19"
-
-# gRPC client
-tonic = { version = "0.12", features = ["transport", "tls", "tls-native-roots"] }
-prost = "0.13"
-prost-types = "0.13"
+# ORCHER SDK Core, from crates.io: the kernel, the worker host and the
+# clients this crate binds for Python, speaking encoded kernel and host
+# messages. To build against a local checkout instead, see
+# .cargo/config.example.toml.
+orcher-sdk-core = "0.20.1"
 
 # Async runtime
 tokio = { version = "1.35", features = ["full", "sync"] }

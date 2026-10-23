@@ -34,7 +34,6 @@ pub fn core_error_to_py(error: CoreError) -> PyErr {
         CoreError::Connection(msg) => {
             PyConnectionError::new_err(format!("Connection error: {}", msg))
         }
-        CoreError::Transport(e) => PyConnectionError::new_err(format!("Transport error: {}", e)),
 
         // Timeout errors
         CoreError::Timeout { operation, .. } => {
@@ -131,7 +130,7 @@ pub fn core_error_to_py(error: CoreError) -> PyErr {
         // Generic errors
         CoreError::Internal(msg) => PyRuntimeError::new_err(format!("Internal error: {}", msg)),
 
-        // Any other error. There is no GrpcStatus arm: the core SDK maps
+        // Any other error. There is no Status arm: the core SDK maps
         // NOT_FOUND, ALREADY_EXISTS and DEADLINE_EXCEEDED onto the semantic
         // variants handled above. Keeping that mapping in one place stops two
         // copies from drifting apart.
