@@ -21,14 +21,6 @@ use crate::error::IntoPyResult;
 use crate::runtime::block_on;
 use crate::types::{PyWorkflowExecution, PyWorkflowStatus};
 
-/// Convert a millisecond duration to the proto `Duration` used in retry policies.
-fn ms_to_proto_duration(ms: u64) -> orcher_sdk_core::proto::prost_types::Duration {
-    orcher_sdk_core::proto::prost_types::Duration {
-        seconds: (ms / 1000) as i64,
-        nanos: ((ms % 1000) * 1_000_000) as i32,
-    }
-}
-
 /// The sdk-core options for a cancellation whose cleanup may take `cleanup_timeout`.
 fn cancel_opts(cleanup_timeout: Option<Duration>) -> CancelWorkflowOpts {
     let opts = CancelWorkflowOpts::default();
@@ -37,6 +29,10 @@ fn cancel_opts(cleanup_timeout: Option<Duration>) -> CancelWorkflowOpts {
         None => opts,
     }
 }
+
+/// How long an actor invocation waits for its result when the caller does
+/// not say.
+const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 30_000;
 
 /// Attempts a retry policy allows when it leaves `max_attempts` out, the first one
 /// included. It is the SDK's documented `RetryPolicy` default.
@@ -51,12 +47,12 @@ fn maximum_attempts(max_attempts: Option<i32>) -> i32 {
     max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS)
 }
 
-/// Build a proto `RetryPolicy` from the `retry_policy` kwargs dict passed by the
-/// Python client. Fields are millisecond-based to match the native retry surface.
-/// Returns `None` when no policy dict is present.
+/// Build sdk-core's workflow retry policy from the `retry_policy` kwargs dict
+/// passed by the Python client. Fields are millisecond-based to match the
+/// native retry surface. Returns `None` when no policy dict is present.
 fn extract_retry_policy(
     kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Option<orcher_sdk_core::proto::orcher::v1::RetryPolicy>> {
+) -> PyResult<Option<orcher_sdk_core::WorkflowRetryPolicy>> {
     let Some(obj) = kwargs.and_then(|k| k.get_item("retry_policy").ok().flatten()) else {
         return Ok(None);
     };
@@ -78,23 +74,24 @@ fn extract_retry_policy(
         .flatten()
         .and_then(|v| v.extract().ok())
         .unwrap_or_default();
-    Ok(Some(orcher_sdk_core::proto::orcher::v1::RetryPolicy {
-        initial_interval: get_u64("initial_interval_ms").map(ms_to_proto_duration),
+    Ok(Some(orcher_sdk_core::WorkflowRetryPolicy {
+        initial_interval: get_u64("initial_interval_ms").map(Duration::from_millis),
         backoff_coefficient: d
             .get_item("backoff_coefficient")
             .ok()
             .flatten()
             .and_then(|v| v.extract().ok())
             .unwrap_or(2.0),
-        maximum_interval: get_u64("max_interval_ms").map(ms_to_proto_duration),
-        maximum_attempts: maximum_attempts(
+        max_interval: get_u64("max_interval_ms").map(Duration::from_millis),
+        // A negative count cannot be sent; it reads as unlimited, as 0 does.
+        max_attempts: u32::try_from(maximum_attempts(
             d.get_item("max_attempts")
                 .ok()
                 .flatten()
                 .and_then(|v| v.extract().ok()),
-        ),
-        non_retryable_error_types: non_retryable,
-        ..Default::default()
+        ))
+        .unwrap_or(0),
+        non_retryable_errors: non_retryable,
     }))
 }
 
@@ -218,9 +215,7 @@ impl PyClientConfig {
 impl PyClientConfig {
     /// The TLS settings for this config's server URL and `tls_*` paths; see
     /// [`crate::tls::tls_from_paths`].
-    fn build_tls_config(
-        &self,
-    ) -> std::result::Result<Option<orcher_sdk_core::poller::TlsConfig>, String> {
+    fn build_tls_config(&self) -> std::result::Result<Option<orcher_sdk_core::TlsConfig>, String> {
         crate::tls::tls_from_paths(
             &self.server_url,
             self.tls_ca_cert_path.as_deref(),
@@ -234,8 +229,8 @@ impl PyClientConfig {
 struct ClientInner {
     client: WorkflowClient,
     config: PyClientConfig,
-    /// The connection actor invocations go out on, with the client's key.
-    actors: crate::actor_invoke::ActorChannels,
+    /// Actor invocations, on the client's connection with its credentials.
+    actors: orcher_sdk_core::ActorClient,
 }
 
 /// Client for starting, listing, and searching workflows.
@@ -265,87 +260,32 @@ impl PyClient {
             .build_tls_config()
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
 
+        let mut options = orcher_sdk_core::ConnectOptions::new(&server_url)
+            .with_namespace(&config.namespace)
+            .with_connect_timeout(connect_timeout);
+        if let Some(ref key) = config.api_key {
+            options = options.with_api_key(key);
+        }
+        let dial_now = tls_config.is_some();
+        if let Some(tls) = tls_config {
+            options = options.with_tls(tls);
+        }
+        let request_timeout = std::time::Duration::from_millis(config.timeout_ms);
+
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let client = if let Some(ref tls) = tls_config {
-                // No custom CA -> verify against the system trust store, which is
-                // what mTLS to a publicly-trusted server needs.
-                let mut tls_cfg = match tls.ca_cert {
-                    Some(ref ca) => tonic::transport::ClientTlsConfig::new()
-                        .ca_certificate(tonic::transport::Certificate::from_pem(ca)),
-                    None => tonic::transport::ClientTlsConfig::new().with_native_roots(),
-                };
-
-                if let (Some(ref cert), Some(ref key)) = (&tls.client_cert, &tls.client_key) {
-                    let identity = tonic::transport::Identity::from_pem(cert, key);
-                    tls_cfg = tls_cfg.identity(identity);
-                }
-
-                if let Some(ref domain) = tls.domain_name {
-                    tls_cfg = tls_cfg.domain_name(domain.clone());
-                }
-
-                let endpoint = tonic::transport::Endpoint::from_shared(server_url.clone())
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Invalid server URL: {}",
-                            e
-                        ))
-                    })?
-                    .tls_config(tls_cfg)
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "TLS configuration error: {}",
-                            e
-                        ))
-                    })?
-                    .connect_timeout(connect_timeout)
-                    .timeout(std::time::Duration::from_secs(180));
-
-                let channel = endpoint.connect().await.map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "TLS connection failed: {}",
-                        crate::tls::with_causes(&e)
-                    ))
-                })?;
-
-                WorkflowClient::from_channel(channel)
+            // With TLS settings the connection is made now, so a certificate
+            // the server refuses fails here; without, on the first call.
+            let connection = if dial_now {
+                orcher_sdk_core::Connection::connect(options).await
             } else {
-                // As WorkflowClient::connect builds it, with the configured
-                // connect timeout in place of its fixed one.
-                let channel = tonic::transport::Endpoint::from_shared(server_url.clone())
-                    .map_err(|e| {
-                        pyo3::exceptions::PyRuntimeError::new_err(format!(
-                            "Invalid server URL: {}",
-                            e
-                        ))
-                    })?
-                    .connect_timeout(connect_timeout)
-                    .timeout(std::time::Duration::from_secs(180))
-                    .connect_lazy();
-                WorkflowClient::from_channel(channel)
-            };
-
-            // Attach the API key so every request carries it.
-            let client = match config.api_key {
-                Some(ref key) => client.with_api_key(key.clone()),
-                None => client,
-            };
-
-            // Actor invocations dial lazily, on first use, with the same TLS.
-            let manager = match tls_config {
-                Some(tls) => orcher_sdk_core::poller::channel::ChannelManager::with_tls(
-                    server_url.clone(),
-                    tls,
-                ),
-                None => orcher_sdk_core::poller::channel::ChannelManager::new(server_url.clone()),
-            };
-            let actors = crate::actor_invoke::ActorChannels::new(
-                manager,
-                crate::actor_invoke::Credentials {
-                    api_key: config.api_key.clone(),
-                    organization_id: None,
-                },
-            );
+                orcher_sdk_core::Connection::lazy(options)
+            }
+            .map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("Client connection failed: {e}"))
+            })?;
+            // Every call the client makes carries the configured timeout.
+            let client = connection.workflow_client().with_timeout(request_timeout);
+            let actors = connection.actor_client();
 
             let mut guard = inner.lock().await;
             *guard = Some(ClientInner {
@@ -415,7 +355,7 @@ impl PyClient {
             .transpose()?;
         let id_reuse_policy = id_reuse_policy
             .map(|name| {
-                use orcher_sdk_core::proto::orcher::v1::WorkflowIdReusePolicy as Policy;
+                use orcher_sdk_core::WorkflowIdReusePolicy as Policy;
                 match name.as_str() {
                     "ALLOW_DUPLICATE" => Ok(Policy::AllowDuplicate),
                     "ALLOW_DUPLICATE_FAILED_ONLY" => Ok(Policy::AllowDuplicateFailedOnly),
@@ -640,8 +580,21 @@ impl PyClient {
                     .actors
                     .clone()
             };
-            crate::actor_invoke::invoke(&actors, actor_name, key, operation, payload, timeout_ms)
+            actors
+                .invoke_operation(
+                    actor_name,
+                    key,
+                    operation,
+                    payload,
+                    Some(timeout_ms.unwrap_or(DEFAULT_INVOKE_TIMEOUT_MS)),
+                    None,
+                )
                 .await
+                .map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "Actor operation failed: {e}"
+                    ))
+                })
         })
     }
 

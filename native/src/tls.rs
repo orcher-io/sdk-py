@@ -2,32 +2,13 @@
 //!
 //! The client and the worker both decide TLS here, so they cannot disagree.
 
-use orcher_sdk_core::poller::TlsConfig;
+use orcher_sdk_core::TlsConfig;
 
 /// Whether `url` uses the `https` scheme.
 pub(crate) fn is_https(url: &str) -> bool {
     url.trim()
         .get(..8)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
-}
-
-/// `error` followed by each cause in its source chain.
-///
-/// tonic reports a failed TLS handshake as a bare "transport error"; why it
-/// failed (an untrusted certificate, a client certificate the server
-/// required) is only in the chain.
-pub(crate) fn with_causes(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
-    while let Some(cause) = source {
-        let cause_text = cause.to_string();
-        if !cause_text.is_empty() && !text.contains(&cause_text) {
-            text.push_str(": ");
-            text.push_str(&cause_text);
-        }
-        source = cause.source();
-    }
-    text
 }
 
 /// Reads the PEM files named by the `tls_*` paths into a [`TlsConfig`].
@@ -112,31 +93,6 @@ mod tests {
         assert_eq!(tls.ca_cert.as_deref(), Some(&b"ca"[..]));
         assert_eq!(tls.client_cert.as_deref(), Some(&b"cert"[..]));
         assert_eq!(tls.client_key.as_deref(), Some(&b"key"[..]));
-    }
-
-    #[test]
-    fn causes_follow_the_error() {
-        let inner = std::io::Error::other("received fatal alert: CertificateRequired");
-        let outer = std::io::Error::other(Wrapped(inner));
-        assert_eq!(
-            with_causes(&outer),
-            "transport error: received fatal alert: CertificateRequired"
-        );
-    }
-
-    #[derive(Debug)]
-    struct Wrapped(std::io::Error);
-
-    impl std::fmt::Display for Wrapped {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str("transport error")
-        }
-    }
-
-    impl std::error::Error for Wrapped {
-        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-            Some(&self.0)
-        }
     }
 
     #[test]

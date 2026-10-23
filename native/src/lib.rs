@@ -32,7 +32,6 @@ use pyo3::prelude::*;
 use std::sync::Mutex;
 use tracing_subscriber::{fmt, EnvFilter};
 
-mod actor_invoke;
 mod client;
 mod codec;
 mod convert;
