@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.14](https://github.com/orcher-io/sdk-py/compare/v0.4.13...v0.4.14) (2026-10-23)
+
+
+### Features
+
+* run on sdk-core 0.20 ([#73](https://github.com/orcher-io/sdk-py/issues/73)) ([f19b821](https://github.com/orcher-io/sdk-py/commit/f19b8214bfe684f9eb6e8a56262cbc9b933a864a))
+
 ## [0.4.13](https://github.com/orcher-io/sdk-py/compare/v0.4.12...v0.4.13) (2026-10-21)
 
 
