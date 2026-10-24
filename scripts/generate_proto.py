@@ -27,7 +27,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "src" / "orcher" / "_proto"
 # The messages that cross the native boundary, and what they import.
-PROTOS = ["kernel.proto", "host.proto"]
+PROTOS = ["kernel.proto", "host.proto", "client.proto"]
 
 
 def proto_dir_from_cargo() -> Path:

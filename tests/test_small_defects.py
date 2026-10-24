@@ -105,11 +105,13 @@ async def test_the_client_hands_its_connection_timeout_to_the_native_client(
 
     configs: list[Any] = []
 
-    class FakeNativeClient:
-        async def connect(self, config: Any) -> None:
+    class FakeConnection:
+        @staticmethod
+        async def connect(config: Any) -> Any:
             configs.append(config)
+            return object()
 
-    monkeypatch.setattr(_native, "Client", FakeNativeClient)
+    monkeypatch.setattr(_native, "ClientConnection", FakeConnection)
     client = Client(
         ClientConfig(server_url="http://localhost:1", connection_timeout=timedelta(seconds=2.5))
     )
@@ -130,18 +132,6 @@ def test_the_next_timer_is_the_earliest_pending_one() -> None:
     controller.cancel_timer(first)
 
     assert controller.get_next_timer_time() == datetime(2026, 1, 1, 0, 0, 20)
-
-
-def test_a_description_reads_its_times_like_a_listing() -> None:
-    from orcher.types import WorkflowExecutionDescription, WorkflowExecutionInfo
-
-    started = {"secs_since_epoch": 1_700_000_000, "nanos_since_epoch": 500_000_000}
-    description = WorkflowExecutionDescription._from_dict({"startTime": started})
-    listing = WorkflowExecutionInfo._from_dict({"startTime": started})
-
-    assert description.start_time == listing.start_time
-    assert description.start_time is not None
-    assert description.close_time is None
 
 
 def test_a_missing_native_module_names_the_sdk_package(monkeypatch: pytest.MonkeyPatch) -> None:

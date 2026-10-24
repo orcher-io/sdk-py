@@ -7,41 +7,79 @@ from datetime import timedelta
 from typing import Any
 
 from orcher._internal.arguments import pack_arguments
+from orcher._proto import client_pb2 as pb
+from orcher.client import _protocol
 from orcher.client.config import ClientConfig
 from orcher.client.workflow_handle import WorkflowHandle
-from orcher.errors import ClientError
-from orcher.errors._translate import translate
-from orcher.types import RetryPolicy, WorkflowIdReusePolicy, WorkflowListPage
+from orcher.errors import ClientError, WorkflowError
+from orcher.types import RetryPolicy, WorkflowIdReusePolicy, WorkflowListPage, WorkflowStatus
 
 __all__ = [
     "Client",
 ]
 
 
-def _retry_policy_to_native(rp: RetryPolicy | dict[str, Any]) -> dict[str, Any]:
-    """Convert a workflow retry policy into the millisecond dict the native binding reads.
+#: The attempts a retry policy allows when a dict leaves ``max_attempts`` out,
+#: the first one included: the SDK's documented ``RetryPolicy`` default.
+DEFAULT_MAX_ATTEMPTS = 3
 
-    Accepts a ``RetryPolicy`` or a plain dict; a dict is passed through unchanged.
+
+def _retry_policy(rp: RetryPolicy | dict[str, Any]) -> pb.RetryPolicy:
+    """A workflow retry policy as the client protocol carries it.
+
+    Accepts a ``RetryPolicy`` or a dict with millisecond intervals
+    (``initial_interval_ms``, ``max_interval_ms``). A dict that leaves
+    ``max_attempts`` out allows :data:`DEFAULT_MAX_ATTEMPTS`; 0 is unlimited.
     """
     if isinstance(rp, RetryPolicy):
-        return {
-            "max_attempts": rp.max_attempts,
-            "initial_interval_ms": int(rp.initial_interval.total_seconds() * 1000),
-            "max_interval_ms": int(rp.max_interval.total_seconds() * 1000),
-            "backoff_coefficient": rp.backoff_coefficient,
-            "non_retryable_error_types": list(rp.non_retryable_error_types),
-        }
+        return pb.RetryPolicy(
+            max_attempts=max(rp.max_attempts, 0),
+            initial_interval=_protocol.duration(rp.initial_interval),
+            max_interval=_protocol.duration(rp.max_interval),
+            backoff_coefficient=rp.backoff_coefficient,
+            non_retryable_errors=list(rp.non_retryable_error_types),
+        )
     if isinstance(rp, dict):
-        return rp
+        policy = pb.RetryPolicy(
+            max_attempts=max(int(rp.get("max_attempts", DEFAULT_MAX_ATTEMPTS)), 0),
+            backoff_coefficient=float(rp.get("backoff_coefficient", 2.0)),
+            non_retryable_errors=list(rp.get("non_retryable_error_types", [])),
+        )
+        if rp.get("initial_interval_ms") is not None:
+            policy.initial_interval.CopyFrom(
+                _protocol.duration(timedelta(milliseconds=rp["initial_interval_ms"]))
+            )
+        if rp.get("max_interval_ms") is not None:
+            policy.max_interval.CopyFrom(
+                _protocol.duration(timedelta(milliseconds=rp["max_interval_ms"]))
+            )
+        return policy
     raise TypeError(f"retry_policy must be a RetryPolicy or dict, got {type(rp).__name__}")
+
+
+_ID_REUSE_POLICIES = {
+    WorkflowIdReusePolicy.ALLOW_DUPLICATE: pb.ID_REUSE_POLICY_ALLOW_DUPLICATE,
+    WorkflowIdReusePolicy.ALLOW_DUPLICATE_FAILED_ONLY: (
+        pb.ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY
+    ),
+    WorkflowIdReusePolicy.REJECT_DUPLICATE: pb.ID_REUSE_POLICY_REJECT_DUPLICATE,
+    WorkflowIdReusePolicy.TERMINATE_IF_RUNNING: pb.ID_REUSE_POLICY_TERMINATE_IF_RUNNING,
+}
+
+_LIST_ORDERS = {
+    "start_time_asc": pb.LIST_ORDER_START_TIME_ASC,
+    "start_time_desc": pb.LIST_ORDER_START_TIME_DESC,
+    "close_time_asc": pb.LIST_ORDER_CLOSE_TIME_ASC,
+    "close_time_desc": pb.LIST_ORDER_CLOSE_TIME_DESC,
+}
 
 
 class Client:
     """Client for interacting with ORCHER server.
 
     The Client provides methods to start workflows, get handles to existing
-    workflows, and manage workflow executions. Every operation goes through
-    the native Rust module, which talks to the server over gRPC.
+    workflows, and manage workflow executions. Every operation is a client
+    protocol call through the native module, which talks to the server.
 
     Example:
         >>> config = ClientConfig(server_url="http://localhost:50051")
@@ -108,10 +146,7 @@ class Client:
                 api_key=self._config.api_key,
             )
 
-            native_client = _native.Client()
-            await native_client.connect(native_config)
-
-            self._native_client = native_client
+            self._native_client = await _native.ClientConnection.connect(native_config)
             self._connected = True
         except ImportError as e:
             raise ClientError.connection_failed(
@@ -156,10 +191,22 @@ class Client:
             RuntimeError: If the operation does not succeed.
         """
         self._ensure_connected()
-        result: bytes = await self._native_client.invoke_actor_operation(
-            actor_name, key, operation, payload, timeout_ms
+        invoke = pb.InvokeActor(
+            actor_name=actor_name,
+            key=key,
+            operation=operation,
+            payload=payload,
         )
-        return bytes(result)
+        invoke.operation_timeout.CopyFrom(
+            _protocol.duration(
+                timedelta(milliseconds=timeout_ms if timeout_ms is not None else 30_000)
+            )
+        )
+        try:
+            answer = await self._call(pb.ClientCall(invoke_actor=invoke))
+        except (ClientError, WorkflowError) as e:
+            raise RuntimeError(f"Actor operation failed: {e}") from e
+        return bytes(answer.value)
 
     async def close(self) -> None:
         """Close the client connection.
@@ -169,9 +216,6 @@ class Client:
         """
         if not self._connected:
             return
-
-        if self._native_client is not None:
-            await self._native_client.close()
 
         self._native_client = None
         self._connected = False
@@ -184,6 +228,13 @@ class Client:
     async def __aexit__(self, *args: Any) -> None:
         """Async context manager exit."""
         await self.close()
+
+    async def _call(
+        self, message: pb.ClientCall, *, workflow_id: str = "unknown"
+    ) -> pb.ClientAnswer:
+        """Make one client protocol call; a refusal raises the documented error."""
+        self._ensure_connected()
+        return await _protocol.call(self._native_client, message, workflow_id=workflow_id)
 
     def _ensure_connected(self) -> None:
         """Ensure client is connected, raise error if not."""
@@ -259,37 +310,27 @@ class Client:
         # them one to one as positional arguments (see pack_arguments).
         input_data = pack_arguments(args)
 
-        kwargs: dict[str, Any] = {}
+        start = pb.StartWorkflow(
+            workflow_id=workflow_id,
+            workflow_type=workflow_type,
+            task_queue=task_queue,
+            input=_protocol.encode_json(input_data),
+            cron_schedule=cron_schedule or "",
+        )
         if execution_timeout is not None:
-            kwargs["execution_timeout_ms"] = int(execution_timeout.total_seconds() * 1000)
+            start.execution_timeout.CopyFrom(_protocol.duration(execution_timeout))
         if run_timeout is not None:
-            kwargs["run_timeout_ms"] = int(run_timeout.total_seconds() * 1000)
+            start.run_timeout.CopyFrom(_protocol.duration(run_timeout))
         if task_timeout is not None:
-            kwargs["task_timeout_ms"] = int(task_timeout.total_seconds() * 1000)
-        if cron_schedule is not None:
-            kwargs["cron_schedule"] = cron_schedule
+            start.task_timeout.CopyFrom(_protocol.duration(task_timeout))
         if retry_policy is not None:
-            kwargs["retry_policy"] = _retry_policy_to_native(retry_policy)
+            start.retry_policy.CopyFrom(_retry_policy(retry_policy))
         if id_reuse_policy is not None:
-            kwargs["id_reuse_policy"] = WorkflowIdReusePolicy(id_reuse_policy).value
+            start.id_reuse_policy = _ID_REUSE_POLICIES[WorkflowIdReusePolicy(id_reuse_policy)]
 
-        try:
-            native_handle = await self._native_client.start_workflow(
-                workflow_id,
-                workflow_type,
-                task_queue,
-                input_data,
-                **kwargs,
-            )
-        except BaseException as exc:  # noqa: BLE001 - re-raised below
-            # A refused start becomes the WorkflowError documented above, naming
-            # the existing run. Any other error propagates unchanged.
-            translated = translate(exc, workflow_id=workflow_id)
-            if translated is exc:
-                raise
-            raise translated from exc
-
-        return WorkflowHandle._from_native(self, native_handle)
+        answer = await self._call(pb.ClientCall(start_workflow=start), workflow_id=workflow_id)
+        started = answer.started.workflow
+        return WorkflowHandle(self, workflow_id=started.workflow_id, run_id=started.run_id)
 
     async def get_workflow(
         self,
@@ -310,13 +351,7 @@ class Client:
             ClientError: If there's a communication error.
         """
         self._ensure_connected()
-
-        native_handle = await self._native_client.get_workflow_handle(
-            workflow_id,
-            run_id,
-        )
-
-        return WorkflowHandle._from_native(self, native_handle)
+        return WorkflowHandle(self, workflow_id=workflow_id, run_id=run_id or "")
 
     async def list_workflows(
         self,
@@ -350,18 +385,16 @@ class Client:
             >>> for info in page.executions:
             ...     print(info.workflow_id, info.status)
         """
-        self._ensure_connected()
-
-        raw = await self._native_client.list_workflows(
+        list_call = pb.ListWorkflows(
             page_size=page_size,
-            next_page_token=next_page_token,
-            workflow_type=workflow_type,
-            task_queue=task_queue,
-            status_filter=status_filter,
-            sort_order=sort_order,
+            page_token=next_page_token or b"",
+            workflow_type=workflow_type or "",
+            task_queue=task_queue or "",
+            statuses=[_protocol.status_value(WorkflowStatus(s)) for s in status_filter or []],
+            order=_LIST_ORDERS.get(sort_order or "", pb.LIST_ORDER_UNSPECIFIED),
         )
-
-        return WorkflowListPage._from_dict(raw)
+        answer = await self._call(pb.ClientCall(list_workflows=list_call))
+        return _protocol.list_page(answer.page)
 
     async def search_workflows(
         self,
@@ -389,15 +422,13 @@ class Client:
             ... )
             >>> print(f"Found {len(page.executions)} workflows")
         """
-        self._ensure_connected()
-
-        raw = await self._native_client.search_workflows(
-            query,
+        search = pb.SearchWorkflows(
+            query=query,
             page_size=page_size,
-            next_page_token=next_page_token,
+            page_token=next_page_token or b"",
         )
-
-        return WorkflowListPage._from_dict(raw)
+        answer = await self._call(pb.ClientCall(search_workflows=search))
+        return _protocol.list_page(answer.page)
 
     def __repr__(self) -> str:
         status = "connected" if self._connected else "disconnected"

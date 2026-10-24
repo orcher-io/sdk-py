@@ -1,99 +1,20 @@
-//! Client bindings for Python
+//! The client, as a binding over sdk-core's client protocol.
 //!
-//! Python wrappers for the core `WorkflowClient` and `WorkflowHandle`.
+//! Python connects once and then makes every client call (starting
+//! workflows, waiting for their results, queries, updates, events, listing,
+//! actors, namespaces) by handing sdk-core an encoded
+//! `orcher.client.v1.ClientCall` and reading back the encoded `ClientAnswer`.
+//! Python builds and reads the messages with the code generated from the
+//! same protocol (`orcher._proto.client_pb2`), so a new client call needs no
+//! change here.
 
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
-use orcher_sdk_core::client::{
-    CancelWorkflowOpts, StartWorkflowOpts, WorkflowClient, WorkflowHandle,
-};
-use orcher_sdk_core::types::{
-    ListWorkflowsOptions, ListWorkflowsSortOrder, SearchWorkflowsOptions, WorkflowExecution,
-    WorkflowStatus,
-};
+use pyo3::prelude::*;
 
-use crate::convert::{json_value_to_py, py_to_json_value};
-use crate::error::IntoPyResult;
-use crate::runtime::block_on;
-use crate::types::{PyWorkflowExecution, PyWorkflowStatus};
-
-/// The sdk-core options for a cancellation whose cleanup may take `cleanup_timeout`.
-fn cancel_opts(cleanup_timeout: Option<Duration>) -> CancelWorkflowOpts {
-    let opts = CancelWorkflowOpts::default();
-    match cleanup_timeout {
-        Some(timeout) => opts.with_cleanup_timeout(timeout),
-        None => opts,
-    }
-}
-
-/// How long an actor invocation waits for its result when the caller does
-/// not say.
-const DEFAULT_INVOKE_TIMEOUT_MS: u64 = 30_000;
-
-/// Attempts a retry policy allows when it leaves `max_attempts` out, the first one
-/// included. It is the SDK's documented `RetryPolicy` default.
-const DEFAULT_MAX_ATTEMPTS: i32 = 3;
-
-/// The `maximum_attempts` a retry policy sends for the `max_attempts` it was given.
-///
-/// An omitted count takes [`DEFAULT_MAX_ATTEMPTS`]; it must never become 0, which
-/// the engine reads as unlimited. An explicit 0 stays 0 (unlimited) and any other
-/// count is sent as given, the first attempt included.
-fn maximum_attempts(max_attempts: Option<i32>) -> i32 {
-    max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS)
-}
-
-/// Build sdk-core's workflow retry policy from the `retry_policy` kwargs dict
-/// passed by the Python client. Fields are millisecond-based to match the
-/// native retry surface. Returns `None` when no policy dict is present.
-fn extract_retry_policy(
-    kwargs: Option<&Bound<'_, PyDict>>,
-) -> PyResult<Option<orcher_sdk_core::WorkflowRetryPolicy>> {
-    let Some(obj) = kwargs.and_then(|k| k.get_item("retry_policy").ok().flatten()) else {
-        return Ok(None);
-    };
-    if obj.is_none() {
-        return Ok(None);
-    }
-    let d = obj
-        .downcast::<PyDict>()
-        .map_err(|_| pyo3::exceptions::PyTypeError::new_err("retry_policy must be a dict"))?;
-    let get_u64 = |key: &str| -> Option<u64> {
-        d.get_item(key)
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract().ok())
-    };
-    let non_retryable: Vec<String> = d
-        .get_item("non_retryable_error_types")
-        .ok()
-        .flatten()
-        .and_then(|v| v.extract().ok())
-        .unwrap_or_default();
-    Ok(Some(orcher_sdk_core::WorkflowRetryPolicy {
-        initial_interval: get_u64("initial_interval_ms").map(Duration::from_millis),
-        backoff_coefficient: d
-            .get_item("backoff_coefficient")
-            .ok()
-            .flatten()
-            .and_then(|v| v.extract().ok())
-            .unwrap_or(2.0),
-        max_interval: get_u64("max_interval_ms").map(Duration::from_millis),
-        // A negative count cannot be sent; it reads as unlimited, as 0 does.
-        max_attempts: u32::try_from(maximum_attempts(
-            d.get_item("max_attempts")
-                .ok()
-                .flatten()
-                .and_then(|v| v.extract().ok()),
-        ))
-        .unwrap_or(0),
-        non_retryable_errors: non_retryable,
-    }))
-}
+use orcher_sdk_core::{ConnectOptions, Connection, ProtocolClient};
 
 /// Connection settings for `Client`.
 #[pyclass(name = "ClientConfig")]
@@ -225,646 +146,62 @@ impl PyClientConfig {
     }
 }
 
-/// Internal state for the client
-struct ClientInner {
-    client: WorkflowClient,
-    config: PyClientConfig,
-    /// Actor invocations, on the client's connection with its credentials.
-    actors: orcher_sdk_core::ActorClient,
-}
-
-/// Client for starting, listing, and searching workflows.
-#[pyclass(name = "Client")]
-pub struct PyClient {
-    inner: Arc<Mutex<Option<ClientInner>>>,
+/// A connection to the engine that answers client protocol calls.
+#[pyclass(name = "ClientConnection", frozen)]
+pub struct PyClientConnection {
+    client: Arc<ProtocolClient>,
 }
 
 #[pymethods]
-impl PyClient {
-    #[new]
-    fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    /// Connect to the Orcher server.
-    #[pyo3(signature = (config))]
-    fn connect<'py>(&self, py: Python<'py>, config: PyClientConfig) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let server_url = config.server_url.clone();
-        let connect_timeout = std::time::Duration::from_millis(config.connect_timeout_ms);
-
-        // Build TLS config before entering async context (file I/O is sync)
-        let tls_config = config
+impl PyClientConnection {
+    /// `ClientConnection.connect(config) -> Awaitable[ClientConnection]`
+    ///
+    /// With TLS settings the connection is made now, so a certificate the
+    /// server refuses fails here; without, on the first call. Raises
+    /// `ValueError` for TLS files that cannot be read and `RuntimeError` for
+    /// a connection that cannot be made.
+    #[staticmethod]
+    fn connect<'py>(py: Python<'py>, config: PyClientConfig) -> PyResult<Bound<'py, PyAny>> {
+        let tls = config
             .build_tls_config()
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
-
-        let mut options = orcher_sdk_core::ConnectOptions::new(&server_url)
+        let mut options = ConnectOptions::new(&config.server_url)
             .with_namespace(&config.namespace)
-            .with_connect_timeout(connect_timeout);
+            .with_connect_timeout(Duration::from_millis(config.connect_timeout_ms));
         if let Some(ref key) = config.api_key {
             options = options.with_api_key(key);
         }
-        let dial_now = tls_config.is_some();
-        if let Some(tls) = tls_config {
+        let dial_now = tls.is_some();
+        if let Some(tls) = tls {
             options = options.with_tls(tls);
         }
-        let request_timeout = std::time::Duration::from_millis(config.timeout_ms);
-
+        let timeout = Duration::from_millis(config.timeout_ms);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // With TLS settings the connection is made now, so a certificate
-            // the server refuses fails here; without, on the first call.
             let connection = if dial_now {
-                orcher_sdk_core::Connection::connect(options).await
+                Connection::connect(options).await
             } else {
-                orcher_sdk_core::Connection::lazy(options)
+                Connection::lazy(options)
             }
             .map_err(|e| {
                 pyo3::exceptions::PyRuntimeError::new_err(format!("Client connection failed: {e}"))
             })?;
-            // Every call the client makes carries the configured timeout.
-            let client = connection.workflow_client().with_timeout(request_timeout);
-            let actors = connection.actor_client();
-
-            let mut guard = inner.lock().await;
-            *guard = Some(ClientInner {
-                client,
-                config,
-                actors,
-            });
-
-            Ok(())
-        })
-    }
-
-    /// Check if client is connected
-    fn is_connected(&self) -> bool {
-        let inner = self.inner.clone();
-        block_on(async {
-            let guard = inner.lock().await;
-            guard.is_some()
-        })
-    }
-
-    /// Start a workflow execution
-    #[pyo3(signature = (workflow_id, workflow_type, task_queue, input = None, **kwargs))]
-    fn start_workflow<'py>(
-        &self,
-        py: Python<'py>,
-        workflow_id: String,
-        workflow_type: String,
-        task_queue: String,
-        input: Option<PyObject>,
-        kwargs: Option<&Bound<'_, PyDict>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        let input_json = if let Some(input_obj) = input {
-            py_to_json_value(py, input_obj.bind(py))?
-        } else {
-            serde_json::Value::Null
-        };
-
-        let execution_timeout: Option<Duration> = kwargs
-            .and_then(|k| k.get_item("execution_timeout_ms").ok().flatten())
-            .and_then(|v| v.extract::<u64>().ok())
-            .map(Duration::from_millis);
-
-        let run_timeout: Option<Duration> = kwargs
-            .and_then(|k| k.get_item("run_timeout_ms").ok().flatten())
-            .and_then(|v| v.extract::<u64>().ok())
-            .map(Duration::from_millis);
-
-        let task_timeout: Option<Duration> = kwargs
-            .and_then(|k| k.get_item("task_timeout_ms").ok().flatten())
-            .and_then(|v| v.extract::<u64>().ok())
-            .map(Duration::from_millis);
-
-        let cron_schedule: Option<String> = kwargs
-            .and_then(|k| k.get_item("cron_schedule").ok().flatten())
-            .and_then(|v| v.extract().ok());
-
-        // Optional workflow-level retry policy. Built before the async block
-        // because kwargs is not Send.
-        let retry_policy = extract_retry_policy(kwargs)?;
-
-        let id_reuse_policy: Option<String> = kwargs
-            .and_then(|k| k.get_item("id_reuse_policy").ok().flatten())
-            .map(|v| v.extract())
-            .transpose()?;
-        let id_reuse_policy = id_reuse_policy
-            .map(|name| {
-                use orcher_sdk_core::WorkflowIdReusePolicy as Policy;
-                match name.as_str() {
-                    "ALLOW_DUPLICATE" => Ok(Policy::AllowDuplicate),
-                    "ALLOW_DUPLICATE_FAILED_ONLY" => Ok(Policy::AllowDuplicateFailedOnly),
-                    "REJECT_DUPLICATE" => Ok(Policy::RejectDuplicate),
-                    "TERMINATE_IF_RUNNING" => Ok(Policy::TerminateIfRunning),
-                    other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "unknown id_reuse_policy {other:?}"
-                    ))),
-                }
+            // Every call carries the configured timeout unless it sets its own.
+            let client = connection.protocol_client().with_timeout(timeout);
+            Ok(PyClientConnection {
+                client: Arc::new(client),
             })
-            .transpose()?;
-
-        let input_bytes = serde_json::to_vec(&input_json).map_err(|e| {
-            pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize input: {}", e))
-        })?;
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let client_inner = guard.as_ref().ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Client not connected")
-            })?;
-
-            let client = client_inner
-                .client
-                .clone()
-                .with_namespace(&client_inner.config.namespace);
-
-            let mut opts = StartWorkflowOpts::new(
-                workflow_id.clone(),
-                workflow_type.clone(),
-                task_queue.clone(),
-                input_bytes,
-            );
-            opts.cron_schedule = cron_schedule;
-            opts.retry_policy = retry_policy;
-            opts.execution_timeout = execution_timeout;
-            opts.run_timeout = run_timeout;
-            opts.task_timeout = task_timeout;
-            opts.id_reuse_policy = id_reuse_policy;
-
-            let handle = client
-                .start_workflow_with_options(opts)
-                .await
-                .into_py_result()?;
-
-            Ok(PyWorkflowHandle::from_handle(handle))
         })
     }
 
-    /// Get a handle to an existing workflow
-    #[pyo3(signature = (workflow_id, run_id = None))]
-    fn get_workflow_handle<'py>(
-        &self,
-        py: Python<'py>,
-        workflow_id: String,
-        run_id: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let client_inner = guard.as_ref().ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Client not connected")
-            })?;
-
-            let client = client_inner
-                .client
-                .clone()
-                .with_namespace(&client_inner.config.namespace);
-
-            // An empty run id is the wire's "latest run" sentinel: the server
-            // resolves by execution_id when one is given and by workflow_id
-            // otherwise. A placeholder such as "unknown" would turn every later
-            // call into an exact lookup for a run that cannot exist, failing
-            // with a not-found error naming an id the caller never supplied.
-            let execution = WorkflowExecution::new(workflow_id, run_id.unwrap_or_default());
-            let handle = WorkflowHandle::new(client, execution);
-
-            Ok(PyWorkflowHandle::from_handle(handle))
-        })
-    }
-
-    /// List workflow executions with optional filters
-    #[pyo3(signature = (page_size = 100, next_page_token = None, workflow_type = None, task_queue = None, status_filter = None, sort_order = None))]
-    #[allow(clippy::too_many_arguments)]
-    fn list_workflows<'py>(
-        &self,
-        py: Python<'py>,
-        page_size: i32,
-        next_page_token: Option<Vec<u8>>,
-        workflow_type: Option<String>,
-        task_queue: Option<String>,
-        status_filter: Option<Vec<String>>,
-        sort_order: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        // Unknown status names are ignored rather than rejected.
-        let status_filter_values: Vec<WorkflowStatus> = status_filter
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|s| match s.to_uppercase().as_str() {
-                "RUNNING" => Some(WorkflowStatus::Running),
-                "COMPLETED" => Some(WorkflowStatus::Completed),
-                "FAILED" => Some(WorkflowStatus::Failed),
-                "CANCELLED" | "CANCELED" => Some(WorkflowStatus::Cancelled),
-                "TERMINATED" => Some(WorkflowStatus::Terminated),
-                "TIMED_OUT" => Some(WorkflowStatus::TimedOut),
-                "RESTARTED_FRESH" => Some(WorkflowStatus::RestartedFresh),
-                _ => None,
-            })
-            .collect();
-
-        // An unknown sort order is treated as unset.
-        let sort_order_value = sort_order.and_then(|s| match s.to_lowercase().as_str() {
-            "start_time_asc" => Some(ListWorkflowsSortOrder::StartTimeAsc),
-            "start_time_desc" => Some(ListWorkflowsSortOrder::StartTimeDesc),
-            "close_time_asc" => Some(ListWorkflowsSortOrder::CloseTimeAsc),
-            "close_time_desc" => Some(ListWorkflowsSortOrder::CloseTimeDesc),
-            _ => None,
-        });
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let client_inner = guard.as_ref().ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Client not connected")
-            })?;
-
-            let client = client_inner
-                .client
-                .clone()
-                .with_namespace(&client_inner.config.namespace);
-
-            let mut options = ListWorkflowsOptions::default()
-                .with_page_size(page_size)
-                .with_next_page_token(next_page_token.unwrap_or_default())
-                .with_status_filter(status_filter_values);
-            options.workflow_type = workflow_type;
-            options.task_queue = task_queue;
-            options.sort_order = sort_order_value;
-
-            let page = client.list_workflows(options).await.into_py_result()?;
-
-            let json_value = serde_json::to_value(&page).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to serialize list result: {}",
-                    e
-                ))
-            })?;
-
-            Python::with_gil(|py| json_value_to_py(py, &json_value))
-        })
-    }
-
-    /// Search workflow executions using query syntax
-    #[pyo3(signature = (query, page_size = 100, next_page_token = None))]
-    fn search_workflows<'py>(
-        &self,
-        py: Python<'py>,
-        query: String,
-        page_size: i32,
-        next_page_token: Option<Vec<u8>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let guard = inner.lock().await;
-            let client_inner = guard.as_ref().ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Client not connected")
-            })?;
-
-            let client = client_inner
-                .client
-                .clone()
-                .with_namespace(&client_inner.config.namespace);
-
-            let page = client
-                .search_workflows(
-                    query,
-                    SearchWorkflowsOptions::default()
-                        .with_page_size(page_size)
-                        .with_next_page_token(next_page_token.unwrap_or_default()),
-                )
-                .await
-                .into_py_result()?;
-
-            let json_value = serde_json::to_value(&page).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to serialize search result: {}",
-                    e
-                ))
-            })?;
-
-            Python::with_gil(|py| json_value_to_py(py, &json_value))
-        })
-    }
-
-    /// Invoke an actor operation and wait for its result.
+    /// `call(call: bytes) -> Awaitable[bytes]`
     ///
-    /// The server queues the operation under its concurrency rules, a worker
-    /// runs it, and its result bytes come back. Raises `RuntimeError` when
-    /// the operation does not succeed.
-    #[pyo3(signature = (actor_name, key, operation, payload, timeout_ms = None))]
-    fn invoke_actor_operation<'py>(
-        &self,
-        py: Python<'py>,
-        actor_name: String,
-        key: String,
-        operation: String,
-        payload: Vec<u8>,
-        timeout_ms: Option<u64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
+    /// Answers an encoded `ClientCall` with an encoded `ClientAnswer`; a
+    /// refused call is answered with a `ClientError`, never raised.
+    fn call<'py>(&self, py: Python<'py>, call: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
+        let client = Arc::clone(&self.client);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let actors = {
-                let guard = inner.lock().await;
-                guard
-                    .as_ref()
-                    .ok_or_else(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err("Client not connected")
-                    })?
-                    .actors
-                    .clone()
-            };
-            actors
-                .invoke_operation(
-                    actor_name,
-                    key,
-                    operation,
-                    payload,
-                    Some(timeout_ms.unwrap_or(DEFAULT_INVOKE_TIMEOUT_MS)),
-                    None,
-                )
-                .await
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "Actor operation failed: {e}"
-                    ))
-                })
+            Ok(Cow::<'static, [u8]>::Owned(client.call(&call).await))
         })
-    }
-
-    /// Close the client connection
-    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut guard = inner.lock().await;
-            *guard = None;
-            Ok(())
-        })
-    }
-
-    fn __repr__(&self) -> String {
-        let connected = self.is_connected();
-        format!("Client(connected={})", connected)
-    }
-}
-
-/// Handle to a single workflow execution.
-#[pyclass(name = "WorkflowHandle")]
-pub struct PyWorkflowHandle {
-    inner: Arc<Mutex<WorkflowHandle>>,
-    workflow_id: String,
-    run_id: String,
-}
-
-impl PyWorkflowHandle {
-    fn from_handle(handle: WorkflowHandle) -> Self {
-        let workflow_id = handle.workflow_id().to_string();
-        let run_id = handle.run_id().to_string();
-        Self {
-            inner: Arc::new(Mutex::new(handle)),
-            workflow_id,
-            run_id,
-        }
-    }
-}
-
-#[pymethods]
-impl PyWorkflowHandle {
-    /// Get the workflow ID
-    #[getter]
-    fn workflow_id(&self) -> &str {
-        &self.workflow_id
-    }
-
-    /// Get the run ID
-    #[getter]
-    fn run_id(&self) -> &str {
-        &self.run_id
-    }
-
-    /// Get the workflow execution info
-    #[getter]
-    fn execution(&self) -> PyWorkflowExecution {
-        PyWorkflowExecution::from_inner(WorkflowExecution::new(
-            self.workflow_id.clone(),
-            self.run_id.clone(),
-        ))
-    }
-
-    /// Wait for the workflow result
-    #[pyo3(signature = (timeout_ms = None))]
-    fn result<'py>(&self, py: Python<'py>, timeout_ms: Option<u64>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handle = inner.lock().await;
-
-            let result: serde_json::Value = if let Some(timeout) = timeout_ms {
-                tokio::time::timeout(
-                    Duration::from_millis(timeout),
-                    handle.result::<serde_json::Value>(),
-                )
-                .await
-                .map_err(|_| {
-                    PyErr::new::<pyo3::exceptions::PyTimeoutError, _>(
-                        "Timeout waiting for workflow result",
-                    )
-                })?
-                .into_py_result()?
-            } else {
-                handle
-                    .result::<serde_json::Value>()
-                    .await
-                    .into_py_result()?
-            };
-
-            Python::with_gil(|py| json_value_to_py(py, &result))
-        })
-    }
-
-    /// Get the current workflow status
-    fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handle = inner.lock().await;
-            let status = handle.status().await.into_py_result()?;
-            Ok(PyWorkflowStatus::from_inner(status))
-        })
-    }
-
-    /// Send an event to the workflow
-    #[pyo3(signature = (event_name, payload = None))]
-    fn send_event<'py>(
-        &self,
-        py: Python<'py>,
-        event_name: String,
-        payload: Option<PyObject>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        let payload_json = if let Some(p) = payload {
-            py_to_json_value(py, p.bind(py))?
-        } else {
-            serde_json::Value::Null
-        };
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handle = inner.lock().await;
-            handle
-                .send_event(&event_name, payload_json)
-                .await
-                .into_py_result()?;
-            Ok(())
-        })
-    }
-
-    /// Query the workflow
-    #[pyo3(signature = (query_type, args = None))]
-    fn query<'py>(
-        &self,
-        py: Python<'py>,
-        query_type: String,
-        args: Option<PyObject>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        let args_json = if let Some(a) = args {
-            py_to_json_value(py, a.bind(py))?
-        } else {
-            serde_json::Value::Null
-        };
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handle = inner.lock().await;
-            let result: serde_json::Value = handle
-                .query(&query_type, args_json)
-                .await
-                .into_py_result()?;
-
-            Python::with_gil(|py| json_value_to_py(py, &result))
-        })
-    }
-
-    /// Update the workflow
-    #[pyo3(signature = (update_name, args = None))]
-    fn update<'py>(
-        &self,
-        py: Python<'py>,
-        update_name: String,
-        args: Option<PyObject>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        let args_json = if let Some(a) = args {
-            py_to_json_value(py, a.bind(py))?
-        } else {
-            serde_json::Value::Null
-        };
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handle = inner.lock().await;
-            let result: serde_json::Value = handle
-                .update(&update_name, args_json)
-                .await
-                .into_py_result()?;
-
-            Python::with_gil(|py| json_value_to_py(py, &result))
-        })
-    }
-
-    /// Describe the workflow execution (detailed metadata)
-    fn describe<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handle = inner.lock().await;
-            let description = handle.describe().await.into_py_result()?;
-
-            let json_value = serde_json::to_value(&description).map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                    "Failed to serialize description: {}",
-                    e
-                ))
-            })?;
-
-            Python::with_gil(|py| json_value_to_py(py, &json_value))
-        })
-    }
-
-    /// Cancel the workflow.
-    ///
-    /// `cleanup_timeout_ms` is how long the workflow may spend cleaning up
-    /// before the engine terminates it; `None` sets no limit. Engines from
-    /// before cancellation cleanup ignore it and cancel at once.
-    #[pyo3(signature = (cleanup_timeout_ms = None))]
-    fn cancel<'py>(
-        &self,
-        py: Python<'py>,
-        cleanup_timeout_ms: Option<u64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let opts = cancel_opts(cleanup_timeout_ms.map(Duration::from_millis));
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handle = inner.lock().await;
-            handle.cancel_with(opts).await.into_py_result()?;
-            Ok(())
-        })
-    }
-
-    /// Terminate the workflow
-    #[pyo3(signature = (reason = None))]
-    fn terminate<'py>(
-        &self,
-        py: Python<'py>,
-        reason: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let reason_str = reason.unwrap_or_else(|| "terminated by user".to_string());
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handle = inner.lock().await;
-            handle.terminate(reason_str).await.into_py_result()?;
-            Ok(())
-        })
-    }
-
-    /// Reset the workflow to a journal point and re-execute from there.
-    ///
-    /// Returns the new execution id created by the reset.
-    #[pyo3(signature = (target_event_id, reason = None))]
-    fn reset_workflow<'py>(
-        &self,
-        py: Python<'py>,
-        target_event_id: i64,
-        reason: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.inner.clone();
-        let reason_str = reason.unwrap_or_else(|| "reset by user".to_string());
-
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let handle = inner.lock().await;
-            let new_execution_id = handle
-                .reset(target_event_id, reason_str)
-                .await
-                .into_py_result()?;
-            Ok(new_execution_id)
-        })
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            "WorkflowHandle(workflow_id='{}', run_id='{}')",
-            self.workflow_id, self.run_id
-        )
     }
 }
 
@@ -889,34 +226,5 @@ mod tests {
         assert_eq!(config.namespace, "default");
         assert_eq!(config.timeout_ms, 10000);
         assert_eq!(config.connect_timeout_ms, 2500);
-    }
-
-    #[test]
-    fn an_omitted_max_attempts_sends_the_documented_default() {
-        assert_eq!(maximum_attempts(None), 3);
-    }
-
-    #[test]
-    fn an_explicit_zero_max_attempts_stays_unlimited() {
-        assert_eq!(maximum_attempts(Some(0)), 0);
-    }
-
-    #[test]
-    fn an_explicit_max_attempts_is_sent_as_given() {
-        assert_eq!(maximum_attempts(Some(1)), 1);
-        assert_eq!(maximum_attempts(Some(5)), 5);
-    }
-
-    #[test]
-    fn a_cancellation_sets_no_cleanup_limit_by_default() {
-        assert_eq!(cancel_opts(None).cleanup_timeout, None);
-    }
-
-    #[test]
-    fn a_cancellation_passes_its_cleanup_limit_to_sdk_core() {
-        assert_eq!(
-            cancel_opts(Some(Duration::from_millis(90_500))).cleanup_timeout,
-            Some(Duration::from_millis(90_500))
-        );
     }
 }

@@ -34,7 +34,6 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 mod client;
 mod codec;
-mod convert;
 mod error;
 mod host;
 mod kernel;
@@ -43,7 +42,6 @@ mod tls;
 mod types;
 
 // Re-exported for use within the crate.
-pub use convert::*;
 pub use error::*;
 pub use runtime::*;
 pub use types::*;
@@ -109,16 +107,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kernel::_kernel_execution_result, m)?)?;
 
     // Types
-    m.add_class::<types::PyWorkflowExecution>()?;
     m.add_class::<types::PyPayload>()?;
-    m.add_class::<types::PyWorkflowStatus>()?;
-    m.add_class::<types::PyRetryPolicy>()?;
-    m.add_class::<types::PyFailure>()?;
 
     // Client
     m.add_class::<client::PyClientConfig>()?;
-    m.add_class::<client::PyClient>()?;
-    m.add_class::<client::PyWorkflowHandle>()?;
+    m.add_class::<client::PyClientConnection>()?;
 
     // Worker
     m.add_class::<host::PyWorkerHost>()?;

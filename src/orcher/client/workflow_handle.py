@@ -6,7 +6,8 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from orcher._internal.arguments import pack_arguments
-from orcher.errors._translate import translates_native_errors
+from orcher._proto import client_pb2 as pb
+from orcher.client import _protocol
 from orcher.types import WorkflowExecution, WorkflowExecutionDescription, WorkflowStatus
 
 if TYPE_CHECKING:
@@ -24,47 +25,24 @@ class WorkflowHandle(Generic[T]):
 
     Provides methods to interact with a specific workflow execution,
     including waiting for results, sending events, and querying state.
-    Every operation goes through the native Rust module over gRPC.
+    Every operation is a client protocol call through the client's
+    connection.
 
     Attributes:
         workflow_id: Unique identifier of the workflow.
         run_id: Unique identifier of this execution run.
     """
 
-    def __init__(
-        self,
-        client: Client,
-        execution: WorkflowExecution,
-        *,
-        _native_handle: Any = None,
-    ) -> None:
+    def __init__(self, client: Client, *, workflow_id: str, run_id: str = "") -> None:
         """Initialize a workflow handle.
 
         Args:
             client: The client used to communicate with the server.
-            execution: The workflow execution identifier.
-            _native_handle: Internal native handle (use _from_native instead).
+            workflow_id: The workflow's id.
+            run_id: The run; empty for the workflow's latest run.
         """
         self._client = client
-        self._execution = execution
-        self._native_handle = _native_handle
-
-    @classmethod
-    def _from_native(cls, client: Client, native_handle: Any) -> WorkflowHandle[Any]:
-        """Create a WorkflowHandle from a native handle.
-
-        Args:
-            client: The client instance.
-            native_handle: The native _native.WorkflowHandle from Rust.
-
-        Returns:
-            A WorkflowHandle wrapping the native handle.
-        """
-        execution = WorkflowExecution(
-            workflow_id=native_handle.workflow_id,
-            run_id=native_handle.run_id,
-        )
-        return cls(client, execution, _native_handle=native_handle)
+        self._execution = WorkflowExecution(workflow_id=workflow_id, run_id=run_id)
 
     @property
     def workflow_id(self) -> str:
@@ -81,16 +59,12 @@ class WorkflowHandle(Generic[T]):
         """Get the workflow execution identifier."""
         return self._execution
 
-    def _ensure_native(self) -> Any:
-        """Get the native handle, raising if not available."""
-        if self._native_handle is None:
-            raise RuntimeError(
-                "WorkflowHandle has no native handle. "
-                "Use Client.start_workflow() or Client.get_workflow() to create handles."
-            )
-        return self._native_handle
+    def _ref(self) -> pb.WorkflowRef:
+        return pb.WorkflowRef(workflow_id=self.workflow_id, run_id=self.run_id)
 
-    @translates_native_errors
+    async def _call(self, message: pb.ClientCall) -> pb.ClientAnswer:
+        return await self._client._call(message, workflow_id=self.workflow_id)
+
     async def result(self, timeout: float | None = None) -> T:
         """Wait for and return the workflow result.
 
@@ -106,11 +80,13 @@ class WorkflowHandle(Generic[T]):
             WorkflowError: If the workflow fails, is cancelled, or times out.
             ClientError: If there's a communication error.
         """
-        native = self._ensure_native()
-        timeout_ms = int(timeout * 1000) if timeout is not None else None
-        return await native.result(timeout_ms)
+        wait = pb.WaitForResult(workflow=self._ref())
+        if timeout is not None:
+            wait.wait.CopyFrom(_protocol.duration(timedelta(seconds=timeout)))
+        answer = await self._call(pb.ClientCall(wait_for_result=wait))
+        result: T = _protocol.decode_json(answer.result.value)
+        return result
 
-    @translates_native_errors
     async def status(self) -> WorkflowStatus:
         """Get the current status of the workflow.
 
@@ -121,12 +97,9 @@ class WorkflowHandle(Generic[T]):
             WorkflowError: If the workflow is not found.
             ClientError: If there's a communication error.
         """
-        native = self._ensure_native()
-        # Convert to the Python enum so the result compares equal to
-        # WorkflowStatus members such as WorkflowStatus.COMPLETED.
-        return WorkflowStatus._from_native(await native.status())
+        answer = await self._call(pb.ClientCall(get_status=pb.GetStatus(workflow=self._ref())))
+        return _protocol.status(answer.status)
 
-    @translates_native_errors
     async def describe(self) -> WorkflowExecutionDescription:
         """Describe the workflow execution.
 
@@ -140,11 +113,9 @@ class WorkflowHandle(Generic[T]):
             WorkflowError: If the workflow is not found.
             ClientError: If there's a communication error.
         """
-        native = self._ensure_native()
-        raw = await native.describe()
-        return WorkflowExecutionDescription._from_dict(raw)
+        answer = await self._call(pb.ClientCall(describe=pb.Describe(workflow=self._ref())))
+        return _protocol.description(answer.description)
 
-    @translates_native_errors
     async def send_event(self, event_name: str, data: Any = None) -> None:
         """Send an event to the workflow.
 
@@ -156,10 +127,13 @@ class WorkflowHandle(Generic[T]):
             WorkflowError: If the workflow is not found or event fails.
             ClientError: If there's a communication error.
         """
-        native = self._ensure_native()
-        await native.send_event(event_name, data)
+        event = pb.SendEvent(
+            workflow=self._ref(),
+            event_name=event_name,
+            payload=_protocol.encode_json(data),
+        )
+        await self._call(pb.ClientCall(send_event=event))
 
-    @translates_native_errors
     async def query(self, query_name: str, *args: Any) -> Any:
         """Query the workflow state.
 
@@ -174,11 +148,14 @@ class WorkflowHandle(Generic[T]):
             WorkflowError: If the workflow is not found or query fails.
             ClientError: If there's a communication error.
         """
-        native = self._ensure_native()
-        query_args = pack_arguments(args)
-        return await native.query(query_name, query_args)
+        query = pb.Query(
+            workflow=self._ref(),
+            query_name=query_name,
+            args=_protocol.encode_json(pack_arguments(args)),
+        )
+        answer = await self._call(pb.ClientCall(query=query))
+        return _protocol.decode_json(answer.value)
 
-    @translates_native_errors
     async def update(self, update_name: str, *args: Any) -> Any:
         """Send an update to the workflow.
 
@@ -197,11 +174,14 @@ class WorkflowHandle(Generic[T]):
             WorkflowError: If the workflow is not found or update fails.
             ClientError: If there's a communication error.
         """
-        native = self._ensure_native()
-        update_args = pack_arguments(args)
-        return await native.update(update_name, update_args)
+        update = pb.Update(
+            workflow=self._ref(),
+            update_name=update_name,
+            args=_protocol.encode_json(pack_arguments(args)),
+        )
+        answer = await self._call(pb.ClientCall(update=update))
+        return _protocol.decode_json(answer.value)
 
-    @translates_native_errors
     async def cancel(self, cleanup_timeout: timedelta | None = None) -> None:
         """Request workflow cancellation.
 
@@ -223,15 +203,13 @@ class WorkflowHandle(Generic[T]):
             WorkflowError: If the workflow is not found.
             ClientError: If there's a communication error.
         """
-        cleanup_timeout_ms = None
+        cancel = pb.Cancel(workflow=self._ref())
         if cleanup_timeout is not None:
             if cleanup_timeout < timedelta(0):
                 raise ValueError(f"cleanup_timeout must not be negative, got {cleanup_timeout}")
-            cleanup_timeout_ms = int(cleanup_timeout.total_seconds() * 1000)
-        native = self._ensure_native()
-        await native.cancel(cleanup_timeout_ms)
+            cancel.cleanup_timeout.CopyFrom(_protocol.duration(cleanup_timeout))
+        await self._call(pb.ClientCall(cancel=cancel))
 
-    @translates_native_errors
     async def terminate(self, reason: str = "") -> None:
         """Forcefully terminate the workflow.
 
@@ -245,10 +223,8 @@ class WorkflowHandle(Generic[T]):
             WorkflowError: If the workflow is not found.
             ClientError: If there's a communication error.
         """
-        native = self._ensure_native()
-        await native.terminate(reason)
+        await self._call(pb.ClientCall(terminate=pb.Terminate(workflow=self._ref(), reason=reason)))
 
-    @translates_native_errors
     async def reset(self, target_event_id: int, reason: str = "") -> str:
         """Reset the workflow to a specific journal point and re-execute from there.
 
@@ -268,8 +244,9 @@ class WorkflowHandle(Generic[T]):
             WorkflowError: If the workflow is not found or event_id is invalid.
             ClientError: If there's a communication error.
         """
-        native = self._ensure_native()
-        return await native.reset_workflow(target_event_id, reason)
+        reset = pb.Reset(workflow=self._ref(), event_id=target_event_id, reason=reason)
+        answer = await self._call(pb.ClientCall(reset=reset))
+        return answer.reset_to.run_id
 
     def __repr__(self) -> str:
         return f"WorkflowHandle(workflow_id={self.workflow_id!r}, run_id={self.run_id!r})"
