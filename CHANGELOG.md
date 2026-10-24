@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.15](https://github.com/orcher-io/sdk-py/compare/v0.4.14...v0.4.15) (2026-10-24)
+
+
+### Features
+
+* make every client call through sdk-core's client protocol ([#75](https://github.com/orcher-io/sdk-py/issues/75)) ([6207adb](https://github.com/orcher-io/sdk-py/commit/6207adb62ba044c1fd77a6bc6fa83141a83085a4))
+
 ## [0.4.14](https://github.com/orcher-io/sdk-py/compare/v0.4.13...v0.4.14) (2026-10-23)
 
 
