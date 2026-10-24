@@ -219,6 +219,12 @@ class WorkflowContext:
         # and take none.
         self._step_sequence: int = 0
 
+        # The run's history lineage, for a run the engine bound to the
+        # kernel's step-id scheme: its calls are named the kernel's way, from
+        # a counter starting at 0, and its children without an id from the
+        # lineage. None for a run under this SDK's own scheme.
+        self._kernel_lineage: str | None = None
+
         # When the engine journaled each result this activation can hand the
         # workflow, in milliseconds since the epoch, keyed as the results are:
         # a step's id, `timer:{id}`, `child:{workflow id}`. Receiving one
@@ -321,10 +327,31 @@ class WorkflowContext:
         """
         return self._time
 
+    def _bind_kernel_scheme(self, lineage: str, seed: bytes) -> None:
+        """Run under the kernel's step-id scheme (internal; the worker calls it
+        before the workflow runs): steps named the kernel's way, random values
+        from the kernel's generator seeded with ``seed``."""
+        self._kernel_lineage = lineage
+        self._random = WorkflowRandom._from_kernel_seed(seed)
+
     def _next_sequence(self) -> int:
-        """Take the next number from the step counter."""
+        """Take the next number from the step counter: from 0 under the
+        kernel's step-id scheme, as it numbers calls, and from 1 under this
+        SDK's own."""
+        if self._kernel_lineage is not None:
+            sequence = self._step_sequence
+            self._step_sequence += 1
+            return sequence
         self._step_sequence += 1
         return self._step_sequence
+
+    def _step_id(self, kind: str, sequence: int, own: str) -> str:
+        """The id of a step of ``kind`` (``task``, ``timer``, ``value``,
+        ``await``) made by the call numbered ``sequence``: the kernel's,
+        ``{kind}-{sequence}``, for a run under its scheme, ``own`` otherwise."""
+        if self._kernel_lineage is not None:
+            return f"{kind}-{sequence}"
+        return own
 
     def _default_child_id(self, sequence: int) -> str:
         """The id of a child started without one, at step ``sequence``.
@@ -340,6 +367,8 @@ class WorkflowContext:
         so a run that began under the old default replays to the same child
         rather than starting another.
         """
+        if self._kernel_lineage is not None:
+            return f"{self._kernel_lineage}-child-{sequence}"
         legacy = f"child_{sequence}"
         if legacy in self._journaled_children or f"child:{legacy}" in self._cached_results:
             return legacy
@@ -453,7 +482,7 @@ class WorkflowContext:
         # the ids of the steps after this one do not depend on whether it had
         # already completed. The task name prefix makes the journal readable.
         sequence = self._next_sequence()
-        task_id = f"{task_name}_{sequence}"
+        task_id = self._step_id("task", sequence, f"{task_name}_{sequence}")
         self._reach(task_id)
 
         # A journaled result means the task already ran: return it instead of
@@ -593,7 +622,7 @@ class WorkflowContext:
         # One number from the step counter on every path, cached or not, like
         # every other step.
         sequence = self._next_sequence()
-        step_id = f"{step_name}_{sequence}"
+        step_id = self._step_id("value", sequence, f"{step_name}_{sequence}")
 
         # A journaled result means the closure already ran. The journal hands
         # closure results back as completed steps, like task results. They do
@@ -609,7 +638,7 @@ class WorkflowContext:
         # beside a step that suspends (in an asyncio.gather, say) is still
         # running when the workflow suspends, and the worker waits for it so
         # its result goes out with this activation.
-        run = asyncio.ensure_future(self._run_closure(step_name, step_id, closure))
+        run = asyncio.ensure_future(self._run_closure(step_name, step_id, sequence, closure))
         self._running_closures.add(run)
         run.add_done_callback(self._running_closures.discard)
         return await run
@@ -618,6 +647,7 @@ class WorkflowContext:
         self,
         step_name: str,
         step_id: str,
+        sequence: int,
         closure: Callable[[], Any],
     ) -> Any:
         result = closure()
@@ -636,6 +666,7 @@ class WorkflowContext:
         self._commands.append(
             {
                 "RecordStepResult": {
+                    "sequence": sequence,
                     "step_name": step_id,
                     "step_type": _STEP_TYPE_CLOSURE,
                     "result": list(encoded),
@@ -700,7 +731,7 @@ class WorkflowContext:
         # One number from the step counter on every path, like every other step.
         sequence = self._next_sequence()
         session_id = f"session_{sequence}"
-        task_id = f"{SESSION_CREATE_TASK}_{sequence}"
+        task_id = self._step_id("task", sequence, f"{SESSION_CREATE_TASK}_{sequence}")
         self._reach(task_id)
         cache_key = f"task:{task_id}"
         await self._at_wait(
@@ -782,7 +813,7 @@ class WorkflowContext:
         """
         # One number from the step counter on every path.
         sequence = self._next_sequence()
-        timer_id = f"timer_{sequence}"
+        timer_id = self._step_id("timer", sequence, f"timer_{sequence}")
         self._reach(timer_id, "timer")
 
         # A fired timer is in the journal: the sleep is over.
@@ -975,7 +1006,20 @@ class WorkflowContext:
         # A timed wait races a durable deadline timer against the event. The
         # timer is named after the event and how many timed waits for it came
         # before, taken on every path, so a replay names it as the live run did.
-        timer_id = self._event_timeout_timer_id(event_name) if timeout else None
+        #
+        # Under the kernel's step-id scheme the wait, and its deadline timer, are
+        # durable calls like any other: each takes its number on every path, and
+        # the timer is named by its number.
+        wait_sequence: int | None = None
+        timer_sequence: int | None = None
+        if self._kernel_lineage is not None:
+            wait_sequence = self._next_sequence()
+            if timeout:
+                timer_sequence = self._next_sequence()
+        if timer_sequence is not None:
+            timer_id: str | None = self._step_id("timer", timer_sequence, "")
+        else:
+            timer_id = self._event_timeout_timer_id(event_name) if timeout else None
         # Reached on every path, whichever of the event and the deadline wins:
         # the journal holds this timer whenever an earlier activation parked.
         if timer_id is not None:
@@ -1051,7 +1095,12 @@ class WorkflowContext:
         self._commands.append(
             {
                 "WaitForEvent": {
-                    "step_id": f"event_{event_name}",
+                    "sequence": wait_sequence or 0,
+                    "step_id": (
+                        self._step_id("await", wait_sequence, "")
+                        if wait_sequence is not None
+                        else f"event_{event_name}"
+                    ),
                     "event_name": event_name,
                     "timeout_ms": int(timeout.total_seconds() * 1000) if timeout else None,
                 }
@@ -1065,12 +1114,14 @@ class WorkflowContext:
             total = timeout.total_seconds()
             secs = int(total)
             nanos = int(round((total - secs) * 1_000_000_000))
-            # The sequence only labels the command; the counter is not
-            # advanced (see above).
+            # Under this SDK's own scheme the sequence only labels the
+            # command; the counter is not advanced (see above).
             self._commands.append(
                 {
                     "StartTimer": {
-                        "sequence": self._step_sequence,
+                        "sequence": (
+                            timer_sequence if timer_sequence is not None else self._step_sequence
+                        ),
                         "timer_id": timer_id,
                         "duration": {"secs": secs, "nanos": nanos},
                     }
@@ -1207,8 +1258,10 @@ class WorkflowContext:
         Example:
             >>> await ctx.sleep_with_id("payment-timeout", timedelta(minutes=30))
         """
-        # One number from the step counter on every path.
+        # One number from the step counter on every path. Under the kernel's
+        # step-id scheme the kernel names the timer, not the id given.
         sequence = self._next_sequence()
+        timer_id = self._step_id("timer", sequence, timer_id)
         self._reach(timer_id, "timer")
 
         cache_key = f"timer:{timer_id}"

@@ -78,6 +78,7 @@ def _resolution(spec: dict[str, Any]) -> kernel.Resolution:
         out.started.attempt = int(started.get("attempt") or 0)
         if started.get("started_at_ms") is not None:
             out.started.started_at.CopyFrom(_timestamp(started["started_at_ms"]))
+        out.started.step_ids = int(started.get("step_ids") or 0)
         out.started.history_lineage = started.get("history_lineage") or ""
         out.started.random_seed = bytes(started.get("random_seed") or [])
     elif "step" in spec:

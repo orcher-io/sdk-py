@@ -148,7 +148,7 @@ class SessionContext:
 
         # A step like any other: one number from the workflow's step counter.
         sequence = self._ctx._next_sequence()
-        task_id = f"{SESSION_COMPLETE_TASK}_{sequence}"
+        task_id = self._ctx._step_id("task", sequence, f"{SESSION_COMPLETE_TASK}_{sequence}")
         self._ctx._reach(task_id)
 
         input_payload = {

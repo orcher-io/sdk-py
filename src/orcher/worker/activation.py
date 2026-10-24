@@ -158,6 +158,22 @@ def load_activation(activation: kernel.RunActivation, namespace: str) -> LoadedA
         ),
     )
     ctx = WorkflowContext(info=info, replaying=replaying)
+    # A run the engine bound to the kernel's step-id scheme: its steps are named
+    # the kernel's way and its random values come from the kernel's generator,
+    # seeded from its history lineage.
+    if started is not None and started.step_ids == kernel.STEP_ID_SCHEME_KERNEL:
+        if not started.history_lineage:
+            raise ProtocolRefusalError(
+                "the run is under the kernel's step-id scheme but has no history lineage",
+                "undecodable",
+            )
+        if len(started.random_seed) != 32:
+            raise ProtocolRefusalError(
+                "the run is under the kernel's step-id scheme but its random seed is "
+                f"{len(started.random_seed)} bytes, not 32",
+                "undecodable",
+            )
+        ctx._bind_kernel_scheme(started.history_lineage, bytes(started.random_seed))
 
     cached: dict[str, Any] = {}
     resolved_at: dict[str, int] = {}
@@ -450,14 +466,34 @@ def _step_of(command: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
+def _kernel_sequence(kind: str, step_id: str) -> int:
+    """The call number a step id under the kernel's scheme was made from
+    (``task-3`` is call 3), so the call reaches the kernel numbered as it was
+    named; 0 for an id of this SDK's own, which the kernel does not derive
+    from the number."""
+    prefix = f"{kind}-"
+    number = step_id[len(prefix) :] if step_id.startswith(prefix) else ""
+    return int(number) if number.isdigit() else 0
+
+
 def _satisfied(step: tuple[str, str]) -> kernel.Command:
     """A call answered from history: its kind and id, no payloads."""
     kind, step_id = step
     if kind == "timer":
-        return kernel.Command(satisfied=True, step_id=step_id, start_timer=kernel.StartTimer())
+        return kernel.Command(
+            seq=_kernel_sequence("timer", step_id),
+            satisfied=True,
+            step_id=step_id,
+            start_timer=kernel.StartTimer(),
+        )
     if kind == "child":
         return kernel.Command(satisfied=True, start_child=kernel.StartChild(workflow_id=step_id))
-    return kernel.Command(satisfied=True, step_id=step_id, run_task=kernel.RunTask())
+    return kernel.Command(
+        seq=_kernel_sequence("task", step_id),
+        satisfied=True,
+        step_id=step_id,
+        run_task=kernel.RunTask(),
+    )
 
 
 _ORPHAN_POLICIES = {
@@ -527,6 +563,7 @@ def _kernel_command(command: dict[str, Any]) -> kernel.Command:
         if fields.get("failure"):
             raise ProtocolRefusalError("a recorded value that failed is never recorded by this SDK")
         return kernel.Command(
+            seq=int(fields.get("sequence") or 0),
             step_id=fields.get("step_name", ""),
             record_value=kernel.RecordValue(
                 outcome=kernel.Outcome(
@@ -539,6 +576,7 @@ def _kernel_command(command: dict[str, Any]) -> kernel.Command:
     if kind == "WaitForEvent":
         timeout_ms = fields.get("timeout_ms")
         return kernel.Command(
+            seq=int(fields.get("sequence") or 0),
             step_id=fields.get("step_id", ""),
             await_event=kernel.AwaitEvent(
                 name=fields.get("event_name", ""),
