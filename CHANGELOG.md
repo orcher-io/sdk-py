@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.16](https://github.com/orcher-io/sdk-py/compare/v0.4.15...v0.4.16) (2026-10-24)
+
+
+### Features
+
+* run workflows bound to the kernel's step-id scheme ([#77](https://github.com/orcher-io/sdk-py/issues/77)) ([cbf458c](https://github.com/orcher-io/sdk-py/commit/cbf458c2fc14354ebcffaecd496d42c9bbd65bed)), closes [#45](https://github.com/orcher-io/sdk-py/issues/45)
+
 ## [0.4.15](https://github.com/orcher-io/sdk-py/compare/v0.4.14...v0.4.15) (2026-10-24)
 
 
