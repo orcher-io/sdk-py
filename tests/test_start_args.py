@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from orcher import Client, ClientConfig, WorkflowContext, workflow
+from orcher import WorkflowContext, workflow
+from orcher._proto import client_pb2 as pb
 from orcher.client.workflow_handle import WorkflowHandle
 from orcher.decorators import GlobalRegistry
 from orcher.errors import WorkflowSuspendedError
@@ -24,6 +24,7 @@ from orcher.worker.activation import AskedQuery, AskedUpdate
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
 from orcher.workflow.info import WorkflowInfo
+from tests._fake_connection import FakeConnection, client_on, started
 from tests.support.kernel import activation, run
 
 
@@ -64,18 +65,12 @@ async def run_on_worker(workflow_type: str, sent: Any) -> Any:
 
 async def sent_by_client(args: tuple[Any, ...]) -> bytes:
     """The input a client start sends for ``args``."""
-    sent: list[bytes] = []
-
-    async def start_workflow(workflow_id: str, workflow_type: str, queue: str, data: Any) -> Any:
-        sent.append(json.dumps(data).encode())
-        return SimpleNamespace(workflow_id=workflow_id, run_id="run-1")
-
-    client = Client(ClientConfig(server_url="http://localhost:50051"))
-    client._connected = True
-    client._native_client = SimpleNamespace(start_workflow=start_workflow)
-    await client.start_workflow(workflow_type="t", workflow_id="w", task_queue="q", args=args)
-    (data,) = sent
-    return data
+    connection = FakeConnection(started())
+    await client_on(connection).start_workflow(
+        workflow_type="t", workflow_id="w", task_queue="q", args=args
+    )
+    (call,) = connection.calls
+    return bytes(call.start_workflow.input)
 
 
 def child_context() -> WorkflowContext:
@@ -134,16 +129,11 @@ async def test_a_single_arg_is_sent_as_itself() -> None:
 
 async def test_query_and_update_args_are_passed_one_to_one() -> None:
     """A handle's query and update pack their arguments the same way."""
-    sent: list[Any] = []
-
-    async def capture(name: str, data: Any) -> None:
-        sent.append(data)
-
-    client = Client(ClientConfig(server_url="http://localhost:50051"))
-    native = SimpleNamespace(workflow_id="w", run_id="r", query=capture, update=capture)
-    handle = WorkflowHandle._from_native(client, native)
+    connection = FakeConnection(pb.ClientAnswer(value=b"null"), pb.ClientAnswer(value=b"null"))
+    handle = WorkflowHandle(client_on(connection), workflow_id="w", run_id="r")
     await handle.query("q", 1, [2])
     await handle.update("u", 1, [2])
+    sent = [json.loads(connection.calls[0].query.args), json.loads(connection.calls[1].update.args)]
 
     seen: list[Any] = []
 
