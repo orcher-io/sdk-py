@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from orcher._proto import host_pb2
 from orcher.worker.config import WorkerConfig
 from orcher.worker.worker import Worker
 from tests.support.messages import task_message
@@ -28,8 +29,12 @@ class _Host:
     def __init__(self) -> None:
         self.failures: list[tuple[Any, ...]] = []
 
-    async def fail_task(self, *args: Any) -> None:
-        self.failures.append(args)
+    async def complete_task(self, outcome: bytes) -> None:
+        reported = host_pb2.TaskOutcome.FromString(outcome)
+        failure = reported.failure
+        self.failures.append(
+            (reported.token, failure.message, failure.error_type, failure.non_retryable)
+        )
 
 
 async def _report(error: Exception) -> tuple[Any, ...]:

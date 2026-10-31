@@ -18,17 +18,14 @@ native = pytest.importorskip("orcher._native")
 
 def test_every_report_takes_the_arguments_the_worker_passes() -> None:
     host = native.WorkerHost
-    inspect.signature(host.complete_activation).bind(object(), "{}")
-    inspect.signature(host.complete_task).bind(object(), b"token", b"{}")
-    inspect.signature(host.fail_task).bind(object(), b"token", "boom", "ValueError", False)
-    inspect.signature(host.complete_actor_operation).bind(object(), "op", "run", b"{}")
-    inspect.signature(host.fail_actor_operation).bind(object(), "op", "run", "boom", "ValueError")
+    inspect.signature(host.complete_activation).bind(object(), b"answer")
+    inspect.signature(host.complete_task).bind(object(), b"outcome")
+    inspect.signature(host.complete_actor_operation).bind(object(), b"result")
 
 
-def test_the_calls_a_running_task_makes_take_its_token() -> None:
+def test_the_calls_a_running_task_makes_take_what_the_worker_passes() -> None:
     host = native.WorkerHost
-    inspect.signature(host.heartbeat).bind(object(), b"token", b"{}")
-    inspect.signature(host.heartbeat).bind(object(), b"token", None)
+    inspect.signature(host.heartbeat).bind(object(), b"heartbeat")
     inspect.signature(host.task_cancelled).bind(object(), b"token")
 
 

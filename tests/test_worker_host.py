@@ -17,7 +17,7 @@ from unittest import mock
 import pytest
 
 from orcher import TaskContext, WorkflowContext, task, workflow
-from orcher._proto import kernel_pb2
+from orcher._proto import host_pb2, kernel_pb2
 from orcher.decorators import GlobalRegistry
 from orcher.worker import worker as worker_module
 from orcher.worker.config import WorkerConfig
@@ -60,16 +60,19 @@ class FakeHost:
         self.answers.append(answer_of(kernel_pb2.RunActivationResult.FromString(result)))
         self.answered.set()
 
-    async def complete_task(self, token: bytes, result: bytes) -> None:
-        self.results.append((token, json.loads(result)))
+    async def complete_task(self, outcome: bytes) -> None:
+        reported = host_pb2.TaskOutcome.FromString(outcome)
+        if reported.HasField("value"):
+            self.results.append((reported.token, json.loads(reported.value.data)))
+        else:
+            failure = reported.failure
+            self.results.append(
+                (reported.token, failure.message, failure.error_type, failure.non_retryable)
+            )
         self.answered.set()
 
-    async def fail_task(self, *args: Any) -> None:
-        self.results.append(args)
-        self.answered.set()
-
-    def heartbeat(self, token: bytes, details: Any) -> bool:
-        return False
+    def heartbeat(self, heartbeat: bytes) -> bytes:
+        return b""  # an encoded HeartbeatAnswer asking nothing
 
     async def task_cancelled(self, token: bytes) -> bool:
         await asyncio.Event().wait()
