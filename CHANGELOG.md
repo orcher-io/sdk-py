@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.17](https://github.com/orcher-io/sdk-py/compare/v0.4.16...v0.4.17) (2026-11-01)
+
+
+### Features
+
+* build on orcher-sdk-core 0.22.1 ([#79](https://github.com/orcher-io/sdk-py/issues/79)) ([86460d7](https://github.com/orcher-io/sdk-py/commit/86460d7625eb2fd5d7a9329eee0df0b5ccccc9fa))
+
+
+### Changes
+
+* report task and actor outcomes through the encoded host ([#82](https://github.com/orcher-io/sdk-py/issues/82)) ([4439b90](https://github.com/orcher-io/sdk-py/commit/4439b904f678290ff328803f7f4ae2cfc6bb6ded))
+
 ## [0.4.16](https://github.com/orcher-io/sdk-py/compare/v0.4.15...v0.4.16) (2026-10-24)
 
 
