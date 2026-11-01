@@ -32,8 +32,8 @@ async def takes_several(ctx: TaskContext, name: str, count: int, gift: bool) -> 
 class FakeHost:
     """The worker host calls a task execution makes: no cancellation ever comes."""
 
-    def heartbeat(self, token: bytes, details: Any) -> bool:
-        return False
+    def heartbeat(self, heartbeat: bytes) -> bytes:
+        return b""  # an encoded HeartbeatAnswer asking nothing
 
     async def task_cancelled(self, token: bytes) -> bool:
         await asyncio.Event().wait()

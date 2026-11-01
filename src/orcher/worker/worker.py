@@ -214,6 +214,59 @@ def _actor_request(operation: host_pb2.ActorOperation) -> dict[str, Any]:
     }
 
 
+# What the worker hands back to the host crosses as encoded ``orcher.host.v1``
+# messages, built here with this SDK's own generated code; the native module
+# passes the bytes through.
+
+
+def _json_payload(data: bytes) -> kernel_pb2.Payload:
+    """A value as the kernel protocol carries it: its JSON encoding, marked so."""
+    return kernel_pb2.Payload(data=data, metadata={"encoding": b"json"})
+
+
+def _task_heartbeat(token: bytes, details: bytes | None) -> bytes:
+    """An encoded ``TaskHeartbeat``, its details their JSON encoding or none."""
+    heartbeat = host_pb2.TaskHeartbeat(token=token)
+    if details is not None:
+        heartbeat.details.CopyFrom(_json_payload(details))
+    return heartbeat.SerializeToString()
+
+
+def _send_heartbeat(host: Any, token: bytes, details: bytes | None) -> bool:
+    """Record a task's heartbeat with the host; whether it was asked to cancel."""
+    answer = host_pb2.HeartbeatAnswer.FromString(host.heartbeat(_task_heartbeat(token, details)))
+    return bool(answer.cancel_requested)
+
+
+def _task_result(token: bytes, result: bytes) -> bytes:
+    """An encoded ``TaskOutcome`` carrying a task's result, its JSON encoding."""
+    return host_pb2.TaskOutcome(token=token, value=_json_payload(result)).SerializeToString()
+
+
+def _task_failure(token: bytes, message: str, error_type: str, non_retryable: bool) -> bytes:
+    """An encoded ``TaskOutcome`` carrying a task's failure."""
+    failure = kernel_pb2.Failure(
+        message=message, error_type=error_type, non_retryable=non_retryable
+    )
+    return host_pb2.TaskOutcome(token=token, failure=failure).SerializeToString()
+
+
+def _actor_result(operation_id: str, execution_id: str, result: bytes) -> bytes:
+    """An encoded ``ActorResult`` carrying an operation's result, its JSON encoding."""
+    return host_pb2.ActorResult(
+        operation_id=operation_id, execution_id=execution_id, value=_json_payload(result)
+    ).SerializeToString()
+
+
+def _actor_failure(operation_id: str, execution_id: str, message: str, error_type: str) -> bytes:
+    """An encoded ``ActorResult`` carrying an operation's failure."""
+    return host_pb2.ActorResult(
+        operation_id=operation_id,
+        execution_id=execution_id,
+        failure=kernel_pb2.Failure(message=message, error_type=error_type),
+    ).SerializeToString()
+
+
 @dataclass
 class _WorkflowRun:
     """What running a workflow's code once produced."""
@@ -916,7 +969,9 @@ class Worker:
 
             result = await self._execute_task(request)
 
-            await self._get_host().complete_task(token, json.dumps(result).encode("utf-8"))
+            await self._get_host().complete_task(
+                _task_result(token, json.dumps(result).encode("utf-8"))
+            )
 
             self._stats.tasks_executed += 1
             logger.debug(f"Completed task: {task_id}")
@@ -932,11 +987,13 @@ class Worker:
             # class name is sent. A truthy `non_retryable` attribute on the
             # exception stops retries regardless of the policy.
             try:
-                await self._get_host().fail_task(
-                    token,
-                    str(e),
-                    type(e).__name__,
-                    bool(getattr(e, "non_retryable", False)),
+                await self._get_host().complete_task(
+                    _task_failure(
+                        token,
+                        str(e),
+                        type(e).__name__,
+                        bool(getattr(e, "non_retryable", False)),
+                    )
                 )
             except Exception as fail_error:
                 logger.error(f"Failed to report task failure: {fail_error}")
@@ -1365,7 +1422,7 @@ class Worker:
         task_token = request.get("task_token", b"")
         ctx = TaskContext(
             info=task_info,
-            heartbeat_sender=lambda details: bool(host.heartbeat(task_token, details)),
+            heartbeat_sender=lambda details: _send_heartbeat(host, task_token, details),
         )
         cancellation_watch = asyncio.ensure_future(
             _watch_task_cancellation(host, task_token, ctx.cancellation_token)
@@ -1472,7 +1529,7 @@ class Worker:
             result = await self._execute_actor_operation(request)
 
             await self._get_host().complete_actor_operation(
-                operation_id, execution_id, json.dumps(result).encode("utf-8")
+                _actor_result(operation_id, execution_id, json.dumps(result).encode("utf-8"))
             )
 
             logger.debug(f"Completed actor operation: {operation_id}")
@@ -1484,8 +1541,8 @@ class Worker:
             self._stats.errors += 1
 
             try:
-                await self._get_host().fail_actor_operation(
-                    operation_id, execution_id, str(e), type(e).__name__
+                await self._get_host().complete_actor_operation(
+                    _actor_failure(operation_id, execution_id, str(e), type(e).__name__)
                 )
             except Exception as fail_error:
                 logger.error(f"Failed to report actor failure: {fail_error}")

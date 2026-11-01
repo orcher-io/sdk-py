@@ -8,11 +8,16 @@
 //! - `next_activation` / `complete_activation`: a workflow activation as the
 //!   kernel protocol's `RunActivation`, answered with a `RunActivationResult`,
 //!   both encoded, as the host's encoded view takes and gives them.
-//! - `next_task` / `complete_task` / `fail_task`: a task, with `heartbeat`
-//!   and `task_cancelled` while it runs.
-//! - `next_actor_operation` / `complete_actor_operation` /
-//!   `fail_actor_operation`: an actor operation, with the actor state calls
-//!   the operation makes, on the worker's connection.
+//! - `next_task` / `complete_task`: a task as an `orcher.host.v1`
+//!   `TaskAssignment`, answered with a `TaskOutcome`, with `heartbeat`
+//!   (a `TaskHeartbeat`, answered with a `HeartbeatAnswer`) and
+//!   `task_cancelled` while it runs.
+//! - `next_actor_operation` / `complete_actor_operation`: an actor operation
+//!   as an `ActorOperation`, answered with an `ActorResult`, with the actor
+//!   state calls the operation makes, on the worker's connection.
+//!
+//! Every message crosses encoded: Python builds and reads them with its own
+//! generated code, and this module passes the bytes through.
 //!
 //! A pull resolves `None` once the host has stopped and handed over
 //! everything it took; it never wakes up empty-handed before then.
@@ -20,8 +25,6 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
-use orcher_sdk_core::proto::host::v1::{actor_result, task_outcome, ActorResult, TaskOutcome};
-use orcher_sdk_core::proto::kernel::v1::{Failure, Payload};
 use orcher_sdk_core::{ActorHandler, EncodedHost, Host, HostConfig, Registrations, StateScope};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -171,16 +174,17 @@ impl RegistrationsJson {
     }
 }
 
-fn json_payload(data: Vec<u8>) -> Payload {
-    Payload {
-        data,
-        metadata: [("encoding".to_string(), b"json".to_vec())].into(),
-        ..Default::default()
-    }
-}
-
 fn host_error(what: &str, error: impl std::fmt::Display) -> PyErr {
     PyRuntimeError::new_err(format!("{what}: {error}"))
+}
+
+/// An answer the host did not take: `ValueError` for bytes that are not the
+/// message it expects, `RuntimeError` for anything else.
+fn answer_error(what: &str, error: orcher_sdk_core::Error) -> PyErr {
+    match error {
+        orcher_sdk_core::Error::Protocol(_) => PyValueError::new_err(error.to_string()),
+        error => host_error(what, error),
+    }
 }
 
 /// A running worker host.
@@ -268,10 +272,7 @@ impl PyWorkerHost {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             host.complete_activation(&answer)
                 .await
-                .map_err(|e| match e {
-                    orcher_sdk_core::Error::Protocol(_) => PyValueError::new_err(e.to_string()),
-                    e => host_error("the activation's answer was not taken", e),
-                })
+                .map_err(|e| answer_error("the activation's answer was not taken", e))
         })
     }
 
@@ -288,18 +289,19 @@ impl PyWorkerHost {
         })
     }
 
-    /// `heartbeat(token: bytes, details: bytes | None = None) -> bool`
+    /// `heartbeat(heartbeat: bytes) -> bytes`
     ///
-    /// Records a heartbeat from a running task's code, with its details (their
-    /// JSON encoding), sent with the next heartbeat due. Never waits: the
-    /// host heartbeats every task it handed over on its own. Returns whether
-    /// the task has been asked to cancel; `False` for a task the host does not
-    /// hold.
-    #[pyo3(signature = (token, details = None))]
-    fn heartbeat(&self, token: Vec<u8>, details: Option<Vec<u8>>) -> bool {
-        self.host
-            .heartbeat(&token, details.map(json_payload))
-            .cancel_requested
+    /// Records a heartbeat from a running task's code, an encoded
+    /// `orcher.host.v1.TaskHeartbeat` whose details are sent with the next
+    /// heartbeat due, and answers with an encoded `HeartbeatAnswer`: whether
+    /// the task has been asked to cancel, which a task the host does not hold
+    /// never has. Never waits: the host heartbeats every task it handed over on
+    /// its own. Raises `ValueError` for bytes that are not a `TaskHeartbeat`.
+    fn heartbeat(&self, heartbeat: &[u8]) -> PyResult<Cow<'static, [u8]>> {
+        self.encoded
+            .heartbeat(heartbeat)
+            .map(Cow::Owned)
+            .map_err(|e| answer_error("the heartbeat was not taken", e))
     }
 
     /// `task_cancelled(token: bytes) -> Awaitable[bool]`
@@ -309,60 +311,25 @@ impl PyWorkerHost {
     /// stopping past its grace), and `False` once its outcome is reported (at
     /// once for a task the host does not hold).
     fn task_cancelled<'py>(&self, py: Python<'py>, token: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
-        let host = self.host.clone();
+        let host = self.encoded.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             Ok(host.task_cancelled(&token).await)
         })
     }
 
-    /// `complete_task(token: bytes, result: bytes) -> Awaitable[None]`
+    /// `complete_task(outcome: bytes) -> Awaitable[None]`
     ///
-    /// Reports a task's result, its JSON encoding.
-    fn complete_task<'py>(
-        &self,
-        py: Python<'py>,
-        token: Vec<u8>,
-        result: Vec<u8>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let host = self.host.clone();
+    /// Reports how a task ended, an encoded `orcher.host.v1.TaskOutcome`: its
+    /// result, or its failure, whose type and `non_retryable` the engine
+    /// decides a retry from. Raises `ValueError` for bytes that are not one,
+    /// and `RuntimeError` for an outcome the host does not take.
+    fn complete_task<'py>(&self, py: Python<'py>, outcome: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        let outcome = outcome.to_vec();
+        let host = self.encoded.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            host.complete_task(TaskOutcome {
-                token,
-                result: Some(task_outcome::Result::Value(json_payload(result))),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| host_error("the task's result was not taken", e))
-        })
-    }
-
-    /// `fail_task(token, message, error_type, non_retryable=False) -> Awaitable[None]`
-    ///
-    /// Reports a task's failure. The engine decides whether to retry it from
-    /// its type, which a retry policy names, and `non_retryable`.
-    #[pyo3(signature = (token, message, error_type, non_retryable = false))]
-    fn fail_task<'py>(
-        &self,
-        py: Python<'py>,
-        token: Vec<u8>,
-        message: String,
-        error_type: String,
-        non_retryable: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let host = self.host.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            host.complete_task(TaskOutcome {
-                token,
-                result: Some(task_outcome::Result::Failure(Failure {
-                    message,
-                    error_type,
-                    non_retryable,
-                    ..Default::default()
-                })),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| host_error("the task's failure was not taken", e))
+            host.complete_task(&outcome)
+                .await
+                .map_err(|e| answer_error("the task's outcome was not taken", e))
         })
     }
 
@@ -380,54 +347,23 @@ impl PyWorkerHost {
         })
     }
 
-    /// `complete_actor_operation(operation_id, execution_id, result: bytes) -> Awaitable[None]`
+    /// `complete_actor_operation(result: bytes) -> Awaitable[None]`
     ///
-    /// Reports an actor operation's result, its JSON encoding.
+    /// Reports how an actor operation ended, an encoded
+    /// `orcher.host.v1.ActorResult`: its result or its failure. Raises
+    /// `ValueError` for bytes that are not one, and `RuntimeError` for a
+    /// result the host does not take.
     fn complete_actor_operation<'py>(
         &self,
         py: Python<'py>,
-        operation_id: String,
-        execution_id: String,
-        result: Vec<u8>,
+        result: &[u8],
     ) -> PyResult<Bound<'py, PyAny>> {
-        let host = self.host.clone();
+        let result = result.to_vec();
+        let host = self.encoded.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            host.complete_actor_operation(ActorResult {
-                operation_id,
-                execution_id,
-                result: Some(actor_result::Result::Value(json_payload(result))),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| host_error("the actor operation's result was not taken", e))
-        })
-    }
-
-    /// `fail_actor_operation(operation_id, execution_id, message, error_type) -> Awaitable[None]`
-    ///
-    /// Reports an actor operation's failure, with its type.
-    fn fail_actor_operation<'py>(
-        &self,
-        py: Python<'py>,
-        operation_id: String,
-        execution_id: String,
-        message: String,
-        error_type: String,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let host = self.host.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            host.complete_actor_operation(ActorResult {
-                operation_id,
-                execution_id,
-                result: Some(actor_result::Result::Failure(Failure {
-                    message,
-                    error_type,
-                    ..Default::default()
-                })),
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| host_error("the actor operation's failure was not taken", e))
+            host.complete_actor_operation(&result)
+                .await
+                .map_err(|e| answer_error("the actor operation's result was not taken", e))
         })
     }
 

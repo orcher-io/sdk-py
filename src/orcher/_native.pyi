@@ -265,10 +265,11 @@ class WorkerHost:
     """The worker host shared with the Rust and TypeScript SDKs, running.
 
     It polls the engine, keeps the worker registered, runs sessions and
-    drains on shutdown; ``orcher.Worker`` pulls work from it. Messages cross
-    as JSON: activations and their answers in the kernel protocol's shapes
-    (see ``orcher.worker.activation``). A pull returns None once the host has
-    stopped and handed over everything it took.
+    drains on shutdown; ``orcher.Worker`` pulls work from it. Work and its
+    outcomes cross as encoded protocol messages: activations and their answers
+    as ``orcher.kernel.v1`` messages (see ``orcher.worker.activation``), tasks,
+    heartbeats and actor operations as ``orcher.host.v1`` ones. A pull returns
+    None once the host has stopped and handed over everything it took.
     """
 
     @staticmethod
@@ -282,27 +283,20 @@ class WorkerHost:
     async def next_activation(self) -> bytes | None: ...
     async def complete_activation(self, result: bytes) -> None: ...
     async def next_task(self) -> bytes | None: ...
-    def heartbeat(self, token: bytes, details: bytes | None = None) -> bool:
-        """Record a heartbeat; return whether the task was asked to cancel."""
+    def heartbeat(self, heartbeat: bytes) -> bytes:
+        """Record an encoded ``orcher.host.v1.TaskHeartbeat``; return an encoded
+        ``HeartbeatAnswer``, saying whether the task was asked to cancel."""
         ...
     async def task_cancelled(self, token: bytes) -> bool:
         """True once the task is asked to cancel, False once it is reported."""
         ...
-    async def complete_task(self, token: bytes, result: bytes) -> None: ...
-    async def fail_task(
-        self,
-        token: bytes,
-        message: str,
-        error_type: str,
-        non_retryable: bool = False,
-    ) -> None: ...
+    async def complete_task(self, outcome: bytes) -> None:
+        """Report an encoded ``orcher.host.v1.TaskOutcome``: a result or a failure."""
+        ...
     async def next_actor_operation(self) -> bytes | None: ...
-    async def complete_actor_operation(
-        self, operation_id: str, execution_id: str, result: bytes
-    ) -> None: ...
-    async def fail_actor_operation(
-        self, operation_id: str, execution_id: str, message: str, error_type: str
-    ) -> None: ...
+    async def complete_actor_operation(self, result: bytes) -> None:
+        """Report an encoded ``orcher.host.v1.ActorResult``: a result or a failure."""
+        ...
     async def actor_get_state(
         self, actor_name: str, key: str, state_key: str, execution_id: str
     ) -> bytes | None: ...
