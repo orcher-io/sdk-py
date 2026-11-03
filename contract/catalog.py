@@ -535,6 +535,15 @@ class ContractProbe:
         except Exception as e:  # engine rejects with FAILED_PRECONDITION
             return {"write_rejected": True, "error": str(e)[:200]}
 
+    @operation(mode=OperationMode.SHARED)
+    async def echo_argument(self, ctx: ActorContext, *args: Any, **kwargs: Any) -> dict:
+        """Return the one argument as it was received (sdk-core#149).
+
+        An object arrives spread as keyword arguments, anything else as the
+        one positional argument; either way it is returned whole.
+        """
+        return {"received": args[0] if args else kwargs}
+
     @operation(mode=OperationMode.EXCLUSIVE)
     async def exclusive_write_roundtrip(self, ctx: ActorContext, value: Any) -> dict:
         """Write state from an exclusive operation; the write must succeed and read back."""
