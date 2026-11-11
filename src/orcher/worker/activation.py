@@ -145,7 +145,7 @@ def load_activation(activation: kernel.RunActivation, namespace: str) -> LoadedA
         namespace=run.namespace or namespace,
         # The engine counts a run's attempt from 1 (2 for the run of its first
         # workflow-level retry) and the kernel hands it over as is. Engines
-        # before orcher#356 numbered the first run 0; it reads as 1, so a first
+        # before 0.6.0 numbered the first run 0; it reads as 1, so a first
         # run is still the first attempt there. On a current engine the floor
         # never applies.
         attempt=max(int(started.attempt) if started is not None else 1, 1),
