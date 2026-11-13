@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.19](https://github.com/orcher-io/sdk-py/compare/v0.4.18...v0.4.19) (2026-11-13)
+
+
+### Bug Fixes
+
+* report replaying only while the code re-runs what it already ran ([#90](https://github.com/orcher-io/sdk-py/issues/90)) ([4db24a2](https://github.com/orcher-io/sdk-py/commit/4db24a24bc0dfe5b32720eb5a5510917f34205cf)), closes [#89](https://github.com/orcher-io/sdk-py/issues/89)
+
+
+### Documentation
+
+* the banner follows the GitHub theme, not the computer's ([#86](https://github.com/orcher-io/sdk-py/issues/86)) ([f99bb34](https://github.com/orcher-io/sdk-py/commit/f99bb349b1eeaee90ae5ce3dbd1b34dd3fe1d0ed))
+
 ## [0.4.18](https://github.com/orcher-io/sdk-py/compare/v0.4.17...v0.4.18) (2026-11-01)
 
 
