@@ -242,6 +242,15 @@ class WorkflowContext:
         self._event_times: dict[str, list[int]] = {}
         self._event_orders: dict[str, list[int]] = {}
 
+        # The outcomes this activation holds for the code to receive (step,
+        # child and timer results, and events), by their place in the run's
+        # order of outcomes, and the latest place the code has received so
+        # far: what `replaying` is decided from.
+        self._newest_outcome = 0
+        self._first_new_outcome: int | None = None
+        self._any_outcome_seen_before = False
+        self._received_through = 0
+
         # A request to cancel the workflow, if the journal holds one, and where
         # it comes in the run's order of outcomes. The code is told once, at the
         # first wait whose result does not come before the request: the same
@@ -303,11 +312,38 @@ class WorkflowContext:
 
     @property
     def replaying(self) -> bool:
-        """Whether the context is replaying from the execution journal.
+        """Whether the code is re-running what an earlier activation of the run
+        already ran.
 
-        During replay, side effects must not run again; their results are
-        already recorded in the journal.
+        A run's code runs again from the start each time it is activated,
+        receiving the outcomes it waited for from its history. Until it has
+        received the newest outcome this activation holds, everything it does
+        was done before; from then on it is new. So it is False throughout a
+        run's first activation, and in a later one it turns False at the point
+        the code reaches work the history has no outcome for.
+
+        Use it to avoid repeating logs or metrics on replay. Do not use it to
+        decide whether to perform an effect: run effects as tasks, which the
+        engine records, so they happen once whatever the code's replays.
+
+        It is exact when the engine marks which of an activation's outcomes the
+        run has already observed. Without those marks the newest outcome is
+        taken as the new one, which is off in two cases: an activation with
+        several new outcomes (two tasks that finished together) reads True
+        until the code has received the newest, and one with no new outcome at
+        all (for a query) reads False past the newest outcome.
         """
+        if self._any_outcome_seen_before:
+            # The activation says which outcomes the run saw before: the code
+            # replays until it receives the first that is new, and throughout
+            # if there is none.
+            first_new = self._first_new_outcome
+            return first_new is None or self._received_through < first_new
+        if self._newest_outcome > 0:
+            # Unmarked: take the newest outcome as what is new.
+            return self._received_through < self._newest_outcome
+        # No outcome noted: a context built by hand rather than from an
+        # activation, which says itself whether it replays.
         return self._replaying
 
     @property
@@ -400,9 +436,33 @@ class WorkflowContext:
         reached, self._reached_steps = self._reached_steps, []
         return reached
 
+    def _note_outcome(self, order: int, seen_before: bool) -> None:
+        """Note that this activation holds an outcome for the code to receive,
+        at ``order`` in the run's order of outcomes, and whether the run already
+        observed it in an earlier activation as the activation marks it
+        (internal)."""
+        self._newest_outcome = max(self._newest_outcome, order)
+        if seen_before:
+            self._any_outcome_seen_before = True
+        elif self._first_new_outcome is None or order < self._first_new_outcome:
+            self._first_new_outcome = order
+
+    def _received_at_order(self, order: int | None) -> None:
+        """The code received the outcome at ``order`` in the run's order of
+        outcomes."""
+        if order is not None and order > self._received_through:
+            self._received_through = order
+
+    def _received(self, key: str) -> None:
+        """The code received the outcome held under ``key``, without its clock
+        moving: a recorded closure result, which the code reads back on replay
+        but did not wait for when it first ran."""
+        self._received_at_order(self._resolved_order.get(key))
+
     def _observe(self, key: str) -> None:
         """The workflow received what was journaled under ``key``: its clock
         moves to when that was journaled."""
+        self._received(key)
         at_ms = self._resolved_at.get(key)
         if at_ms is not None:
             self._time._advance_to_ms(at_ms)
@@ -630,6 +690,7 @@ class WorkflowContext:
         # was journaled.
         cache_key = f"task:{step_id}"
         if cache_key in self._cached_results:
+            self._received(step_id)
             cached = self._cached_results[cache_key]
             _raise_if_task_failed(cached, step_id, step_name, "Step failed")
             return cached  # type: ignore[no-any-return]
@@ -1078,7 +1139,7 @@ class WorkflowContext:
                     self._time._advance_to_ms(times.pop(0))
                 orders = self._event_orders.get(event_name)
                 if orders:
-                    orders.pop(0)
+                    self._received_at_order(orders.pop(0))
                 if isinstance(data, list):
                     data = bytes(data)
                 if data:

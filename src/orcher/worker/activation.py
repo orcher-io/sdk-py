@@ -198,6 +198,14 @@ def load_activation(activation: kernel.RunActivation, namespace: str) -> LoadedA
         what = resolution.WhichOneof("what")
         if what == "started":
             continue
+        # An outcome the code waits on. A timer with no step id and an event
+        # with no name are dropped below, so the code could never receive them.
+        if (
+            what in ("step", "child")
+            or (what == "timer" and step_id)
+            or (what == "event" and resolution.event.name)
+        ):
+            ctx._note_outcome(order, resolution.replaying)
         if what == "step":
             note_resolved_at(step_id, at_ms, order)
             outcome = resolution.step.outcome
