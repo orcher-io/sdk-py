@@ -222,7 +222,7 @@ def test_events_updates_and_a_cancel_request_are_loaded() -> None:
     assert ctx._cached_results["event_positions:go"] == [1]
     assert ctx._event_times == {"go": [START_MS + 5]}
     assert loaded.journaled_updates == [
-        {"update_id": "u1", "update_name": "set", "args": b"2", "at_ms": START_MS + 6}
+        {"update_id": "u1", "update_name": "set", "args": b"2", "at_ms": START_MS + 6, "order": 3}
     ]
     assert [(u.update_id, u.args) for u in loaded.updates] == [("u2", b"3")]
     # The first request is the one the run is told of, at its place in the

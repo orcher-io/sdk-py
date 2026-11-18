@@ -290,6 +290,7 @@ def load_activation(activation: kernel.RunActivation, namespace: str) -> LoadedA
                             "update_name": update.name,
                             "args": raw,
                             "at_ms": at_ms,
+                            "order": order,
                         }
                     )
             else:

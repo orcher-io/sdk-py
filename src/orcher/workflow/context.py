@@ -1582,7 +1582,11 @@ class WorkflowContext:
         delivered. ``present`` says whether the journal holds the wait's result,
         ``at_ms`` when it was journaled and ``order`` where it comes in the
         run's order of outcomes, if known."""
-        await self._replay_updates(before_ms=at_ms if present else None, every=not present)
+        await self._replay_updates(
+            before_ms=at_ms if present else None,
+            before_order=order if present else None,
+            every=not present,
+        )
         self._cancellation(present, order)
 
     def _record_journaled_updates(
@@ -1596,23 +1600,44 @@ class WorkflowContext:
         self._journaled_updates = [u for u in updates if isinstance(u, dict)]
         self._update_replayer = replayer
 
-    async def _replay_updates(self, *, before_ms: int | None = None, every: bool = False) -> None:
+    async def _replay_updates(
+        self,
+        *,
+        before_ms: int | None = None,
+        before_order: int | None = None,
+        every: bool = False,
+    ) -> None:
         """Run again the journaled updates not yet run: every one, or those
-        journaled before ``before_ms``.
+        that came before a wait's result, which is at ``before_order`` in the
+        run's order of outcomes and was journaled at ``before_ms``.
 
-        At a wait whose result the journal holds, the updates journaled before
+        At a wait whose result the journal holds, the updates that came before
         that result came while the code waited there, so they run before it
         receives the result. At a wait with no result yet, where the code
-        stops, every remaining update came while it waited there. An update
-        with no known time runs only then.
+        stops, every remaining update came while it waited there. Which came
+        first is decided by the order, which never ties; the times, which tie
+        within a millisecond, decide only when an order is unknown. An update
+        with neither runs only at a wait with no result.
         """
         while self._journaled_updates:
-            at = self._journaled_updates[0].get("at_ms")
-            if not every and (before_ms is None or not isinstance(at, int) or at >= before_ms):
+            if not every and not self._came_before(
+                self._journaled_updates[0], before_ms, before_order
+            ):
                 return
             update = self._journaled_updates.pop(0)
             if self._update_replayer is not None:
                 await self._update_replayer(update)
+
+    @staticmethod
+    def _came_before(
+        update: dict[str, Any], before_ms: int | None, before_order: int | None
+    ) -> bool:
+        """Whether a journaled update came before a wait's result."""
+        order = update.get("order")
+        if isinstance(order, int) and before_order is not None:
+            return order < before_order
+        at = update.get("at_ms")
+        return before_ms is not None and isinstance(at, int) and at < before_ms
 
     def _cancellation(self, present: bool, order: int | None) -> None:
         """Raise the cancellation here if this wait is where the code learns of
