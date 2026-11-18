@@ -119,6 +119,19 @@ async def test_an_update_after_a_result_is_not_seen_before_it() -> None:
     assert json.loads(bytes(done["result"]["data"])) == {"after_go": "initial", "at_end": 42}
 
 
+async def test_an_update_in_the_same_millisecond_as_a_result_keeps_its_order() -> None:
+    """The update and "go" were journaled in the same millisecond, the update
+    first: the order the run observed them in decides, so the code reading
+    state after "go" sees the update, as it did on the original run."""
+    response = await run(
+        make_worker(),
+        request(journaled("u1", 42, 2_000), event("go", 2_000), task_done(1, 4_000)),
+    )
+    assert response["successful"], response["error"]
+    (done,) = [c["CompleteWorkflow"] for c in response["commands"] if "CompleteWorkflow" in c]
+    assert json.loads(bytes(done["result"]["data"])) == {"after_go": 42, "at_end": 42}
+
+
 async def test_a_new_update_applies_after_the_journaled_ones() -> None:
     response = await run(
         make_worker(),
