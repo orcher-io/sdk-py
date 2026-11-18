@@ -1106,11 +1106,11 @@ class Worker:
 
                 if metadata.is_function:
                     workflow_fn = metadata.handler
-                    if asyncio.iscoroutinefunction(workflow_fn):
+                    if inspect.iscoroutinefunction(workflow_fn):
                         return await workflow_fn(ctx, *wf_args, **wf_kwargs)
                     return workflow_fn(ctx, *wf_args, **wf_kwargs)
                 workflow_instance = metadata.handler()
-                if asyncio.iscoroutinefunction(metadata.run_method):
+                if inspect.iscoroutinefunction(metadata.run_method):
                     return await workflow_instance.run(ctx, *wf_args, **wf_kwargs)
                 return workflow_instance.run(ctx, *wf_args, **wf_kwargs)
 
@@ -1371,7 +1371,7 @@ class Worker:
         raw_bytes = bytes(raw_args)
         args_data = json.loads(raw_bytes) if raw_bytes else None
         args, kwargs = unpack_arguments(args_data)
-        if asyncio.iscoroutinefunction(handler):
+        if inspect.iscoroutinefunction(handler):
             return await handler(ctx, *args, **kwargs)
         return handler(ctx, *args, **kwargs)
 
@@ -1480,7 +1480,7 @@ class Worker:
             # any other value, a list included, is the one argument. Spreading
             # only objects failed every task given a list or a scalar.
             task_args, task_kwargs = unpack_arguments(data)
-            if asyncio.iscoroutinefunction(handler):
+            if inspect.iscoroutinefunction(handler):
                 return await handler(ctx, *task_args, **task_kwargs)
             # Sync handlers run in the executor so blocking or CPU-bound
             # work does not stall the event loop.
@@ -1635,12 +1635,12 @@ class Worker:
         # The method is an unbound function from the class, so the instance is
         # passed explicitly as self.
         if isinstance(operation_input, dict):
-            if asyncio.iscoroutinefunction(method):
+            if inspect.iscoroutinefunction(method):
                 result = await method(actor_instance, ctx, **operation_input)
             else:
                 result = method(actor_instance, ctx, **operation_input)
         else:
-            if asyncio.iscoroutinefunction(method):
+            if inspect.iscoroutinefunction(method):
                 result = await method(actor_instance, ctx, operation_input)
             else:
                 result = method(actor_instance, ctx, operation_input)
