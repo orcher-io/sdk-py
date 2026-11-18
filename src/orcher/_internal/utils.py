@@ -5,7 +5,7 @@ This module provides common utility functions used throughout the SDK.
 
 from __future__ import annotations
 
-import asyncio
+import inspect
 import re
 import uuid
 from collections.abc import Awaitable, Callable
@@ -52,11 +52,11 @@ def is_async_callable(obj: Any) -> bool:
     Returns:
         True if the object is an async function or has an async __call__.
     """
-    if asyncio.iscoroutinefunction(obj):
+    if inspect.iscoroutinefunction(obj):
         return True
 
     if callable(obj):
-        return asyncio.iscoroutinefunction(obj.__call__)
+        return inspect.iscoroutinefunction(obj.__call__)
 
     return False
 
