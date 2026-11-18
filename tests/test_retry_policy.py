@@ -67,6 +67,27 @@ class TestDurableNormalization:
             "non_retryable_errors": ["ValueError"],
         }
 
+    def test_sub_second_intervals_keep_their_precision(self) -> None:
+        out = _normalize_retry_policy(
+            RetryPolicy(
+                max_attempts=3,
+                initial_interval=timedelta(milliseconds=250),
+                max_interval=timedelta(seconds=1, milliseconds=500),
+            )
+        )
+        assert out["initial_interval"] == {"secs": 0, "nanos": 250_000_000}
+        assert out["max_interval"] == {"secs": 1, "nanos": 500_000_000}
+
+    def test_sub_second_intervals_reach_the_kernel(self) -> None:
+        from orcher.worker.activation import _retry_policy
+
+        policy = _retry_policy(
+            _normalize_retry_policy(
+                RetryPolicy(max_attempts=3, initial_interval=timedelta(milliseconds=250))
+            )
+        )
+        assert policy.first_delay.ToMilliseconds() == 250
+
     def test_none_normalizes_to_none(self) -> None:
         assert _normalize_retry_policy(None) is None
 
@@ -93,6 +114,13 @@ class TestTaskDictUnitContract:
             "backoff_coefficient": 1.5,
             "non_retryable_errors": ["KeyError"],
         }
+
+    def test_fractional_seconds_keys_keep_their_precision(self) -> None:
+        out = _normalize_retry_policy(
+            {"initial_interval_seconds": 0.5, "max_interval_seconds": 1.5}
+        )
+        assert out["initial_interval"] == {"secs": 0, "nanos": 500_000_000}
+        assert out["max_interval"] == {"secs": 1, "nanos": 500_000_000}
 
     def test_retry_shorthand_dict_uses_defaults(self) -> None:
         # `@task(retry=N)` becomes {"max_attempts": N}; intervals fall back to defaults.
