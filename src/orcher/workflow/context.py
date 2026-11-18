@@ -39,17 +39,12 @@ T = TypeVar("T")
 
 
 def _retry_policy_to_dict(rp: RetryPolicy) -> dict:
-    """Convert a RetryPolicy dataclass to the serde-compatible dict expected by sdk-core."""
+    """Convert a RetryPolicy dataclass to the serde-compatible dict expected by
+    sdk-core, keeping the intervals' sub-second precision."""
     return {
         "max_attempts": rp.max_attempts,
-        "initial_interval": {
-            "secs": int(rp.initial_interval.total_seconds()),
-            "nanos": 0,
-        },
-        "max_interval": {
-            "secs": int(rp.max_interval.total_seconds()),
-            "nanos": 0,
-        },
+        "initial_interval": _duration_parts(rp.initial_interval),
+        "max_interval": _duration_parts(rp.max_interval),
         "backoff_coefficient": rp.backoff_coefficient,
         "non_retryable_errors": list(rp.non_retryable_error_types),
     }
@@ -80,13 +75,7 @@ def _workflow_retry_policy(rp: RetryPolicy | None) -> dict | None:
         return None
     if not isinstance(rp, RetryPolicy):
         raise TypeError(f"retry_policy must be a RetryPolicy, not {type(rp).__name__}")
-    return {
-        "max_attempts": rp.max_attempts,
-        "initial_interval": _duration_parts(rp.initial_interval),
-        "max_interval": _duration_parts(rp.max_interval),
-        "backoff_coefficient": rp.backoff_coefficient,
-        "non_retryable_errors": list(rp.non_retryable_error_types),
-    }
+    return _retry_policy_to_dict(rp)
 
 
 def _normalize_retry_policy(rp: Any) -> dict | None:
@@ -105,14 +94,12 @@ def _normalize_retry_policy(rp: Any) -> dict | None:
     if isinstance(rp, dict):
         return {
             "max_attempts": int(rp.get("max_attempts", DEFAULT_MAX_ATTEMPTS)),
-            "initial_interval": {
-                "secs": int(rp.get("initial_interval_seconds", 1)),
-                "nanos": 0,
-            },
-            "max_interval": {
-                "secs": int(rp.get("max_interval_seconds", 60)),
-                "nanos": 0,
-            },
+            "initial_interval": _duration_parts(
+                timedelta(seconds=float(rp.get("initial_interval_seconds", 1)))
+            ),
+            "max_interval": _duration_parts(
+                timedelta(seconds=float(rp.get("max_interval_seconds", 60)))
+            ),
             "backoff_coefficient": float(rp.get("backoff_coefficient", 2.0)),
             "non_retryable_errors": list(rp.get("non_retryable_errors", [])),
         }
@@ -847,7 +834,7 @@ class WorkflowContext:
             "task_type": SESSION_CREATE_TASK,
             "task_queue": self._info.task_queue,
             "input": [input_payload],
-            "timeout": {"secs": int(options.creation_timeout.total_seconds()), "nanos": 0},
+            "timeout": _duration_parts(options.creation_timeout),
             "retry_policy": None,
             "headers": [],
         }
