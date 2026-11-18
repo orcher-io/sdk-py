@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.20](https://github.com/orcher-io/sdk-py/compare/v0.4.19...v0.4.20) (2026-11-18)
+
+
+### Features
+
+* build on orcher-sdk-core 0.23.2 ([#91](https://github.com/orcher-io/sdk-py/issues/91)) ([b842cb4](https://github.com/orcher-io/sdk-py/commit/b842cb43aee77eb772c3d6730547804a13946a35))
+
+
+### Bug Fixes
+
+* do not complete a session again on replay ([#96](https://github.com/orcher-io/sdk-py/issues/96)) ([ff11d7e](https://github.com/orcher-io/sdk-py/commit/ff11d7e7ad8d635b49562138ffa857d5fa9cbc65)), closes [#49](https://github.com/orcher-io/sdk-py/issues/49)
+* keep sub-second precision in task retry intervals ([#94](https://github.com/orcher-io/sdk-py/issues/94)) ([09211a3](https://github.com/orcher-io/sdk-py/commit/09211a31f0887880f0fd0abdd8f8b11d329a58e6)), closes [#46](https://github.com/orcher-io/sdk-py/issues/46) [#62](https://github.com/orcher-io/sdk-py/issues/62)
+* order replayed updates by the run's order of outcomes ([#95](https://github.com/orcher-io/sdk-py/issues/95)) ([db0c8bb](https://github.com/orcher-io/sdk-py/commit/db0c8bb35e5a2017ee5c8851fa1d6e1e9f13daf2)), closes [#56](https://github.com/orcher-io/sdk-py/issues/56)
+* use inspect.iscoroutinefunction, not the deprecated asyncio one ([#93](https://github.com/orcher-io/sdk-py/issues/93)) ([358b8db](https://github.com/orcher-io/sdk-py/commit/358b8db749d291545f36b1d7211158271ef90ff6)), closes [#66](https://github.com/orcher-io/sdk-py/issues/66)
+
 ## [0.4.19](https://github.com/orcher-io/sdk-py/compare/v0.4.18...v0.4.19) (2026-11-13)
 
 
