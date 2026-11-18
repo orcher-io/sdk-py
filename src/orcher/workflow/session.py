@@ -150,6 +150,11 @@ class SessionContext:
         sequence = self._ctx._next_sequence()
         task_id = self._ctx._step_id("task", sequence, f"{SESSION_COMPLETE_TASK}_{sequence}")
         self._ctx._reach(task_id)
+        if f"task:{task_id}" in self._ctx._cached_results:
+            # The journal holds its result: the session was completed on an
+            # earlier activation, so it is not completed again.
+            self._ctx._observe(task_id)
+            return
 
         input_payload = {
             "data": list(input_bytes),
