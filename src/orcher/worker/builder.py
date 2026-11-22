@@ -12,6 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from orcher.encryption import Compression, Encryption, check_compression, check_encryption
 from orcher.interceptors.base import (
     Interceptor,
     InterceptorFactory,
@@ -95,6 +96,8 @@ class WorkerBuilder:
         self._tls_ca_cert_path: str | None = None
         self._tls_client_cert_path: str | None = None
         self._tls_client_key_path: str | None = None
+        self._encryption: Encryption | None = None
+        self._compression: Compression | None = None
 
         # Auto-discovery settings
         self._auto_discover_paths: list[str] | None = None
@@ -369,6 +372,61 @@ class WorkerBuilder:
         self._api_key = _undeclared_if_blank(key)
         return self
 
+    def encryption(self, encryption: Encryption | None) -> WorkerBuilder:
+        """
+        Encrypt every payload the worker exchanges with the engine.
+
+        Payloads are encrypted with AES-256-GCM just before they are sent and
+        decrypted just after they arrive: workflow and task inputs and
+        results, step results, events, query and update arguments and
+        answers, child workflows, actor calls and actor state. The engine
+        never holds the key and stores only ciphertext; workflow and task
+        code sees plain values.
+
+        Clients and every worker that exchange payloads need the same key. A
+        worker with a different key, or none, cannot read what it is handed:
+        the work is not failed, it stays waiting for a worker with the right
+        key, and this worker logs an error.
+
+        Names, ids, task queues, labels, annotations, headers, error messages
+        and stack traces are not encrypted.
+
+        Args:
+            encryption: The key, its id and any rotated-out keys still needed
+                for reading. None turns encryption off.
+
+        Returns:
+            Builder instance for chaining
+
+        Example:
+            >>> key = bytes.fromhex(os.environ["PAYLOAD_KEY"])
+            >>> builder.encryption(Encryption(key=key, key_id="2026-11"))
+        """
+        check_encryption(encryption)
+        self._encryption = encryption
+        return self
+
+    def compression(self, compression: Compression | None) -> WorkerBuilder:
+        """
+        Compress every payload the worker exchanges with the engine.
+
+        Clients and every worker that exchange payloads must be given the
+        same compression. With encryption, payloads are compressed first and
+        then encrypted.
+
+        Args:
+            compression: "gzip", or None for no compression.
+
+        Returns:
+            Builder instance for chaining
+
+        Example:
+            >>> builder.compression("gzip")
+        """
+        check_compression(compression)
+        self._compression = compression
+        return self
+
     def tls(
         self,
         ca_cert_path: str | os.PathLike[str] | None = None,
@@ -639,6 +697,8 @@ class WorkerBuilder:
         config_kwargs["tls_ca_cert_path"] = self._tls_ca_cert_path
         config_kwargs["tls_client_cert_path"] = self._tls_client_cert_path
         config_kwargs["tls_client_key_path"] = self._tls_client_key_path
+        config_kwargs["encryption"] = self._encryption
+        config_kwargs["compression"] = self._compression
 
         config = WorkerConfig(**config_kwargs)
 

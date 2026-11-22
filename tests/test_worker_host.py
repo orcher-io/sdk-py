@@ -102,7 +102,9 @@ async def started(worker: Worker, host: FakeHost) -> tuple[asyncio.Task[None], l
     """Run ``worker`` on ``host``; the configuration it started the host with."""
     configs: list[str] = []
 
-    async def start(config_json: str, registrations_json: str) -> FakeHost:
+    async def start(
+        config_json: str, registrations_json: str, payload_seal: object
+    ) -> FakeHost:
         configs.extend([config_json, registrations_json])
         return host
 

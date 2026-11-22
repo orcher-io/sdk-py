@@ -25,10 +25,13 @@
 use std::borrow::Cow;
 use std::time::Duration;
 
+use orcher_sdk_core::payload::PayloadSeal;
 use orcher_sdk_core::{ActorHandler, EncodedHost, Host, HostConfig, Registrations, StateScope};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use serde::Deserialize;
+
+use crate::seal::PyPayloadSeal;
 
 /// The worker's configuration, as `WorkerHost.start` reads it from JSON.
 /// Every option left out keeps the host's default.
@@ -96,7 +99,11 @@ fn checked_api_key(api_key: Option<String>) -> Result<Option<String>, String> {
 }
 
 impl ConfigJson {
-    fn into_host_config(self) -> Result<HostConfig, String> {
+    /// The host's configuration. `payload_seal` is applied to every payload
+    /// the worker exchanges with the engine, on the one connection all its
+    /// drivers, its registration and its actor state calls share. It is not
+    /// part of the JSON, so that no key is ever in a string.
+    fn into_host_config(self, payload_seal: Option<PayloadSeal>) -> Result<HostConfig, String> {
         let defaults = HostConfig::new(&self.server_url, &self.task_queue);
         // TLS follows the URL scheme and the paths, as for the client.
         let tls = crate::tls::tls_from_paths(
@@ -157,6 +164,9 @@ impl ConfigJson {
         if let Some(ms) = self.shutdown_grace_ms {
             config = config.with_shutdown_grace(Duration::from_millis(ms));
         }
+        if let Some(seal) = payload_seal {
+            config.connection = config.connection.with_payload_seal(seal);
+        }
         Ok(config)
     }
 }
@@ -198,7 +208,7 @@ pub struct PyWorkerHost {
 
 #[pymethods]
 impl PyWorkerHost {
-    /// `WorkerHost.start(config_json, registrations_json) -> Awaitable[WorkerHost]`
+    /// `WorkerHost.start(config_json, registrations_json, payload_seal=None) -> Awaitable[WorkerHost]`
     ///
     /// Starts a worker: its drivers, its registration with the engine, and its
     /// actor handlers' registration with the actor service. Raises
@@ -206,17 +216,25 @@ impl PyWorkerHost {
     /// read, an API key that cannot be a header), and `RuntimeError` when
     /// nothing is registered, the engine cannot be reached, or the actor
     /// service refuses the handlers.
+    ///
+    /// `payload_seal` (a `PayloadSeal`) encrypts or compresses every payload
+    /// the worker sends and decodes every payload it receives.
     #[staticmethod]
+    #[pyo3(signature = (config_json, registrations_json, payload_seal = None))]
     fn start<'py>(
         py: Python<'py>,
         config_json: String,
         registrations_json: String,
+        payload_seal: Option<PyRef<'py, PyPayloadSeal>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let config: ConfigJson = serde_json::from_str(&config_json)
             .map_err(|e| PyValueError::new_err(format!("invalid worker configuration: {e}")))?;
         let registrations: RegistrationsJson = serde_json::from_str(&registrations_json)
             .map_err(|e| PyValueError::new_err(format!("invalid worker registrations: {e}")))?;
-        let config = config.into_host_config().map_err(PyValueError::new_err)?;
+        let payload_seal = payload_seal.and_then(|seal| seal.seal());
+        let config = config
+            .into_host_config(payload_seal)
+            .map_err(PyValueError::new_err)?;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let host = Host::start(config, registrations.into_registrations())
                 .await
@@ -481,7 +499,34 @@ mod tests {
     fn config(json: &str) -> Result<HostConfig, String> {
         serde_json::from_str::<ConfigJson>(json)
             .map_err(|e| e.to_string())?
-            .into_host_config()
+            .into_host_config(None)
+    }
+
+    #[test]
+    fn the_host_connects_with_the_payload_seal() {
+        let json = r#"{ "server_url": "http://x:1", "task_queue": "q", "namespace": "n" }"#;
+        let seal = crate::seal::build_seal(Some(&[7u8; 32]), Some("k1"), &[], Some("gzip"))
+            .unwrap()
+            .expect("a seal");
+        let sealed = serde_json::from_str::<ConfigJson>(json)
+            .unwrap()
+            .into_host_config(Some(seal))
+            .unwrap();
+        assert!(sealed.connection.payload_seal.is_some());
+        // Without one, payloads are sent as they are.
+        assert!(config(json).unwrap().connection.payload_seal.is_none());
+    }
+
+    /// A key has no place in the JSON, where it would be a string that can
+    /// be printed.
+    #[test]
+    fn the_json_configuration_takes_no_key() {
+        for option in ["encryption", "key", "payload_seal", "compression"] {
+            let json = format!(
+                r#"{{ "server_url": "http://x:1", "task_queue": "q", "namespace": "n", "{option}": "x" }}"#
+            );
+            assert!(config(&json).is_err(), "{option}");
+        }
     }
 
     #[test]

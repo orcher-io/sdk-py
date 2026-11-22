@@ -11,6 +11,7 @@ from orcher._proto import client_pb2 as pb
 from orcher.client import _protocol
 from orcher.client.config import ClientConfig
 from orcher.client.workflow_handle import WorkflowHandle
+from orcher.encryption import native_payload_seal
 from orcher.errors import ClientError, WorkflowError
 from orcher.types import RetryPolicy, WorkflowIdReusePolicy, WorkflowListPage, WorkflowStatus
 
@@ -144,6 +145,9 @@ class Client:
                 tls_client_cert_path=self._config.tls_client_cert_path,
                 tls_client_key_path=self._config.tls_client_key_path,
                 api_key=self._config.api_key,
+                payload_seal=native_payload_seal(
+                    _native, self._config.encryption, self._config.compression
+                ),
             )
 
             self._native_client = await _native.ClientConnection.connect(native_config)

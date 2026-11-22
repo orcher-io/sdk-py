@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use pyo3::prelude::*;
 
+use orcher_sdk_core::payload::PayloadSeal;
 use orcher_sdk_core::{ConnectOptions, Connection, ProtocolClient};
+
+use crate::seal::PyPayloadSeal;
 
 /// Connection settings for `Client`.
 #[pyclass(name = "ClientConfig")]
@@ -50,12 +53,16 @@ pub struct PyClientConfig {
     /// (default: 10000).
     #[pyo3(get, set)]
     pub connect_timeout_ms: u64,
+
+    /// Applied to every payload sent and removed from every payload
+    /// received; see [`crate::seal`]. Not readable from Python: it holds keys.
+    payload_seal: Option<PayloadSeal>,
 }
 
 #[pymethods]
 impl PyClientConfig {
     #[new]
-    #[pyo3(signature = (server_url, namespace = "default".to_string(), timeout_ms = 10000, identity = None, tls_ca_cert_path = None, tls_client_cert_path = None, tls_client_key_path = None, api_key = None, connect_timeout_ms = 10000))]
+    #[pyo3(signature = (server_url, namespace = "default".to_string(), timeout_ms = 10000, identity = None, tls_ca_cert_path = None, tls_client_cert_path = None, tls_client_key_path = None, api_key = None, connect_timeout_ms = 10000, payload_seal = None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         server_url: String,
@@ -67,8 +74,10 @@ impl PyClientConfig {
         tls_client_key_path: Option<String>,
         api_key: Option<String>,
         connect_timeout_ms: u64,
+        payload_seal: Option<PyRef<'_, PyPayloadSeal>>,
     ) -> Self {
         Self {
+            payload_seal: payload_seal.and_then(|seal| seal.seal()),
             server_url,
             namespace,
             timeout_ms,
@@ -122,6 +131,7 @@ impl PyClientConfig {
             tls_client_cert_path: None,
             tls_client_key_path: None,
             connect_timeout_ms: 10000,
+            payload_seal: None,
         })
     }
 
@@ -136,6 +146,22 @@ impl PyClientConfig {
 impl PyClientConfig {
     /// The TLS settings for this config's server URL and `tls_*` paths; see
     /// [`crate::tls::tls_from_paths`].
+    /// What the connection is made with: the address, the namespace, the
+    /// API key, and the payload seal when one is configured. TLS is added by
+    /// the caller, which reads its files.
+    fn connect_options(&self) -> ConnectOptions {
+        let mut options = ConnectOptions::new(&self.server_url)
+            .with_namespace(&self.namespace)
+            .with_connect_timeout(Duration::from_millis(self.connect_timeout_ms));
+        if let Some(ref key) = self.api_key {
+            options = options.with_api_key(key);
+        }
+        if let Some(ref seal) = self.payload_seal {
+            options = options.with_payload_seal(seal.clone());
+        }
+        options
+    }
+
     fn build_tls_config(&self) -> std::result::Result<Option<orcher_sdk_core::TlsConfig>, String> {
         crate::tls::tls_from_paths(
             &self.server_url,
@@ -165,12 +191,7 @@ impl PyClientConnection {
         let tls = config
             .build_tls_config()
             .map_err(pyo3::exceptions::PyValueError::new_err)?;
-        let mut options = ConnectOptions::new(&config.server_url)
-            .with_namespace(&config.namespace)
-            .with_connect_timeout(Duration::from_millis(config.connect_timeout_ms));
-        if let Some(ref key) = config.api_key {
-            options = options.with_api_key(key);
-        }
+        let mut options = config.connect_options();
         let dial_now = tls.is_some();
         if let Some(tls) = tls {
             options = options.with_tls(tls);
@@ -209,6 +230,36 @@ impl PyClientConnection {
 mod tests {
     use super::*;
 
+    fn config(payload_seal: Option<PayloadSeal>) -> PyClientConfig {
+        PyClientConfig {
+            server_url: "http://localhost:50051".to_string(),
+            namespace: "default".to_string(),
+            timeout_ms: 10000,
+            identity: None,
+            tls_ca_cert_path: None,
+            tls_client_cert_path: None,
+            tls_client_key_path: None,
+            api_key: Some("key".to_string()),
+            connect_timeout_ms: 2500,
+            payload_seal,
+        }
+    }
+
+    #[test]
+    fn the_connection_is_made_with_the_payload_seal() {
+        let seal = crate::seal::build_seal(Some(&[7u8; 32]), None, &[], None).unwrap();
+        assert!(seal.is_some());
+        let options = config(seal).connect_options();
+        assert!(options.payload_seal.is_some());
+        assert_eq!(options.api_key.as_deref(), Some("key"));
+        assert_eq!(options.namespace, "default");
+    }
+
+    #[test]
+    fn without_a_seal_payloads_are_sent_as_they_are() {
+        assert!(config(None).connect_options().payload_seal.is_none());
+    }
+
     #[test]
     fn test_client_config() {
         let config = PyClientConfig::new(
@@ -221,6 +272,7 @@ mod tests {
             None,
             None,
             2500,
+            None,
         );
         assert_eq!(config.server_url, "http://localhost:50051");
         assert_eq!(config.namespace, "default");

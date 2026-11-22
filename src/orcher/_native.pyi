@@ -160,6 +160,7 @@ class ClientConfig:
         tls_client_key_path: str | None = None,
         api_key: str | None = None,
         connect_timeout_ms: int = 10000,
+        payload_seal: PayloadSeal | None = None,
     ) -> None: ...
     @staticmethod
     def from_env(prefix: str = "ORCHER_") -> ClientConfig: ...
@@ -273,9 +274,14 @@ class WorkerHost:
     """
 
     @staticmethod
-    async def start(config_json: str, registrations_json: str) -> WorkerHost:
+    async def start(
+        config_json: str,
+        registrations_json: str,
+        payload_seal: PayloadSeal | None = None,
+    ) -> WorkerHost:
         """Start a worker. Raises ValueError for a configuration it cannot use
-        and RuntimeError when the worker cannot start."""
+        and RuntimeError when the worker cannot start. ``payload_seal``
+        encrypts or compresses every payload the worker exchanges."""
         ...
     @property
     def identity(self) -> str: ...
@@ -315,90 +321,32 @@ class WorkerHost:
     def __repr__(self) -> str: ...
 
 # =============================================================================
-# Codecs
+# Payload encryption and compression
 # =============================================================================
 
-class GzipCodec:
-    """Gzip compression codec for Payloads.
+class PayloadSeal:
+    """What a client or worker does to every payload it exchanges with the
+    engine: gzip compression, AES-256-GCM encryption, or both (compressed
+    first, then encrypted).
 
-    Compresses Payload data in gzip (RFC 1952) format. Text and JSON data
-    typically shrink by 60-90%.
+    Built by ``orcher.encryption`` from the ``encryption`` and ``compression``
+    options. The keys cannot be read back, and repr shows only their ids.
     """
 
-    def __init__(self, level: int = 6) -> None:
-        """Create a GzipCodec with compression level 0-9 (default 6)."""
-        ...
-    @staticmethod
-    def fast() -> GzipCodec:
-        """Create a GzipCodec with fast compression (level 1)."""
-        ...
-    @staticmethod
-    def best() -> GzipCodec:
-        """Create a GzipCodec with best compression (level 9)."""
-        ...
-    def encode(self, payload: Payload) -> Payload:
-        """Compress a Payload."""
-        ...
-    def decode(self, payload: Payload) -> Payload:
-        """Decompress a Payload."""
+    def __init__(
+        self,
+        key: bytes | None = None,
+        key_id: str | None = None,
+        decryption_keys: dict[str, bytes] | None = None,
+        compression: str | None = None,
+    ) -> None:
+        """Raises ValueError for a key that is not 32 bytes, a blank key id,
+        decryption keys without a key, or an unknown compression."""
         ...
     @property
-    def compression_level(self) -> int: ...
-    def __repr__(self) -> str: ...
-
-class EncryptionCodec:
-    """AES-256-GCM encryption codec for Payloads.
-
-    Provides confidentiality, authenticity, and integrity.
-    Each encryption uses a unique random nonce.
-    """
-
-    def __init__(self, key: bytes) -> None:
-        """Create an EncryptionCodec with a 32-byte key.
-
-        Raises:
-            ValueError: If key is not exactly 32 bytes.
-        """
-        ...
-    @staticmethod
-    def generate_key() -> bytes:
-        """Generate a cryptographically secure random 32-byte key."""
-        ...
-    def encode(self, payload: Payload) -> Payload:
-        """Encrypt a Payload."""
-        ...
-    def decode(self, payload: Payload) -> Payload:
-        """Decrypt a Payload."""
-        ...
-    def __repr__(self) -> str: ...
-
-class CodecChain:
-    """Composable chain of codecs applied in sequence.
-
-    Codecs are applied in order during encoding and in reverse during decoding.
-
-    Example:
-        chain = CodecChain().with_encryption(key).with_gzip()
-        encoded = chain.encode(payload)   # encrypt then compress
-        decoded = chain.decode(encoded)   # decompress then decrypt
-    """
-
-    def __init__(self) -> None:
-        """Create an empty CodecChain."""
-        ...
-    def with_gzip(self, level: int | None = None) -> CodecChain:
-        """Add gzip compression to the chain, returning a new CodecChain."""
-        ...
-    def with_encryption(self, key: bytes) -> CodecChain:
-        """Add AES-256-GCM encryption to the chain, returning a new CodecChain."""
-        ...
-    def encode(self, payload: Payload) -> Payload:
-        """Encode a Payload through the full codec chain."""
-        ...
-    def decode(self, payload: Payload) -> Payload:
-        """Decode a Payload through the full codec chain (reverse order)."""
-        ...
-    def __len__(self) -> int: ...
+    def encrypted(self) -> bool: ...
+    @property
+    def compression(self) -> str | None: ...
     def __repr__(self) -> str: ...
 
 # =============================================================================
