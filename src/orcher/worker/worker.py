@@ -59,6 +59,7 @@ from orcher.decorators.registry import (
     UpdateMetadata,
     WorkflowMetadata,
 )
+from orcher.encryption import native_payload_seal
 
 if TYPE_CHECKING:
     from orcher.worker.builder import WorkerBuilder
@@ -802,8 +803,12 @@ class Worker:
             native = get_native_module()
             # Registers the worker, and its actor handlers with their modes,
             # so the server can tell shared operations from exclusive ones.
+            # The keys go to the host as bytes, beside the JSON and never in
+            # it, so that no string holds one.
             self._host = await native.WorkerHost.start(
-                json.dumps(self._host_config()), json.dumps(self._registrations())
+                json.dumps(self._host_config()),
+                json.dumps(self._registrations()),
+                native_payload_seal(native, self._config.encryption, self._config.compression),
             )
             logger.debug("Worker host started")
         else:

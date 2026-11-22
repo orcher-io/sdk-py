@@ -279,6 +279,86 @@ pass a reference.
 </details>
 
 <details>
+<summary><b>Encryption</b>: keep payloads unreadable to the engine</summary>
+
+<br />
+
+Give the client and the worker a key and every payload is encrypted with
+AES-256-GCM just before it is sent to the engine and decrypted just after it
+arrives. The engine never holds the key: it stores ciphertext and returns it
+unchanged, so the values cannot be read in its database or its dashboard.
+Workflow, task and actor code sees plain values, as without encryption.
+
+```python
+import os
+
+from orcher import ClientConfig, Encryption, Worker
+
+encryption = Encryption(
+    key=bytes.fromhex(os.environ["PAYLOAD_KEY"]),  # exactly 32 bytes
+    key_id="2026-11",
+)
+
+config = ClientConfig(server_url="http://localhost:50051", encryption=encryption)
+
+worker = (
+    Worker.builder()
+    .server_url("http://localhost:50051")
+    .task_queue("orders")
+    .encryption(encryption)
+    .build()
+)
+```
+
+`WorkerConfig` takes the same `encryption=` and `compression=` as
+`ClientConfig`. `Encryption.generate_key()` makes a key; a key of any other
+length than 32 bytes is refused when the `Encryption` is made. Its `repr`
+never shows a key.
+
+**What is encrypted:** workflow inputs and results, task inputs and results,
+step results, event payloads, query and update arguments and answers, child
+workflow inputs and results, actor calls and actor state.
+
+**What is not encrypted:** names (of workflows, tasks, actors, events, queries
+and updates), ids, task queues, labels, annotations, headers, and error
+messages and stack traces. Keep secrets out of those, including out of the
+text of the exceptions your code raises. Encryption keeps payloads from the
+engine, not from your own processes: what your code logs, or a logging
+interceptor you add to the worker, is written in the clear.
+
+> [!IMPORTANT]
+> A client and every worker that exchange payloads need the same key. A worker
+> with a different key, or with none, cannot read what it is handed. The
+> workflow or task is not failed: it stays waiting until a worker with the
+> right key takes it, and the worker without it logs an error each time it
+> tries. Roll a key out to every worker before a client starts using it.
+
+To rotate a key, give the new one a new `key_id` and keep the old one for
+reading:
+
+```python
+Encryption(
+    key=new_key,
+    key_id="2027-01",
+    decryption_keys={"2026-11": old_key},
+)
+```
+
+New payloads are written with the new key, and payloads that name an id in
+`decryption_keys` are still read, so workflows started before the rotation
+carry on. Only payloads written with a `key_id` name their key, so set one
+from the start. The id is stored unencrypted beside each payload and must not
+be derived from the key.
+
+`compression="gzip"` (on `ClientConfig` and `WorkerConfig`, or
+`.compression("gzip")` on the builder) compresses payloads the same way, and
+needs the same setting everywhere. With both, a payload is compressed first
+and then encrypted. Payloads written before either was turned on stay
+readable afterwards.
+
+</details>
+
+<details>
 <summary><b>Time and randomness</b>: the replay-safe way</summary>
 
 <br />

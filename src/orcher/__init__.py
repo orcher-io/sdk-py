@@ -51,6 +51,9 @@ from orcher.decorators.task_class import tasks as _tasks_decorator
 from orcher.decorators.update import update as _update_decorator
 from orcher.decorators.workflow import workflow as _workflow_decorator
 
+# Payload encryption
+from orcher.encryption import Encryption
+
 # Errors
 from orcher.errors import (
     ClientError,
@@ -140,6 +143,7 @@ __all__ = [
     # Client API
     "Client",
     "ClientConfig",
+    "Encryption",
     "WorkflowHandle",
     # Workflow context
     "WorkflowContext",

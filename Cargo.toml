@@ -24,7 +24,7 @@ pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 # clients this crate binds for Python, speaking encoded kernel and host
 # messages. To build against a local checkout instead, see
 # .cargo/config.example.toml.
-orcher-sdk-core = "0.23.2"
+orcher-sdk-core = "0.23.3"
 
 # Async runtime
 tokio = { version = "1.35", features = ["full", "sync"] }
@@ -32,9 +32,6 @@ tokio = { version = "1.35", features = ["full", "sync"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Compression (used by codec bindings)
-flate2 = "1.0"
 
 # Logging
 tracing = "0.1"

@@ -33,11 +33,11 @@ use std::sync::Mutex;
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod client;
-mod codec;
 mod error;
 mod host;
 mod kernel;
 mod runtime;
+mod seal;
 mod tls;
 mod types;
 
@@ -116,10 +116,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Worker
     m.add_class::<host::PyWorkerHost>()?;
 
-    // Codecs
-    m.add_class::<codec::PyGzipCodec>()?;
-    m.add_class::<codec::PyEncryptionCodec>()?;
-    m.add_class::<codec::PyCodecChain>()?;
+    // Payload encryption and compression
+    m.add_class::<seal::PyPayloadSeal>()?;
 
     // Exceptions
     m.add("NativeError", m.py().get_type::<error::NativeError>())?;

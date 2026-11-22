@@ -87,7 +87,7 @@ def started_host_config(worker: object) -> dict[str, object]:
     class StopAtHostError(Exception):
         pass
 
-    async def start(config_json: str, registrations_json: str) -> None:
+    async def start(config_json: str, registrations_json: str, payload_seal: object) -> None:
         started.append(config_json)
         raise StopAtHostError
 

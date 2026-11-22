@@ -9,6 +9,8 @@ import uuid
 import warnings
 from dataclasses import dataclass, field
 
+from orcher.encryption import Compression, Encryption, check_compression, check_encryption
+
 # The defaults of the options the worker no longer uses, which it warns about
 # when they are set to anything else.
 _IGNORED_DEFAULTS = {
@@ -84,6 +86,19 @@ class WorkerConfig:
         api_key: Optional API key, sent as `authorization: Bearer <key>` on every
             request the worker makes, for servers that require one. from_env
             reads it from {prefix}API_KEY. Never shown by repr.
+        encryption: Optional `orcher.Encryption`. Encrypts every payload the
+            worker sends with AES-256-GCM and decrypts every payload it
+            receives: workflow and task inputs and results, step results,
+            events, query and update arguments and answers, child workflows,
+            actor calls and actor state. Clients and every other worker must
+            be given the same key; a worker with the wrong key or none leaves
+            the work waiting rather than failing it. Names, ids, task queues,
+            labels, annotations, headers, error messages and stack traces are
+            not encrypted. Not read by from_env.
+        compression: Optional "gzip". Compresses every payload the worker
+            sends and decompresses every payload it receives; clients and
+            other workers must be given the same. With encryption, payloads
+            are compressed first and then encrypted.
         tls_ca_cert_path: Optional path to a CA certificate PEM file, for a
             private or self-signed authority. Without one the server is
             verified against the system trust store.
@@ -143,6 +158,11 @@ class WorkerConfig:
     # never logs the key.
     api_key: str | None = field(default=None, repr=False)
 
+    # Payload encryption and compression (optional). The Encryption's own
+    # repr hides its keys.
+    encryption: Encryption | None = None
+    compression: Compression | None = None
+
     # TLS (optional). An https:// server_url uses TLS without any of these;
     # they add a private CA or a client certificate (mTLS).
     tls_ca_cert_path: str | None = None
@@ -193,6 +213,9 @@ class WorkerConfig:
 
         if (self.tls_client_cert_path is None) != (self.tls_client_key_path is None):
             raise ValueError("tls_client_cert_path and tls_client_key_path must be set together")
+
+        check_encryption(self.encryption)
+        check_compression(self.compression)
 
     @classmethod
     def from_env(cls, prefix: str = "ORCHER_") -> "WorkerConfig":

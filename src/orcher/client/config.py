@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+from orcher.encryption import Compression, Encryption, check_compression, check_encryption
 from orcher.errors import ConfigurationError
 
 __all__ = [
@@ -29,6 +30,17 @@ class ClientConfig:
         api_key: API key sent with every request, for servers that require one.
             Defaults to the ORCHER_API_KEY environment variable; pass None to
             send none. Never shown by repr.
+        encryption: Encrypts every payload this client sends with AES-256-GCM
+            and decrypts every payload it receives: workflow inputs and
+            results, event payloads, query and update arguments and answers,
+            actor calls. The engine never holds the key and stores only
+            ciphertext. Every worker must be given the same key. Names, ids,
+            task queues, labels, annotations, headers, error messages and
+            stack traces are not encrypted. See :class:`orcher.Encryption`.
+        compression: ``"gzip"`` compresses every payload this client sends and
+            decompresses every payload it receives; workers must be given the
+            same. With encryption, payloads are compressed first and then
+            encrypted.
 
     TLS follows the URL scheme: an ``https://`` server_url connects over TLS
     verified against the system trust store, ``http://`` in plaintext. The
@@ -50,9 +62,16 @@ class ClientConfig:
     )
     connection_timeout: timedelta = timedelta(seconds=10)
     request_timeout: timedelta = timedelta(seconds=30)
+    encryption: Encryption | None = None
+    compression: Compression | None = None
 
     def __post_init__(self) -> None:
         """Validate configuration."""
+        try:
+            check_encryption(self.encryption)
+            check_compression(self.compression)
+        except (TypeError, ValueError) as e:
+            raise ConfigurationError(str(e)) from e
         if not self.server_url:
             raise ConfigurationError.missing_required("server_url")
         if not self.server_url.startswith(("http://", "https://", "grpc://")):
