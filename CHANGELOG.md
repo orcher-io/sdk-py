@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.0](https://github.com/orcher-io/sdk-py/compare/v0.4.20...v0.5.0) (2026-11-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* encrypt and compress payloads end to end ([#100](https://github.com/orcher-io/sdk-py/issues/100))
+
+### Features
+
+* encrypt and compress payloads end to end ([#100](https://github.com/orcher-io/sdk-py/issues/100)) ([8b2ab5b](https://github.com/orcher-io/sdk-py/commit/8b2ab5be0a7c68e38a0754e33a327d3f9ce0d2c8))
+
+
+### Documentation
+
+* link the documentation site from the README ([#97](https://github.com/orcher-io/sdk-py/issues/97)) ([cb23e99](https://github.com/orcher-io/sdk-py/commit/cb23e992c951e48bfbf80bd474362553906e878e))
+
 ## [0.4.20](https://github.com/orcher-io/sdk-py/compare/v0.4.19...v0.4.20) (2026-11-18)
 
 
